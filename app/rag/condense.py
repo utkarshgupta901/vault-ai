@@ -14,6 +14,7 @@ from app.ai.prompts import condense as prompt
 from app.ai.provider import LLMProvider, ProviderError, Usage
 from app.config import settings
 from app.rag.history import History
+from app.rag.tokens import count_tokens
 
 log = structlog.get_logger(__name__)
 SHORT_FOLLOWUP_WORDS = 4
@@ -35,6 +36,13 @@ def fallback_query(question: str, previous_query: str | None) -> str:
     if previous_query and len(question.split()) <= SHORT_FOLLOWUP_WORDS:
         return f"{previous_query} {question}"
     return question
+
+
+def estimated_usage(history: History, question: str) -> Usage:
+    """Usage of a condense call that was cancelled mid-flight (client gone): the provider still processes and bills
+    it but its usage never reaches us, so count the input we sent locally (estimated=true)."""
+    text = prompt.INSTRUCTIONS + prompt.render(history.messages, question)
+    return Usage(model=settings.FAST_MODEL, input_tokens=count_tokens(text), estimated=True)
 
 
 def _same(a: str, b: str) -> bool:

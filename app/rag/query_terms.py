@@ -21,7 +21,8 @@ MAX_TERMS = 32
 # "Appendix C", "section 9", "clause 11.2", "exhibit B", "schedule 2": a structural word + a short label. The label
 # alone ("c", "9") is too weak to be an identifier, but the pair names exactly one place in a document, so it joins
 # the identifier tier as a PHRASE query ('appendix <-> c' = "appendix" immediately followed by "c"). Both parts come
-# from TERM_RE-safe tokens, so the only operator in the string is the '<->' we add ourselves.
+# from TERM_RE-safe tokens, so the only operator in the string is the '<->' we add ourselves. Labels that are
+# stopwords ("Appendix A", "Part I") are skipped: see structural_phrases().
 STRUCTURAL_RE = re.compile(
     r"\b(appendix|annex|exhibit|schedule|section|clause|article|attachment|part)\s+([a-z]|\d+(?:\.\d+)*|[ivx]{1,5})\b",
     re.IGNORECASE,
@@ -82,8 +83,25 @@ def extract_terms(question: str) -> QueryTerms:
         if len(terms) == MAX_TERMS:
             break
     id_terms = [t for t in terms if is_identifier(t)]
-    for word, label in STRUCTURAL_RE.findall(question or ""):
-        phrase = f"{word.lower()} <-> {label.lower()}"
+    for phrase in structural_phrases(question):
         if phrase not in id_terms:
             id_terms.append(phrase)
     return QueryTerms(terms=terms, id_terms=id_terms)
+
+
+def structural_phrases(question: str) -> list[str]:
+    """'appendix <-> c' for every structural reference whose label Postgres actually indexes.
+
+    A label that is an English stopword (a, i, s, t) is dropped by to_tsquery AND by to_tsvector, so
+    'appendix <-> a' parses to just 'appendix' and 'schedule <-> a' to just 'schedul'. As an identifier that matches
+    every chunk containing the bare word: "What does Appendix A cover?" would flag Appendix B and C as exact hits,
+    and "Can you schedule a dentist appointment?" would skip the off-topic gate whenever a document says
+    "schedule". The full-text index cannot tell "Appendix A" from "Appendix" (the 'a' was never indexed), so we
+    don't claim an identifier match we can't verify; those questions rank on their plain terms and the vector leg.
+    """
+    phrases: list[str] = []
+    for word, label in STRUCTURAL_RE.findall(question or ""):
+        if label.lower() in STOPWORDS:
+            continue
+        phrases.append(f"{word.lower()} <-> {label.lower()}")
+    return phrases

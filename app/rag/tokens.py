@@ -34,3 +34,18 @@ def count_tokens(text: str) -> int:
     if enc is None:
         return max(1, len(text) // 4)
     return len(enc.encode(text, disallowed_special=()))
+
+
+def truncate_tokens(text: str, max_tokens: int) -> str:
+    """The beginning of `text` in at most about `max_tokens` tokens, ending in '…' when something was cut (so the
+    model can tell the text is incomplete). One token of the budget is left for the marker."""
+    if count_tokens(text) <= max_tokens:
+        return text
+    keep = max(0, max_tokens - 1)
+    enc = _encoding()
+    if enc is None:
+        head = text[: keep * 4]
+    else:
+        # A cut inside a multi-byte character decodes to U+FFFD; drop it rather than feed the model a broken glyph.
+        head = enc.decode(enc.encode(text, disallowed_special=())[:keep]).rstrip("\ufffd")
+    return head.rstrip() + "…"

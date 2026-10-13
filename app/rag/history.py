@@ -5,7 +5,8 @@ Rules (design §2c):
     inserted in one transaction share the same now();
   - only finished answers: a half-streamed or failed answer would teach the model its own broken output;
   - [S#] markers stripped, because source numbers restart every turn ("S2" now is a different chunk);
-  - capped at HISTORY_MAX_TOKENS by dropping the OLDEST messages first (recent context matters most).
+  - capped at HISTORY_MAX_TOKENS by dropping the OLDEST messages first (recent context matters most); a newest
+    message that alone exceeds the cap is truncated, never dropped (see cap_tokens).
 """
 
 import uuid
@@ -18,7 +19,7 @@ from app.ai.provider import Msg
 from app.config import settings
 from app.models import ChatMessage, ChatSession
 from app.rag.citations import strip_citations
-from app.rag.tokens import count_tokens
+from app.rag.tokens import count_tokens, truncate_tokens
 
 
 @dataclass(frozen=True)
@@ -43,13 +44,23 @@ async def load_history(db: AsyncSession, *, owner_id: uuid.UUID, session_id: uui
 
 
 def cap_tokens(messages: list[Msg], max_tokens: int) -> list[Msg]:
+    """Keep the newest messages that fit in max_tokens, dropping the OLDEST first.
+
+    Exception: if the newest message ALONE is over the cap (a long, detailed answer), dropping it would leave no
+    history at all, which silently turns off condense and the conversation context: "And after three years?" would
+    then be searched and answered as typed. So it is cut to its first half-cap of tokens instead, leaving the other
+    half for the messages before it (normally the question it answered)."""
     kept: list[Msg] = []
-    total = 0
+    budget = max_tokens
     for m in reversed(messages):            # newest first, so the oldest are the ones dropped
-        total += count_tokens(m["content"])
-        if total > max_tokens:
+        n = count_tokens(m["content"])
+        if n > budget and not kept:
+            m = Msg(role=m["role"], content=truncate_tokens(m["content"], max_tokens // 2))
+            n = count_tokens(m["content"])
+        if n > budget:
             break
         kept.append(m)
+        budget -= n
     kept.reverse()
     return kept
 

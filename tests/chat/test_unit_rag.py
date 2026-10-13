@@ -1,5 +1,7 @@
 """Pure unit tests for the hand-written RAG pieces: query terms, citation parsing/grounding, gate and confidence."""
 
+import uuid
+
 import pytest
 
 from app.ai.prompts import answer as answer_prompt
@@ -19,6 +21,8 @@ from app.rag.followups import clean_questions
 from app.rag.history import cap_tokens
 from app.rag.query_terms import MAX_TERMS, extract_terms
 from app.rag.retrieval import RetrievalResult, effective_mode
+from app.rag.tokens import count_tokens, truncate_tokens
+from app.services.chat import Scope, ScopeDoc
 
 # --- query terms -----------------------------------------------------------------------------------------------
 
@@ -233,6 +237,36 @@ def test_history_cap_drops_oldest_first() -> None:
     assert [m["content"] for m in kept] == ["mid " * 50, "new question"]
 
 
+def test_history_cap_truncates_a_newest_message_that_alone_is_over_the_cap() -> None:
+    """Regression: a long answer (> HISTORY_MAX_TOKENS) used to empty the history, which silently switched off
+    condense for the follow-up. It is now cut to half the cap and its question is still kept in full."""
+    question = "Explain every leave policy in detail."
+    long_answer = "Employees accrue paid leave monthly under the policy. " * 100
+    kept = cap_tokens([{"role": "user", "content": question}, {"role": "assistant", "content": long_answer}], 100)  # type: ignore[list-item]
+    assert [m["role"] for m in kept] == ["user", "assistant"]
+    assert kept[0]["content"] == question
+    assert kept[1]["content"].startswith("Employees accrue paid leave") and kept[1]["content"].endswith("…")
+    assert count_tokens(kept[1]["content"]) <= 50
+    only = cap_tokens([{"role": "assistant", "content": long_answer}], 100)  # type: ignore[list-item]
+    assert len(only) == 1 and count_tokens(only[0]["content"]) <= 50
+
+
+def test_truncate_tokens() -> None:
+    assert truncate_tokens("short text", 10) == "short text"                       # fits: unchanged, no marker
+    cut = truncate_tokens("word " * 100, 10)
+    assert cut.endswith("…") and count_tokens(cut) <= 10 and cut.startswith("word word")
+
+
+def test_scope_warns_only_about_documents_still_in_flight() -> None:
+    """Regression: a FAILED document made every all-documents answer say "still processing" forever."""
+    def scope(*statuses: str) -> Scope:
+        return Scope([ScopeDoc(uuid.uuid4(), s, f"doc {i}") for i, s in enumerate(statuses)])
+
+    assert scope("ready", "failed").warnings == []
+    assert scope("ready", "queued").warnings == ["docs_not_ready"]
+    assert scope("ready", "processing", "failed").warnings == ["docs_not_ready"]
+
+
 def test_followup_cleanup() -> None:
     assert clean_questions(["1. What about X?", "what about x?", "", "How many days?", "Q4", "Q5"],
                            asked="How many days?") == ["What about X?", "Q4", "Q5"]
@@ -263,6 +297,19 @@ def test_structural_references_become_identifier_phrases() -> None:
     assert t.id_terms == ["appendix <-> c", "exhibit <-> b", "section <-> 9"]
     assert extract_terms("Which part of the plan covers part ii?").id_terms == ["part <-> ii"]
     assert extract_terms("appendix (c)").id_terms == []            # not a clean reference: no phrase, no operators
+
+
+def test_structural_labels_that_are_stopwords_are_not_identifiers() -> None:
+    """Regression: Postgres drops the stopword labels a/i/s/t, so 'appendix <-> a' parsed to just 'appendix' and
+    flagged EVERY appendix as an exact identifier hit; 'schedule <-> a' parsed to 'schedul' and let an off-topic
+    question skip the gate whenever a document mentioned a schedule."""
+    t = extract_terms("What does Appendix A cover?")
+    assert t.id_terms == [] and not t.has_ids and t.terms == ["appendix", "cover"]
+    assert extract_terms("Can you schedule a dentist appointment?").id_terms == []
+    assert extract_terms("Summarize Part I and Exhibit S.").id_terms == []
+    # real references keep working
+    assert extract_terms("What do Appendix C, section 9.2 and clause 11 say?").id_terms == [
+        "9.2", "appendix <-> c", "section <-> 9.2", "clause <-> 11"]
 
 
 def test_derived_values_inherit_grounding_from_their_calculation() -> None:

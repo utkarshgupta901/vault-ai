@@ -141,3 +141,32 @@ async def test_identifier_match_survives_fusion_against_both_leg_chunks(db: Asyn
     doc = await insert_document(db, demo_user_id, "msa.txt", [*filler, clause])
     result = await _retrieve(db, demo_user_id, [doc], "What does section 9.2 of the Brightline MSA say?")
     assert result.chunks[0].content == clause and result.chunks[0].id_hit
+
+
+async def test_structural_phrases_never_collapse_to_a_single_lexeme(db: AsyncSession) -> None:
+    """Every structural phrase we send must stay a real phrase after Postgres parsing. One that collapses to a single
+    lexeme ('appendix <-> a' -> 'appendix') matches every chunk containing the bare word."""
+    labels = [*"abcdefghijklmnopqrstuvwxyz", "ii", "iv", "x", "9", "9.2"]
+    for word in ("appendix", "schedule", "part", "section", "exhibit"):
+        for label in labels:
+            for phrase in extract_terms(f"{word} {label}").id_terms:
+                if "<->" not in phrase:
+                    continue
+                nodes = await db.scalar(text("SELECT numnode(to_tsquery('english', :q))"), {"q": phrase})
+                assert nodes > 1, phrase
+
+
+async def test_appendix_a_does_not_flag_other_appendices_as_identifier_hits(
+    db: AsyncSession, demo_user_id: uuid.UUID
+) -> None:
+    """Regression: "Appendix A" made Appendix B and C chunks exact identifier hits (and gave them the id boost)."""
+    doc = await insert_document(db, demo_user_id, "msa.txt", [
+        "Appendix B - Fees. The monthly platform fee is billed in advance.",
+        "Appendix C - Automated Review Notice. Reviews run every night.",
+        "General terms: this agreement covers services and support.",
+    ])
+    a = await _retrieve(db, demo_user_id, [doc], "What does Appendix A cover?")
+    assert a.id_terms == [] and not a.id_hit and not any(c.id_hit for c in a.chunks)
+    c = await _retrieve(db, demo_user_id, [doc], "What does Appendix C cover?")
+    assert [ch.content[:10] for ch in c.chunks if ch.id_hit] == ["Appendix C"]
+    assert c.chunks[0].content.startswith("Appendix C")
