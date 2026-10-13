@@ -330,3 +330,27 @@ def test_refusals_are_not_grounding_checked() -> None:
     sources = {"S1": Source("Handbook", "Remote work stipend of $500 per year.")}
     check = check_answer("I couldn't find this in your documents. They do not mention a 401(k) match [S1].", sources)
     assert check.answer_type == "not_found" and check.ungrounded_facts == 0 and check.uncited_claims == 0
+
+
+def test_support_is_measured_against_the_whole_cited_chunk() -> None:
+    """Regression (found on a long real-world document): several bullets citing one chunk pooled more words than any
+    single sentence of it holds, so well-supported citations were flagged weak and the badge showed 'low'."""
+    from app.rag.citations import (WEAK_OVERLAP, Source, best_sentence, check_answer, content_tokens,
+                                   split_sentences, strip_citations)
+    chunk = ("New hires receive a laptop, monitor and desk chair shipped before their first day. "
+             "Internet costs are reimbursed monthly under the REMOTE_STIPEND policy. "
+             "Ergonomic assessments are booked through the People team. "
+             "Parental leave is sixteen weeks at full pay for primary caregivers. "
+             "Learning budgets cover conferences, books and online courses. "
+             "Wellness reimbursements include gym memberships and therapy sessions.")
+    answer = ("- New hires get a laptop, monitor and desk chair before day one [S1].\n"
+              "- Internet costs are reimbursed monthly under REMOTE_STIPEND [S1].\n"
+              "- Ergonomic assessments go through the People team [S1].\n"
+              "- Primary caregivers get sixteen weeks of parental leave at full pay [S1].\n"
+              "- The learning budget covers conferences, books and online courses [S1].\n"
+              "- Wellness reimbursements include gym memberships and therapy [S1].")
+    pooled = set().union(*(content_tokens(strip_citations(s)) for s in split_sentences(answer)))
+    assert best_sentence(pooled, chunk)[1] < WEAK_OVERLAP      # the old per-sentence measure would call this weak
+    check = check_answer(answer, {"S1": Source("Larkspur Employee Handbook > Benefits", chunk)})
+    assert check.citations[0].weak_support is False
+    assert check.citations[0].snippet          # popover snippet is still a single best sentence

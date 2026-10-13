@@ -22,7 +22,7 @@ from app.core.textnorm import normalize, normalize_reply_start
 from app.rag.query_terms import STOPWORDS
 
 REFUSAL_PREFIX = "i couldn't find this in your documents"
-WEAK_OVERLAP = 0.2              # below this, the best snippet barely shares words with the answer
+WEAK_OVERLAP = 0.2              # below this, the cited chunk barely shares words with the sentences citing it
 MIN_BARE_NUMBER = Decimal(10)   # "3 years" is not checked; "18 days" and "2026" are
 SNIPPET_MAX_CHARS = 300
 
@@ -244,7 +244,11 @@ def check_answer(answer: str, sources: Mapping[str, SourceText]) -> AnswerCheck:
 
     citations = []
     for ref in order:
-        snippet, score = best_sentence(tokens_by_ref.get(ref, set()), sources[ref].content)
+        answer_tokens = tokens_by_ref.get(ref, set())
+        snippet, _ = best_sentence(answer_tokens, sources[ref].content)   # what the popover shows
+        # Support is measured against the WHOLE cited chunk: one source sentence can't contain every word of several
+        # answer sentences that cite it (a rich, multi-bullet answer would always look "weak" otherwise).
+        score = overlap(answer_tokens, f"{sources[ref].header}\n{sources[ref].content}")
         citations.append(CitationCheck(ref, snippet, round(score, 3), score < WEAK_OVERLAP or ref in weak_refs))
 
     if refusal:

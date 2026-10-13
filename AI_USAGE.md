@@ -2,7 +2,7 @@
 
 **Tool:** Claude Code (Opus 5.5) in the terminal: plan mode, multi-agent workflows, subagents working in isolated
 git worktrees, and the evaluation harness as the arbiter. **Time:** one day. **Result:** ~8.3k lines of Python,
-~5.3k lines of TypeScript, 376 tests, a 43-case evaluation, deployment config.
+~5.3k lines of TypeScript, ~490 tests, a 43-case evaluation, deployment config.
 
 The short version: I used AI to **explore, build in parallel, and attack its own work**, and kept the decisions,
 contracts and verification with me. The chronological log with timestamps is in
@@ -82,7 +82,7 @@ areas, each adding regression tests.
 - **Frozen contracts + file ownership**: agents could not drift from the schema, SSE contract or each other.
 - **CLAUDE.md hard rules**, checked again by reviewers (e.g. a DB session held across a streaming LLM call, unescaped
   document text in a prompt, a status write not fenced by `run_id`).
-- **Offline FakeProvider**: 376 tests run in ~40 s with real Postgres/pgvector and zero API cost.
+- **Offline FakeProvider**: ~490 tests run in ~50 s with real Postgres/pgvector and zero API cost.
 - **Measure, don't assume**: model latency (TTFT p50/p95), retrieval ranks per case, cost per answer, all from real
   runs; README numbers are copied from reports.
 - **Honest log**: what went wrong is recorded (usage limit, withdrawn MinIO images, the bugs above), because that is

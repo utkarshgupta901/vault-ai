@@ -147,6 +147,7 @@ class DoneEvent(BaseModel):
     ttft_ms: int | None
     latency_ms: int
     timings: dict[str, int]
+    warnings: list[str] = []    # final warnings incl. ones only known at the end (e.g. "truncated")
 
 
 class ErrorEvent(BaseModel):

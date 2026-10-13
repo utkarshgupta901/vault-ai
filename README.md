@@ -36,8 +36,11 @@ open http://localhost:8000      # dashboard (API key: vault-demo-key) · API doc
 
 | Command | What it does |
 |---|---|
-| `make up` | dev stack with bind mounts + auto-reload (`make web-dev` runs the dashboard with hot reload on :5173) |
-| `make test` | 376 tests (pytest, FakeProvider, real Postgres/Valkey/S3 from the stack) |
+| `make demo` | **presentation mode**: the built image only (no bind mounts, no auto-reload); dashboard on :8000 |
+| `make up` | dev stack with bind mounts + auto-reload; dashboard also on :8000 (`make web-dev` adds hot reload on :5173) |
+| `make demo-luna` | switch only the API's answer model to `gpt-6-luna` (fallback if the network is slow); `make demo` switches back |
+| `make raise-quota` | raise the demo user's daily AI budget (default $100) |
+| `make test` | ~490 tests (pytest, FakeProvider, real Postgres/Valkey/S3 from the stack) |
 | `make smoke` / `make smoke-llm` | end-to-end smoke against the running API / verify every configured model + TTFT |
 | `make eval` / `make eval-demo` / `make eval-retrieval` | golden-set evaluation (answers, refusals, citations, latency, cost) / demo cases 3× / retrieval only |
 | `make doctor` | pre-demo checklist (health, workers, seeded docs, today's spend) |
@@ -203,6 +206,6 @@ migrations/     hand-written SQL schema
 frontend/       React dashboard (Vite, TypeScript, Tailwind)
 evals/          golden set (43 cases), runner, scoring, reports
 scripts/        demo corpus generator, seeding, smoke, doctor, snapshots, Render all-in-one start
-tests/          376 tests
+tests/          ~490 tests
 docs/           decisions, prompts, eval, deployment, design review, AI usage log
 ```

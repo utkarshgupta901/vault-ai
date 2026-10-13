@@ -750,7 +750,7 @@ def _done_event(run: _Run) -> DoneEvent:
         usage=_usage_out(usage.input_tokens, usage.cached_input_tokens, usage.output_tokens, cost_usd(usage),
                          usage.estimated) if usage else UsageOut(),
         model=run.model, ttft_ms=run.ttft_ms, latency_ms=run.latency_ms or _ms(run.turn.started),
-        timings=dict(run.timings),
+        timings=dict(run.timings), warnings=list(run.warnings),
     )
 
 
@@ -776,7 +776,7 @@ def replay_events(msg: ChatMessage, user_message_id: uuid.UUID) -> list[ChatEven
                             usage=_usage_out(msg.input_tokens, msg.cached_input_tokens, msg.output_tokens,
                                              msg.cost_usd),
                             model=msg.model, ttft_ms=msg.ttft_ms, latency_ms=msg.latency_ms or 0,
-                            timings=dict(msg.timings or {})))
+                            timings=dict(msg.timings or {}), warnings=list(msg.warnings or [])))
     return events
 
 

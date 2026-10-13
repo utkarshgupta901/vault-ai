@@ -28,3 +28,19 @@ before its calculation ("20 days: 18 + 2 = 20"), totals reused in a later calcul
 refusal naming the thing it did not find ("no 401(k) match"). Now: a value shown as a calculation result anywhere in
 the answer is derived (its inputs are checked instead), and refusals are not fact-checked. Inputs that are neither in
 the sources nor derived are still caught (unit-tested).
+
+## D-04 Readiness checks must be bounded and single-flight (incident found by adversarial review)
+`/health/ready` used to run a Celery `inspect` broadcast on every request. Celery's broadcast holds a connection from
+the shared broker pool (10) while kombu borrows a second one for its producer; about 10 overlapping readiness calls
+deadlocked the pool. Every stuck call also pinned one of anyio's 40 worker threads; once they were gone, uploads hung
+and so did new OpenAI connections (the TLS handshake runs `wrap_bio` in a worker thread), so chat timed out.
+Fix: the worker check runs on its own broker connection, single-flight with a 10 s cache; every readiness check has a
+2 s timeout and they run concurrently; publishing has a 5 s bound and broker sockets have timeouts, so a stuck broker
+becomes `503 QUEUE_UNAVAILABLE` instead of a hang; after 3 consecutive provider failures the API rebuilds its AI client.
+Regression test: 20 concurrent readiness calls, then a real publish (deadlocks on the old code, passes in ~1 s now).
+
+## D-05 Citation support is measured against the whole cited chunk
+Manual testing on a long real-world document (~49k words, not part of the repo) showed well-cited answers marked "low confidence": a citation was "weak"
+when the words of all answer sentences citing it overlapped < 20% with the single best sentence of the chunk. Several
+bullets citing one chunk pool more words than any single sentence holds (e.g. 16% vs one sentence, 79% vs the whole
+chunk). Support is now measured against the whole chunk; the popover still shows the single best sentence.
