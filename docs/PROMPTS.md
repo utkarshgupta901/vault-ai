@@ -43,7 +43,7 @@ derived, not looked up); sentences with facts and no citation are counted; the c
 these signals plus retrieval similarity — never self-reported by the model.
 
 **v1 → v2.** v1 (kept, `ANSWER_PROMPT_VERSION=v1`) lacks rules 2, 5's date clause, and 7. The measured difference on
-the golden set is recorded in [EVAL.md](EVAL.md#prompt-v1-vs-v2).
+the golden set: both pass 43/43, but v1 grounds 41/43 vs v2's 43/43 — v1 states computed totals without showing the arithmetic, so code can't verify them ([EVAL.md](EVAL.md#prompt-v1-vs-v2-same-43-cases-same-model)).
 
 ## condense.v1: follow-up → standalone search query
 

@@ -59,9 +59,9 @@ real users paraphrase more, which is what the vector leg is for. A paraphrased r
 | Refusals | 15/15 correct, **0 false refusals**; 9 by the gate (no model call), 6 by the model |
 | Citations valid / gold document cited | 43/43 / 28/28 |
 | Grounded answers | 43/43 |
-| Confidence: high / medium / low | 21 / 6 / 16 (low = the 15 refusals + 1) — every bucket 100% accurate on this set |
-| TTFT p50 / p95 (server) | 2.5 s / 6.6 s |
-| Cost per answer | ~$0.0014 |
+| Confidence: high / medium / low | 20 / 7 / 16 (low = the 15 refusals + 1) — every bucket 100% accurate on this set |
+| TTFT p50 / p95 (server) | 2.4 s / 4.3 s (final run; earlier runs 2.5 s / 6.6 s — Sol's tail varies) |
+| Cost per answer | ~$0.0014–0.0042 (varies with answer length and reasoning tokens) |
 
 ### Answer model comparison (same 43 cases)
 
@@ -70,9 +70,18 @@ real users paraphrase more, which is what the vector leg is for. A paraphrased r
 | gpt-6.1-sol (low) — shipped | 43/43 | 43/43 | 21 | 2.5 s / 6.6 s | $0.0014 |
 | gpt-6-luna (low) — fallback | 43/43 | 42/43 | 16 | 1.2 s / 3.1 s | $0.0002 |
 
-### Prompt v1 vs v2
+### Prompt v1 vs v2 (same 43 cases, same model)
 
-_Measured after the final review fixes; see the latest report in `evals/reports/`._
+| prompt | passed | grounded | TTFT p50 / p95 |
+|---|---|---|---|
+| answer.v1 (7 rules) | 43/43 | 41/43 | 1.9 s / 3.3 s |
+| **answer.v2 (9 rules, shipped)** | 43/43 | **43/43** | 2.4 s / 4.3 s |
+
+Both prompts produced correct answers. The difference is verifiability: v1 stated computed totals ("$600,000 versus
+CoreLink's $665,000, a difference of $65,000"; "20 PTO days") without showing the arithmetic, so the grounding check
+could not trace those numbers to any source. v2's rule 2 ("show the calculation and cite every input") makes the model
+write `$420,000 + 3 × $60,000 = $600,000 [S1]`, so every number is checkable in code. The cost is slightly longer
+answers and ~0.5 s more time to first token.
 
 ## Limitations of this evaluation
 

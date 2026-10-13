@@ -14,7 +14,7 @@ and API latency.
 | Refusals when the answer isn't in the documents | **15/15**, zero false refusals |
 | Citations pointing at a source actually provided / at the right document | **100% / 100%** |
 | Hybrid retrieval hit@8 / MRR | **100% / 0.958** (vector-only 0.907, keyword-only 0.915) |
-| Time to first token p50 / p95 (gpt-6.1-sol) | 2.5 s / 6.6 s |
+| Time to first token p50 / p95 (gpt-6.1-sol) | 2.4 s / 4.3 s (final run; Sol's tail varies run to run) |
 | Cost per answer / per ingested document | ~$0.0014 / ~$0.001 |
 
 Numbers come from `evals/reports/` (see [docs/EVAL.md](docs/EVAL.md)); decisions they drove are in
