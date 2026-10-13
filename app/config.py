@@ -72,7 +72,7 @@ class Settings(BaseSettings):
     EMBED_QUERY_TIMEOUT_S: float = 3.0
     ANSWER_TTFT_TIMEOUT_S: float = 10.0
     ANSWER_IDLE_TIMEOUT_S: float = 20.0
-    FOLLOWUPS_TIMEOUT_S: float = 4.0
+    FOLLOWUPS_TIMEOUT_S: float = 8.0                # runs after the answer is saved; p50 ~1.5 s, observed tail > 4 s
     JSON_ANSWER_TIMEOUT_S: float = 45.0
     STREAMING_STALE_S: int = 90
 
