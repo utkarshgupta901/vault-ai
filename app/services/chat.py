@@ -45,7 +45,9 @@ from app.models import AIUsage, ChatMessage, ChatSession, ChatSessionDocument, D
 from app.rag.cache import QueryEmbedding, embed_query
 from app.rag.citations import AnswerCheck, best_sentence, check_answer, content_tokens
 from app.rag.condense import condense_question
+from app.rag.condense import estimated_usage as estimated_condense_usage
 from app.rag.confidence import confidence, gate_reply, should_gate
+from app.rag.followups import estimated_usage as estimated_followups_usage
 from app.rag.followups import suggest_followups
 from app.rag.generation import AnswerStalled, FallbackUsed, stream_answer
 from app.rag.history import History, load_history
@@ -77,6 +79,8 @@ ChatEvent = MetaEvent | TokenEvent | CitationsEvent | FollowupsEvent | DoneEvent
 
 MAX_STARTERS = 5
 TITLE_CHARS = 60
+IN_FLIGHT_STATUSES = frozenset({"queued", "processing"})   # documents.status values that will still become 'ready'
+BIGINT_MAX = 2**63 - 1                                       # chat_messages.seq is a bigint identity
 
 
 def _ms(since: float) -> int:
@@ -107,7 +111,10 @@ class Scope:
 
     @property
     def warnings(self) -> list[str]:
-        return ["docs_not_ready"] if any(d.status != "ready" for d in self.docs) else []
+        """'docs_not_ready' only while an in-scope document is still queued or processing, i.e. will become
+        searchable on its own. A FAILED document never will: warning "still processing" on every answer would be
+        false (and permanent in an all-documents session); the documents page already shows the failure."""
+        return ["docs_not_ready"] if any(d.status in IN_FLIGHT_STATUSES for d in self.docs) else []
 
 
 async def _owned_session(db: AsyncSession, owner_id: uuid.UUID, session_id: uuid.UUID) -> ChatSession:
@@ -219,10 +226,7 @@ async def list_sessions(
     stmt = select(ChatSession, activity.label("activity")).where(ChatSession.owner_id == owner_id)
     c = decode_cursor(cursor)
     if c:
-        try:
-            ts, last_id = datetime.fromisoformat(c["t"]), uuid.UUID(c["id"])
-        except (KeyError, ValueError) as exc:
-            raise AppError(ErrorCode.INVALID_CURSOR, 400, "Invalid pagination cursor.") from exc
+        ts, last_id = _session_cursor(c)
         stmt = stmt.where(tuple_(activity, ChatSession.id) < tuple_(ts, last_id))
     rows = (await db.execute(stmt.order_by(activity.desc(), ChatSession.id.desc()).limit(limit + 1))).all()
     next_cursor = None
@@ -231,6 +235,32 @@ async def list_sessions(
         next_cursor = encode_cursor({"t": rows[-1].activity.isoformat(), "id": str(rows[-1].ChatSession.id)})
     doc_ids = await _session_document_ids(db, [r.ChatSession.id for r in rows])
     return [_session_out(r.ChatSession, doc_ids[r.ChatSession.id]) for r in rows], next_cursor
+
+
+# A cursor is client input: it is accepted only in exactly the shape we encode, and anything else is a 400
+# INVALID_CURSOR. Validating here (not just catching parse errors) is what keeps a crafted value out of the SQL,
+# e.g. {"seq": 1e20} used to reach Postgres and fail as "bigint out of range" -> 500.
+def _invalid_cursor() -> AppError:
+    return AppError(ErrorCode.INVALID_CURSOR, 400, "Invalid pagination cursor.")
+
+
+def _session_cursor(c: dict[str, Any]) -> tuple[datetime, uuid.UUID]:
+    """{"t": ISO timestamp, "id": session uuid}, both strings (as encode_cursor wrote them)."""
+    t, last_id = c.get("t"), c.get("id")
+    if not isinstance(t, str) or not isinstance(last_id, str):
+        raise _invalid_cursor()
+    try:
+        return datetime.fromisoformat(t), uuid.UUID(last_id)
+    except ValueError as exc:
+        raise _invalid_cursor() from exc
+
+
+def _seq_cursor(c: dict[str, Any]) -> int:
+    """{"seq": n}: a JSON integer in bigint range (bool is an int subclass in Python, so it is rejected explicitly)."""
+    seq = c.get("seq")
+    if not isinstance(seq, int) or isinstance(seq, bool) or not 0 < seq <= BIGINT_MAX:
+        raise _invalid_cursor()
+    return seq
 
 
 async def delete_session(db: AsyncSession, owner_id: uuid.UUID, session_id: uuid.UUID) -> None:
@@ -248,10 +278,7 @@ async def list_messages(
     stmt = select(ChatMessage).where(ChatMessage.session_id == session_id)
     c = decode_cursor(cursor)
     if c:
-        try:
-            stmt = stmt.where(ChatMessage.seq < int(c["seq"]))
-        except (KeyError, TypeError, ValueError) as exc:
-            raise AppError(ErrorCode.INVALID_CURSOR, 400, "Invalid pagination cursor.") from exc
+        stmt = stmt.where(ChatMessage.seq < _seq_cursor(c))
     rows = list(await db.scalars(stmt.order_by(ChatMessage.seq.desc()).limit(limit + 1)))
     next_cursor = None
     if len(rows) > limit:
@@ -305,6 +332,7 @@ async def start_turn(owner_id: uuid.UUID, session_id: uuid.UUID, body: MessageCr
     """One short transaction: expire stale streams, apply idempotency, insert user row + assistant placeholder.
 
     Idempotency on client_message_id (a client retrying after a network blip must not pay twice):
+      key reused for a different question -> 422 VALIDATION_ERROR (never answer question B with question A's reply)
       previous answer complete    -> replay it (no model call, no new rows)
       previous answer streaming   -> 409 MESSAGE_IN_PROGRESS
       failed / interrupted / none -> regenerate: new assistant row replying to the SAME user row
@@ -321,6 +349,13 @@ async def start_turn(owner_id: uuid.UUID, session_id: uuid.UUID, body: MessageCr
                 ChatMessage.session_id == session_id, ChatMessage.role == "user",
                 ChatMessage.client_message_id == body.client_message_id))
         if existing_user is not None:
+            if existing_user.content != body.content:
+                # Stripe-style "same key, different parameters": a real retry resends the identical body. The user
+                # row IS the key's original request, so comparing its content needs no stored hash.
+                raise AppError(ErrorCode.VALIDATION_ERROR, 422,
+                               "client_message_id was already used for a different question; "
+                               "send a new client_message_id for a new question.",
+                               {"field": "client_message_id"})
             previous = await _latest_reply(db, existing_user.id)
             if previous is not None and previous.status == "complete":
                 await db.commit()
@@ -362,7 +397,9 @@ async def start_turn(owner_id: uuid.UUID, session_id: uuid.UUID, body: MessageCr
 @dataclass
 class _Run:
     """Everything known about the turn so far. Lets any exit path (complete, error, disconnect) save a consistent
-    row: whatever was spent (condense, embed, partial answer) is recorded even if the client is gone."""
+    row: whatever was spent (condense, embed, partial answer) is recorded even if the client is gone. A condense or
+    follow-ups call cut off mid-flight is recorded as an estimate; a query embedding cut off mid-flight is not (it
+    can't be told apart from a cancelled cache lookup, and costs ~$0.000001)."""
 
     turn: Turn
     warnings: list[str]
@@ -385,11 +422,13 @@ class _Run:
             self.warnings.append(code)
 
     def record(self, operation: str, usage: Usage, *, prompt_version: str | None = None, cache_hit: bool = False,
-               error_code: str | None = None) -> None:
+               error_code: str | None = None, success: bool | None = None) -> None:
+        """success defaults to "no error code"; a call cut off by a disconnect passes success=False with no code,
+        like the interrupted answer row."""
         self.pending_usage.append(usage_row(
             operation=operation, usage=usage, owner_id=self.turn.owner_id, prompt_version=prompt_version,
-            message_id=self.turn.assistant_message_id, cache_hit=cache_hit, success=error_code is None,
-            error_code=error_code))
+            message_id=self.turn.assistant_message_id, cache_hit=cache_hit,
+            success=error_code is None if success is None else success, error_code=error_code))
 
 
 async def answer(turn: Turn) -> AsyncIterator[ChatEvent]:
@@ -455,7 +494,16 @@ async def _pipeline(run: _Run, provider: LLMProvider) -> AsyncIterator[ChatEvent
 
 async def _understand(run: _Run, provider: LLMProvider, history: History) -> tuple[str, list[float] | None]:
     """Steps 2-3: condense (only with history) and embed the query (cached). Both degrade instead of failing."""
-    condensed = await condense_question(provider, history, run.turn.question)
+    try:
+        condensed = await condense_question(provider, history, run.turn.question)
+    except BaseException:
+        # Only cancellation gets here (condense_question absorbs every Exception): the client left while the call was
+        # in flight. The provider still bills it, so record an estimate; answer()'s shielded 'interrupted' save
+        # writes pending_usage. With no history there was no call to record.
+        if history.messages:
+            run.record("condense", estimated_condense_usage(history, run.turn.question), success=False,
+                       prompt_version=condense_prompt.VERSION)
+        raise
     run.standalone = condensed.rewritten
     if condensed.called:            # timings only hold steps that ran: a first turn has no "condense" key
         run.timings["condense"] = condensed.ms
@@ -508,6 +556,11 @@ async def _stream(run: _Run, provider: LLMProvider, history: History) -> AsyncIt
                     run.warn("fallback_model")
                 elif isinstance(item, StreamEnd):
                     run.answer_usage = item.usage
+                    if item.status == "incomplete":
+                        # max_output_tokens was hit (reasoning tokens count too), so the answer is cut off or even
+                        # empty. Keep what the user saw, but don't present it as a finished answer.
+                        log.warning("answer_truncated", model=run.model, chars=len(run.content))
+                        run.warn("truncated")
                 elif item:
                     if run.ttft_ms is None:
                         run.ttft_ms = _ms(run.turn.started)
@@ -540,23 +593,39 @@ async def _followups(run: _Run, provider: LLMProvider, check: AnswerCheck) -> li
     if run.gate or run.retrieval is None:
         return []
     cited = {run.numbered[c.ref].chunk_id for c in check.citations}
-    result = await suggest_followups(provider, question=run.turn.question, answer=run.content,
-                                     chunks=run.retrieval.chunks, cited_chunk_ids=cited)
+    try:
+        result = await suggest_followups(provider, question=run.turn.question, answer=run.content,
+                                         chunks=run.retrieval.chunks, cited_chunk_ids=cited)
+    except BaseException:
+        # Cancelled mid-call (client pressed Stop / disconnected). The answer was already saved, so answer()'s
+        # finally won't save anything: record the billed-but-unseen call here. Shielded, because a cancelled task
+        # would otherwise be cancelled again at the first DB await.
+        if run.retrieval.chunks:        # with no chunks suggest_followups makes no call
+            usage = estimated_followups_usage(run.turn.question, run.content, run.retrieval.chunks, cited)
+            with anyio.CancelScope(shield=True):
+                await _save_followups(run, [], usage, success=False)
+        raise
     if result.usage is None and result.error is None:     # no model call was made: nothing to store or bill
         return result.questions
+    await _save_followups(run, result.questions, result.usage or Usage(model=settings.FAST_MODEL),
+                          success=result.error is None, error_code=result.error)
+    return result.questions
+
+
+async def _save_followups(run: _Run, questions: list[str], usage: Usage, *, success: bool,
+                          error_code: str | None = None) -> None:
+    """The chips (if any) and the follow-ups ai_usage row, in one tiny transaction of their own."""
     try:
         async with async_session() as db:
-            if result.questions:
+            if questions:
                 await db.execute(update(ChatMessage).where(ChatMessage.id == run.turn.assistant_message_id)
-                                 .values(followups=result.questions))
-            db.add(usage_row(operation="followups", usage=result.usage or Usage(model=settings.FAST_MODEL),
-                             owner_id=run.turn.owner_id, prompt_version=followups_prompt.VERSION,
-                             message_id=run.turn.assistant_message_id, success=result.error is None,
-                             error_code=result.error))
+                                 .values(followups=questions))
+            db.add(usage_row(operation="followups", usage=usage, owner_id=run.turn.owner_id,
+                             prompt_version=followups_prompt.VERSION, message_id=run.turn.assistant_message_id,
+                             success=success, error_code=error_code))
             await db.commit()
     except Exception as exc:  # noqa: BLE001 - the answer is already saved; chips are optional
         log.warning("followups_save_failed", error=str(exc))
-    return result.questions
 
 
 # --- Persistence -----------------------------------------------------------------------------------------------

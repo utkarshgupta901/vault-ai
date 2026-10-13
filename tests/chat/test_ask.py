@@ -2,6 +2,7 @@
 idempotency, SESSION_BUSY, fallback model, time budgets and client disconnects."""
 
 import asyncio
+import base64
 import uuid
 from collections.abc import AsyncIterator
 from typing import Any
@@ -15,6 +16,7 @@ from app.ai import set_provider
 from app.ai.fake_provider import FakeProvider
 from app.ai.provider import ProviderError, StreamEnd, Usage
 from app.config import settings
+from app.core.pagination import encode_cursor
 from app.schemas.chat import MessageCreate, TokenEvent
 from app.services import chat as svc
 from tests.chat.helpers import API, ask_json, ask_stream, new_session, parse_sse, upload_ready
@@ -390,3 +392,147 @@ async def test_messages_page_newest_in_chronological_order(client: AsyncClient, 
     assert [m["seq"] for m in page2["items"]] == sorted(m["seq"] for m in page2["items"])
     assert max(m["seq"] for m in page2["items"]) < seqs[0] and len(page2["items"]) == 2
     assert page2["next_cursor"] is None
+
+
+# --- review regressions ----------------------------------------------------------------------------------------
+async def test_off_topic_question_with_schedule_a_is_still_gated(
+    client: AsyncClient, fake: FakeProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: "schedule a" became the identifier phrase 'schedule <-> a', which Postgres parses to just
+    'schedul', so any document mentioning a schedule counted as an exact identifier hit and skipped the gate."""
+    monkeypatch.setattr(settings, "GATE_MIN_SIMILARITY", 0.99)     # similarity alone would always gate
+    await upload_ready(client, "payroll.txt", "The payroll schedule is monthly. Salaries are paid on the last day.")
+    sid = (await new_session(client))["id"]
+    events = parse_sse((await ask_stream(client, sid, "Can you schedule a dentist appointment for me?")).text)
+    signals = events[_names(events).index("citations")][1]["signals"]
+    assert signals["id_hit"] is False and signals["gate"] is True
+    assert not [c for c in fake.calls if c["op"] == "stream"]          # refused without paying for an answer
+
+
+async def test_client_message_id_reused_for_a_different_question_is_422(
+    client: AsyncClient, session_id: str, fake: FakeProvider
+) -> None:
+    """Regression: the old answer was replayed (200) for a NEW question sent with a reused idempotency key."""
+    first = (await ask_json(client, session_id, QUESTION, client_message_id="c-9")).json()
+    streams_before = len([c for c in fake.calls if c["op"] == "stream"])
+    for send in (ask_json, ask_stream):
+        r = await send(client, session_id, "Where is the office?", client_message_id="c-9")
+        assert r.status_code == 422, r.text
+        error = r.json()["error"]
+        assert error["code"] == "VALIDATION_ERROR" and "client_message_id" in error["message"]
+    assert len([c for c in fake.calls if c["op"] == "stream"]) == streams_before    # no model call
+    again = (await ask_json(client, session_id, QUESTION, client_message_id="c-9")).json()   # a true retry: replay
+    assert again["answer"]["id"] == first["answer"]["id"]
+    msgs = (await client.get(f"{API}/chat/sessions/{session_id}/messages", headers=DEMO)).json()["items"]
+    assert len(msgs) == 2
+
+
+class TruncatingProvider(FakeProvider):
+    """An answer stream that ends with status 'incomplete' (max_output_tokens hit), as the OpenAI provider reports
+    response.incomplete."""
+
+    async def astream_text(self, *, model: str, effort: str, instructions: str, input: Any,
+                           max_output_tokens: int) -> AsyncIterator[str | StreamEnd]:
+        self.calls.append({"op": "stream", "model": model})
+        yield "Employees receive 18 PTO days "
+        yield StreamEnd(usage=Usage(model=model, input_tokens=100, output_tokens=4000), status="incomplete")
+
+
+async def test_truncated_answer_gets_a_truncated_warning(client: AsyncClient, session_id: str) -> None:
+    """Regression: an answer cut off by max_output_tokens was saved as a normal complete answer with no warning."""
+    set_provider(TruncatingProvider())
+    answer = (await ask_json(client, session_id, QUESTION, client_message_id="c-t")).json()["answer"]
+    assert answer["status"] == "complete" and answer["content"] == "Employees receive 18 PTO days "
+    assert answer["warnings"] == ["truncated"]
+    replay = parse_sse((await ask_stream(client, session_id, QUESTION, client_message_id="c-t")).text)
+    assert replay[0][1]["warnings"] == ["truncated"]                   # a replay says so too
+
+
+async def test_long_previous_answer_still_gives_condense_its_history(
+    client: AsyncClient, session_id: str, fake: FakeProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: an answer longer than HISTORY_MAX_TOKENS emptied the history, so the follow-up skipped condense
+    and was searched (and answered) as typed."""
+    monkeypatch.setattr(settings, "HISTORY_MAX_TOKENS", 60)
+    fake.answer_override = lambda _: "Larkspur employees receive 18 PTO days per year [S1]. " * 20
+    seen: list[str] = []
+
+    def condense(text_in: str) -> dict:
+        seen.append(text_in)
+        return {"query": "Larkspur PTO days after three years"}
+
+    fake.json_responses["CondensedQuery"] = condense
+    assert (await ask_json(client, session_id, QUESTION)).status_code == 200
+    second = (await ask_json(client, session_id, "And after three years?")).json()["answer"]
+    assert len(seen) == 1 and second["standalone_query"] == "Larkspur PTO days after three years"
+    assert QUESTION in seen[0] and "Larkspur employees receive 18 PTO days" in seen[0]   # question + cut answer
+
+
+async def test_malformed_messages_cursor_is_400(client: AsyncClient, session_id: str) -> None:
+    """Regression: {"seq": 1e20} reached Postgres ("bigint out of range") and came back as a 500 INTERNAL."""
+    infinity = base64.urlsafe_b64encode(b'{"seq": Infinity}').decode().rstrip("=")
+    bad = [encode_cursor({"seq": 10**20}), encode_cursor({"seq": 0}), encode_cursor({"seq": -5}),
+           encode_cursor({"seq": "5"}), encode_cursor({"seq": None}), encode_cursor({"seq": True}),
+           encode_cursor({"seq": 1.5}), encode_cursor({"other": 1}), infinity]
+    for cursor in bad:
+        r = await client.get(f"{API}/chat/sessions/{session_id}/messages", params={"cursor": cursor}, headers=DEMO)
+        assert r.status_code == 400 and r.json()["error"]["code"] == "INVALID_CURSOR", cursor
+
+
+class HangingJsonProvider(FakeProvider):
+    """FakeProvider whose structured-output call for one schema hangs, so a test can cancel the turn mid-call."""
+
+    def __init__(self, schema: str) -> None:
+        super().__init__()
+        self.schema = schema
+        self.started = asyncio.Event()
+
+    async def acomplete_json(self, **kwargs: Any) -> Any:
+        if kwargs["schema"].__name__ == self.schema:
+            self.started.set()
+            await asyncio.sleep(30)
+        return self.complete_json(**kwargs)
+
+
+async def _cancel_mid_call(turn: svc.Turn, provider: HangingJsonProvider) -> None:
+    async def drain() -> None:
+        async for _ in svc.answer(turn):
+            pass
+
+    task = asyncio.create_task(drain())
+    await asyncio.wait_for(provider.started.wait(), 5)
+    task.cancel()                               # what a client disconnect does to the request task
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+async def test_followups_call_cut_off_by_a_disconnect_is_recorded(
+    client: AsyncClient, session_id: str, demo_user_id: uuid.UUID, db: AsyncSession
+) -> None:
+    """Hard rule 7: the provider bills a call we abandoned, so it still gets an (estimated) ai_usage row."""
+    provider = HangingJsonProvider("FollowupQuestions")
+    set_provider(provider)
+    turn = await _turn(client, session_id, demo_user_id)
+    await _cancel_mid_call(turn, provider)
+    msg = (await _rows(db, "SELECT status FROM chat_messages WHERE id = :id", id=turn.assistant_message_id))[0]
+    assert msg["status"] == "complete"                                  # the answer was saved before follow-ups
+    rows = await _rows(db, "SELECT estimated, success, input_tokens, prompt_version FROM ai_usage "
+                           "WHERE operation = 'followups' AND message_id = :id", id=turn.assistant_message_id)
+    assert len(rows) == 1 and rows[0]["estimated"] is True and rows[0]["success"] is False
+    assert rows[0]["input_tokens"] > 0 and rows[0]["prompt_version"] == "followups.v1"
+
+
+async def test_condense_call_cut_off_by_a_disconnect_is_recorded(
+    client: AsyncClient, session_id: str, demo_user_id: uuid.UUID, db: AsyncSession
+) -> None:
+    assert (await ask_json(client, session_id, QUESTION)).status_code == 200      # history, so turn 2 condenses
+    provider = HangingJsonProvider("CondensedQuery")
+    set_provider(provider)
+    turn = await svc.start_turn(demo_user_id, uuid.UUID(session_id), MessageCreate(content="And after three years?"))
+    await _cancel_mid_call(turn, provider)
+    msg = (await _rows(db, "SELECT status FROM chat_messages WHERE id = :id", id=turn.assistant_message_id))[0]
+    assert msg["status"] == "interrupted"
+    rows = await _rows(db, "SELECT estimated, success, input_tokens FROM ai_usage "
+                           "WHERE operation = 'condense' AND message_id = :id", id=turn.assistant_message_id)
+    assert len(rows) == 1 and rows[0]["estimated"] is True and rows[0]["success"] is False
+    assert rows[0]["input_tokens"] > 0

@@ -97,7 +97,7 @@ Turn = Annotated[svc.Turn, Depends(_start_turn)]
 async def ask(turn: Turn) -> AskResponse:
     """Same pipeline as the streaming endpoint, returned as one JSON body once the answer is complete (overall
     deadline JSON_ANSWER_TIMEOUT_S -> 504 UPSTREAM_TIMEOUT). Retrying with the same `client_message_id` returns
-    the saved answer instead of paying for a new one."""
+    the saved answer instead of paying for a new one; reusing it for a different question is a 422."""
     return await svc.answer_json(turn)
 
 

@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, Query
 
 from app.config import settings
 from app.core.auth import CurrentUser, get_current_user
+from app.core.ratelimit import enforce_daily_quota, rate_limit
 from app.schemas.common import ERROR_RESPONSES
 from app.schemas.search import SearchResponse
 from app.services import chat as svc
@@ -17,8 +18,14 @@ router = APIRouter(tags=["search"], responses=ERROR_RESPONSES)
 
 User = Annotated[CurrentUser, Depends(get_current_user)]
 
+# Search pays for a query embedding (unless cached) and runs the full retrieval SQL, so it gets the same guards as
+# the other AI routes: a per-minute limit and the daily cost quota. Its own rate-limit group, so the retrieval drawer
+# or an eval run never eats into the chat or summaries budget.
+SEARCH_GUARDS = [Depends(rate_limit("search")), Depends(enforce_daily_quota)]
 
-@router.get("/search", response_model=SearchResponse, summary="Hybrid retrieval only (no LLM call)")
+
+@router.get("/search", response_model=SearchResponse, summary="Hybrid retrieval only (no LLM call)",
+            dependencies=SEARCH_GUARDS)
 async def search(
     user: User,
     q: Annotated[str, Query(min_length=1, max_length=2000, description="The question to retrieve for")],

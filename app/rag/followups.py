@@ -15,6 +15,7 @@ from app.ai.prompts import followups as prompt
 from app.ai.provider import LLMProvider, Usage
 from app.config import settings
 from app.rag.retrieval import RetrievedChunk
+from app.rag.tokens import count_tokens
 
 log = structlog.get_logger(__name__)
 MAX_EXCERPTS = 6
@@ -35,6 +36,17 @@ def pick_excerpts(chunks: Sequence[RetrievedChunk], cited_chunk_ids: set[int]) -
     ordered = [c for c in chunks if c.chunk_id not in cited_chunk_ids] + \
               [c for c in chunks if c.chunk_id in cited_chunk_ids]
     return [prompt.Excerpt(header=c.header, content=c.content) for c in ordered[:MAX_EXCERPTS]]
+
+
+def render_input(question: str, answer: str, chunks: Sequence[RetrievedChunk], cited_chunk_ids: set[int]) -> str:
+    return prompt.render(question=question, answer=answer, excerpts=pick_excerpts(chunks, cited_chunk_ids))
+
+
+def estimated_usage(question: str, answer: str, chunks: Sequence[RetrievedChunk], cited_chunk_ids: set[int]) -> Usage:
+    """Usage of a follow-ups call that was cancelled mid-flight (client gone): the provider still processes and bills
+    it but its usage never reaches us, so count the input we sent locally (estimated=true)."""
+    text = prompt.INSTRUCTIONS + render_input(question, answer, chunks, cited_chunk_ids)
+    return Usage(model=settings.FAST_MODEL, input_tokens=count_tokens(text), estimated=True)
 
 
 def clean_questions(raw: Sequence[str], asked: str) -> list[str]:
@@ -58,7 +70,7 @@ async def suggest_followups(
         async with asyncio.timeout(settings.FOLLOWUPS_TIMEOUT_S):
             result, usage = await provider.acomplete_json(
                 model=settings.FAST_MODEL, effort=settings.FAST_EFFORT, instructions=prompt.INSTRUCTIONS,
-                input=prompt.render(question=question, answer=answer, excerpts=pick_excerpts(chunks, cited_chunk_ids)),
+                input=render_input(question, answer, chunks, cited_chunk_ids),
                 schema=prompt.FollowupQuestions, max_output_tokens=MAX_OUTPUT_TOKENS,
             )
         return Followups(clean_questions(result.questions, question), usage,

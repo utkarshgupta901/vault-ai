@@ -1,4 +1,8 @@
-"""GET /search: response shape, modes, document filtering and tenant isolation."""
+"""GET /search: response shape, modes, document filtering, tenant isolation and guards."""
+
+import asyncio
+import time
+import uuid
 
 from httpx import AsyncClient
 from sqlalchemy import text
@@ -60,3 +64,27 @@ async def test_search_validation(client: AsyncClient) -> None:
     assert (await client.get(f"{API}/search", params={"q": "x"})).status_code == 401
     empty = (await client.get(f"{API}/search", params={"q": "anything"}, headers=DEMO)).json()
     assert empty["hits"] == []
+
+
+async def test_search_is_rate_limited_and_quota_guarded(client: AsyncClient, db: AsyncSession,
+                                                        demo_user_id: uuid.UUID) -> None:
+    """/search pays for a query embedding, so it sits behind a per-minute limit and the daily cost quota."""
+    original = await db.scalar(text("SELECT rate_limit_per_min FROM users WHERE name = 'demo'"))
+    await db.execute(text("UPDATE users SET rate_limit_per_min = 1 WHERE name = 'demo'"))
+    await db.commit()
+    try:
+        if time.time() % 60 > 58:           # don't let the two calls straddle a window boundary
+            await asyncio.sleep(60 - time.time() % 60 + 0.05)
+        assert (await client.get(f"{API}/search", params={"q": "incident"}, headers=DEMO)).status_code == 200
+        r = await client.get(f"{API}/search", params={"q": "incident"}, headers=DEMO)
+        assert r.status_code == 429 and r.json()["error"]["code"] == "RATE_LIMITED"
+    finally:                                # users are shared across the test session: always restore
+        await db.execute(text("UPDATE users SET rate_limit_per_min = :n WHERE name = 'demo'"), {"n": original})
+        await db.commit()
+
+    await db.execute(text("INSERT INTO ai_usage (owner_id, operation, model, cost_usd) "
+                          "VALUES (:o, 'answer', 'gpt-6-luna', 1000)"), {"o": demo_user_id})
+    await db.commit()
+    r = await client.get(f"{API}/search", params={"q": "incident"}, headers=DEMO)
+    assert r.status_code == 429 and r.json()["error"]["code"] == "QUOTA_EXCEEDED"
+    assert (await client.get(f"{API}/search", params={"q": "incident"}, headers=OTHER)).status_code == 200
