@@ -18,6 +18,14 @@ from dataclasses import dataclass
 TERM_RE = re.compile(r"[A-Za-z0-9]+(?:[.\-][A-Za-z0-9]+)*")
 DOTTED_NUMBER_RE = re.compile(r"\d+(?:\.\d+)+")      # clause / section numbers: 9.2, 4.1.3
 MAX_TERMS = 32
+# "Appendix C", "section 9", "clause 11.2", "exhibit B", "schedule 2": a structural word + a short label. The label
+# alone ("c", "9") is too weak to be an identifier, but the pair names exactly one place in a document, so it joins
+# the identifier tier as a PHRASE query ('appendix <-> c' = "appendix" immediately followed by "c"). Both parts come
+# from TERM_RE-safe tokens, so the only operator in the string is the '<->' we add ourselves.
+STRUCTURAL_RE = re.compile(
+    r"\b(appendix|annex|exhibit|schedule|section|clause|article|attachment|part)\s+([a-z]|\d+(?:\.\d+)*|[ivx]{1,5})\b",
+    re.IGNORECASE,
+)
 
 # PostgreSQL's 'english' stop list (snowball english.stop, 127 words; verified with ts_lexize in
 # tests/chat/test_retrieval.py). Postgres would drop these anyway; dropping them here too means the 32-term cap is
@@ -36,7 +44,7 @@ same so than too very s t can will just don should now
 @dataclass(frozen=True)
 class QueryTerms:
     terms: list[str]        # lowercased, deduped, stopwords removed, at most MAX_TERMS
-    id_terms: list[str]     # the identifier-like subset of `terms`
+    id_terms: list[str]     # identifier-like terms (LRK-4471, 9.2) + structural phrases ('appendix <-> c')
 
     @property
     def q_or(self) -> str:
@@ -73,4 +81,9 @@ def extract_terms(question: str) -> QueryTerms:
         terms.append(term)
         if len(terms) == MAX_TERMS:
             break
-    return QueryTerms(terms=terms, id_terms=[t for t in terms if is_identifier(t)])
+    id_terms = [t for t in terms if is_identifier(t)]
+    for word, label in STRUCTURAL_RE.findall(question or ""):
+        phrase = f"{word.lower()} <-> {label.lower()}"
+        if phrase not in id_terms:
+            id_terms.append(phrase)
+    return QueryTerms(terms=terms, id_terms=id_terms)

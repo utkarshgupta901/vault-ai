@@ -59,6 +59,7 @@ class Settings(BaseSettings):
     PER_DOC_CAP: int = 4                           # max sources per document in multi-doc scope
     LEXICAL_WEIGHT: float = 1.0                    # weight of the keyword leg in RRF
     RRF_K: int = 60
+    ID_HIT_BOOST: bool = True                      # an exact identifier match also counts as a rank-1 vector hit
     GATE_MIN_SIMILARITY: float = 0.30              # below this (and no identifier hit) -> refuse without an LLM call
     TAU_HIGH: float = 0.50                         # min top similarity for a "high" confidence badge
     RETRIEVAL_MODE: Literal["hybrid", "vector", "keyword"] = "hybrid"

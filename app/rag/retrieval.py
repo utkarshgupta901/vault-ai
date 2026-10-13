@@ -5,7 +5,8 @@ Why two legs:
   - vector (semantic) finds paraphrases: "time off" matches a chunk about "PTO";
   - keyword (lexical) finds exact tokens embeddings blur: "LRK-4471", "clause 9.2", "$60,000".
 Why RRF instead of adding scores: cosine distance and ts_rank_cd live on different, uncalibrated scales. RRF only
-uses each chunk's RANK in each leg:  rrf = 1/(RRF_K + sem_rank) + LEXICAL_WEIGHT * 1/(RRF_K + lex_rank).
+uses each chunk's RANK in each leg:  rrf = 1/(RRF_K + sem_rank) + LEXICAL_WEIGHT * 1/(RRF_K + lex_rank)
+(+ 1/(RRF_K + 1) when the chunk matched an exact identifier; see `id_boost`).
 A chunk found by both legs beats one found by a single leg; RRF_K=60 (the standard constant) flattens the curve so
 rank 1 vs rank 2 matters less than "found by both".
 
@@ -58,7 +59,8 @@ _NO_LEXICAL = "lexical AS (SELECT NULL::bigint AS id, false AS id_hit, NULL::big
 _FUSE_AND_SELECT = """fused AS (
   SELECT COALESCE(s.id, l.id) AS chunk_id,
          COALESCE(1.0::float8 / (:rrf_k + s.rnk), 0)
-           + CAST(:w_lex AS float8) * COALESCE(1.0::float8 / (:rrf_k + l.rnk), 0) AS rrf,
+           + CAST(:w_lex AS float8) * COALESCE(1.0::float8 / (:rrf_k + l.rnk), 0)
+           + CASE WHEN COALESCE(l.id_hit, false) THEN CAST(:id_boost AS float8) ELSE 0 END AS rrf,
          s.rnk AS sem_rank, l.rnk AS lex_rank, s.dist AS sem_dist, COALESCE(l.id_hit, false) AS id_hit
   FROM semantic s FULL OUTER JOIN lexical l ON s.id = l.id),
 ranked AS (
@@ -163,6 +165,10 @@ async def retrieve(
         "owner_id": owner_id, "doc_ids": list(document_ids), "n": candidates or settings.RETRIEVAL_CANDIDATES,
         "rrf_k": settings.RRF_K, "w_lex": settings.LEXICAL_WEIGHT if w_lex is None else w_lex,
         "per_doc_cap": per_doc_cap, "k": k,
+        # Identifier boost: a chunk matching an exact identifier (LRK-4471, 9.2, Appendix C) gets the score of a
+        # rank-1 semantic hit on top of its lexical score. Without it, a chunk found ONLY by keyword (rank 1) scores
+        # 1/61 and loses to every chunk that is merely "okay" on both legs (~2/65), then the per-document cap cuts it.
+        "id_boost": (1.0 / (settings.RRF_K + 1)) if settings.ID_HIT_BOOST else 0.0,
     }
     if mode in ("hybrid", "vector"):
         params["qvec"] = vector_literal(query_vec or [])

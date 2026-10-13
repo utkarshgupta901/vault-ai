@@ -57,7 +57,8 @@ async def test_hybrid_fuses_both_legs_with_rrf(db: AsyncSession, demo_user_id: u
     assert top.content == INCIDENT and top.sem_rank is not None and top.lex_rank == 1
     for c in result.chunks:                       # the documented arithmetic, chunk by chunk
         expected = (1 / (settings.RRF_K + c.sem_rank) if c.sem_rank else 0) + \
-            settings.LEXICAL_WEIGHT * (1 / (settings.RRF_K + c.lex_rank) if c.lex_rank else 0)
+            settings.LEXICAL_WEIGHT * (1 / (settings.RRF_K + c.lex_rank) if c.lex_rank else 0) + \
+            (1 / (settings.RRF_K + 1) if c.id_hit else 0)                  # identifier boost
         assert c.rrf == pytest.approx(expected)
     assert [c.rrf for c in result.chunks] == sorted((c.rrf for c in result.chunks), reverse=True)
     assert top.label == "p. 1" and top.filename == "ops_log.txt"
@@ -130,3 +131,13 @@ async def test_python_stopwords_are_postgres_stopwords(db: AsyncSession) -> None
     rows = (await db.execute(text("SELECT w FROM unnest(CAST(:w AS text[])) w "
                                   "WHERE ts_lexize('english_stem', w) <> '{}'"), {"w": sorted(STOPWORDS)})).all()
     assert rows == []
+
+
+async def test_identifier_match_survives_fusion_against_both_leg_chunks(db: AsyncSession, demo_user_id: uuid.UUID) -> None:
+    """Regression (eval case f-section-9-2): a chunk found ONLY by the keyword leg's identifier tier must not be
+    outranked by chunks that are merely okay on both legs."""
+    filler = [f"Brightline MSA general terms paragraph {i} about services, fees and obligations." for i in range(12)]
+    clause = "9.2 Either party may terminate this Agreement for convenience with sixty days written notice."
+    doc = await insert_document(db, demo_user_id, "msa.txt", [*filler, clause])
+    result = await _retrieve(db, demo_user_id, [doc], "What does section 9.2 of the Brightline MSA say?")
+    assert result.chunks[0].content == clause and result.chunks[0].id_hit

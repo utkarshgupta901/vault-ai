@@ -26,8 +26,8 @@ from app.rag.retrieval import RetrievalResult, effective_mode
 def test_identifier_terms_are_kept_whole_and_tiered() -> None:
     t = extract_terms("What is the status of incident LRK-4471 under clause 9.2?")
     assert "lrk-4471" in t.terms and "9.2" in t.terms
-    assert t.id_terms == ["lrk-4471", "9.2"]
-    assert t.q_ids == "lrk-4471 | 9.2"
+    assert t.id_terms == ["lrk-4471", "9.2", "clause <-> 9.2"]     # + the structural phrase "clause 9.2"
+    assert t.q_ids == "lrk-4471 | 9.2 | clause <-> 9.2"
     assert t.has_ids
 
 
@@ -256,3 +256,10 @@ def test_answer_prompt_layout_and_escaping() -> None:
         version="v1", history=[], question="q", standalone=None, sources=[src], today=settings.today())
     assert v1 == "answer.v1" and "today's date" not in v1_instructions.lower()
     assert not v1_messages[-1]["content"].startswith("Today's date") and "Standalone form" not in v1_messages[-1]["content"]
+
+
+def test_structural_references_become_identifier_phrases() -> None:
+    t = extract_terms("Summarize Appendix C and Exhibit B, then section 9.")
+    assert t.id_terms == ["appendix <-> c", "exhibit <-> b", "section <-> 9"]
+    assert extract_terms("Which part of the plan covers part ii?").id_terms == ["part <-> ii"]
+    assert extract_terms("appendix (c)").id_terms == []            # not a clean reference: no phrase, no operators
