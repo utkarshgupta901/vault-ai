@@ -3,6 +3,7 @@
 .env.*
 !.env.example
 prep/
+demo_docs/user/
 demo_snapshot/
 *.dump
 

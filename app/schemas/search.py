@@ -17,7 +17,8 @@ class SearchHit(BaseModel):
     lex_rank: int | None          # rank in the keyword leg
     similarity: float | None      # cosine similarity (1 - distance)
     id_hit: bool                  # matched an identifier-like term (e.g. LRK-4471, 9.2)
-    snippet: str
+    snippet: str                  # best-matching sentence (for display)
+    content: str                  # full chunk text (eval checks gold substrings against it)
 
 
 class SearchResponse(BaseModel):
