@@ -64,6 +64,12 @@ services:
 
   api:
     <<: *app
+    environment:
+      <<: *app-env
+      # Interpolated so `make demo-luna` can switch the answer model for the API alone without editing .env.
+      # Precedence: shell env > .env > the default here (the same default as app/config.py).
+      ANSWER_MODEL: ${ANSWER_MODEL:-gpt-6.1-sol}
+      ANSWER_EFFORT: ${ANSWER_EFFORT:-low}
     command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips=*"]
     ports: ["8000:8000"]
     depends_on:

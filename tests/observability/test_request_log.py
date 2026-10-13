@@ -4,6 +4,7 @@ middleware never buffers streams and never lets a telemetry failure reach the cl
 import asyncio
 import uuid
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from typing import Any
 
 import pytest
@@ -15,7 +16,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import middleware
 from app.core.errors import install_error_handlers
-from app.core.middleware import RequestLogBuffer, RequestLogMiddleware, request_log_buffer, route_template
+from app.core.middleware import (
+    UNMATCHED_ROUTE,
+    RequestLogBuffer,
+    RequestLogMiddleware,
+    request_log_buffer,
+    route_template,
+)
 from tests.conftest import DEMO, upload
 
 
@@ -58,21 +65,33 @@ async def test_api_calls_are_logged_with_route_templates(client: AsyncClient, db
     assert all(0 <= r["ttfb_ms"] <= r["total_ms"] for r in rows)
 
 
-async def test_unmatched_paths_are_normalized(client: AsyncClient, db: AsyncSession,
-                                              quiet_request_logs: None) -> None:
-    r = await client.get(f"/api/v1/nope/{uuid.uuid4()}/42", headers=DEMO)
-    assert r.status_code == 404
+async def test_unmatched_paths_share_one_bucket(client: AsyncClient, db: AsyncSession,
+                                                quiet_request_logs: None) -> None:
+    """Unmatched paths are client-controlled text and /metrics/system is global, so they are never stored raw."""
+    assert (await client.get(f"/api/v1/nope/{uuid.uuid4()}/42", headers=DEMO)).status_code == 404
+    assert (await client.get("/api/v1/hello-other-tenants-visit-evil.example")).status_code == 404
+    rejected = await client.post("/api/v1/documents", files={"file": ("a.txt", b"x")})   # UploadGuard: no key
+    assert rejected.status_code == 401
     rows = await logged_rows(db)
-    assert [(row["route"], row["status_code"]) for row in rows] == [("/api/v1/nope/{id}/{id}", 404)]
+    assert [(row["route"], row["status_code"]) for row in rows] == [
+        (UNMATCHED_ROUTE, 404), (UNMATCHED_ROUTE, 404), (UNMATCHED_ROUTE, 401)]
+
+
+@dataclass
+class StubRoute:
+    include_in_schema: bool = True
 
 
 def test_route_template_from_path_params() -> None:
     doc_id = str(uuid.uuid4())
-    matched = {"path": f"/api/v1/documents/{doc_id}/pages/4", "route": object(),
+    matched = {"path": f"/api/v1/documents/{doc_id}/pages/4", "route": StubRoute(),
                "path_params": {"document_id": doc_id, "page_no": "4"}}
     assert route_template(matched) == "/api/v1/documents/{document_id}/pages/{page_no}"
-    assert route_template({"path": "/api/v1/documents"}) == "/api/v1/documents"             # 'v1' is kept
-    assert route_template({"path": f"/api/v1/x/{doc_id.upper()}/7/y"}) == "/api/v1/x/{id}/{id}/y"
+    assert route_template({"path": "/api/v1/documents", "route": StubRoute()}) == "/api/v1/documents"  # 'v1' kept
+    assert route_template({"path": "/api/v1/documents"}) == UNMATCHED_ROUTE                 # no route matched
+    spa_catch_all = {"path": "/api/v1/hello-evil", "route": StubRoute(include_in_schema=False),
+                     "path_params": {"path": "api/v1/hello-evil"}}
+    assert route_template(spa_catch_all) == UNMATCHED_ROUTE
 
 
 # --- on a small app, with a capture buffer -------------------------------------------------------------------------

@@ -4,6 +4,7 @@ Every error a client can see has a stable machine-readable `code`, an HTTP statu
 one envelope: {"error": {"code", "message", "details", "request_id"}}. Pipeline failures reuse the same codes and are
 stored on the document row, so the UI shows the same vocabulary for sync and async failures."""
 
+import json
 from enum import StrEnum
 from typing import Any
 
@@ -12,6 +13,7 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from app.core.request_context import get_request_id
 
@@ -23,6 +25,7 @@ class ErrorCode(StrEnum):
     UNAUTHENTICATED = "UNAUTHENTICATED"
     VALIDATION_ERROR = "VALIDATION_ERROR"
     INVALID_CURSOR = "INVALID_CURSOR"
+    PAYLOAD_TOO_LARGE = "PAYLOAD_TOO_LARGE"   # a non-upload request body over the generic cap (upload_guard.py)
     NOT_FOUND = "NOT_FOUND"
     RATE_LIMITED = "RATE_LIMITED"
     QUOTA_EXCEEDED = "QUOTA_EXCEEDED"
@@ -103,6 +106,54 @@ def envelope(code: str, message: str, details: dict[str, Any] | None = None) -> 
     return {"error": {"code": code, "message": message, "details": details or {}, "request_id": get_request_id()}}
 
 
+async def send_error(send: Send, status: int, code: str, message: str, *, close_connection: bool = False) -> None:
+    """Send the envelope from pure-ASGI middleware, which runs outside FastAPI's exception handlers.
+    close_connection: for rejections made before the body was read, so the server need not drain it for keep-alive."""
+    body = json.dumps(envelope(code, message)).encode()
+    headers = [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode())]
+    if close_connection:
+        headers.append((b"connection", b"close"))
+    await send({"type": "http.response.start", "status": status, "headers": headers})
+    await send({"type": "http.response.body", "body": body})
+
+
+class UnhandledErrorMiddleware:
+    """Turns an unhandled exception into the INTERNAL envelope while the request id is still bound.
+
+    Why not only the `Exception` handler below: Starlette runs that handler in ServerErrorMiddleware, the outermost
+    layer, after RequestIdMiddleware has already unbound the id. Every 500 then had request_id null, no X-Request-ID
+    header and an `unhandled_error` log line without the id, i.e. exactly the errors you most need to trace.
+    main.py installs this middleware directly inside RequestIdMiddleware, so the log line carries request_id and the
+    response goes out through RequestIdMiddleware's send (which adds X-Request-ID). The exception is handled here, so
+    the outer handler never sends a second response.
+
+    If the response has already started (a stream failed half-way) an envelope can't be sent any more: we log and
+    re-raise, and the server aborts the connection."""
+
+    def __init__(self, app: ASGIApp):
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        response_started = False
+
+        async def tracking_send(message: Message) -> None:
+            nonlocal response_started
+            if message["type"] == "http.response.start":
+                response_started = True
+            await send(message)
+
+        try:
+            await self.app(scope, receive, tracking_send)
+        except Exception as exc:
+            log.exception("unhandled_error", error=str(exc), method=scope.get("method"), path=scope.get("path"))
+            if response_started:
+                raise
+            await send_error(send, 500, ErrorCode.INTERNAL, "Internal server error.")
+
+
 def install_error_handlers(app: FastAPI) -> None:
     @app.exception_handler(AppError)
     async def _app_error(_: Request, exc: AppError) -> JSONResponse:
@@ -124,5 +175,6 @@ def install_error_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(Exception)
     async def _unhandled(_: Request, exc: Exception) -> JSONResponse:
+        # Fallback only: UnhandledErrorMiddleware handles errors first, with the request id still bound.
         log.exception("unhandled_error", error=str(exc))
         return JSONResponse(envelope(ErrorCode.INTERNAL, "Internal server error."), status_code=500)

@@ -86,10 +86,14 @@ class Settings(BaseSettings):
 
     # --- Limits --------------------------------------------------------------------------------------
     MAX_UPLOAD_MB: int = 25
+    MAX_BODY_KB: int = 1024                        # any other /api request body (JSON); checked before it is read
     QUEUE_BACKPRESSURE_DEPTH: int = 500
 
     # --- Web -----------------------------------------------------------------------------------------
     CORS_ORIGINS: list[str] = ["http://localhost:5173"]
+    # Built React dashboard. Unset: /srv/spa (where the Dockerfile puts it, outside the dev bind mount of ./app) if it
+    # exists, else app/static/spa. Point it at frontend/dist to serve a local `pnpm build`.
+    SPA_DIR: str | None = None
 
     # --- Seeded API users (local/demo). In prod set real secrets via env. ---------------------------------
     SEED_DEMO_API_KEY: str = "vault-demo-key"

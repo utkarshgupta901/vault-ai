@@ -35,6 +35,7 @@ FLUSH_INTERVAL_S = 1.0
 FLUSH_BATCH_ROWS = 100
 MAX_BUFFERED_ROWS = 10_000      # if the DB is down for long, drop new rows instead of growing memory without bound
 MAX_ROUTE_LEN = 200
+UNMATCHED_ROUTE = "<unmatched>"
 CLIENT_CLOSED_REQUEST = 499     # nginx's convention: the client went away before we sent a response
 
 _UUID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
@@ -52,11 +53,18 @@ def route_template(scope: Scope) -> str:
     Routing sets scope["route"] (the matched route) and scope["path_params"]. In FastAPI 0.143 the matched route's
     `.path` does NOT include include_router prefixes (it is "/documents/{document_id}", without "/api/v1"), so we
     rebuild the template from the real path: each segment equal to a path-parameter value becomes "{name}".
-    Unmatched requests (404s, uploads rejected by UploadGuard before routing) have no path_params and fall back to
-    replacing UUID / number segments with {id}, which keeps the number of distinct routes small either way."""
+
+    Requests that matched no API route are all logged as UNMATCHED_ROUTE: 404s, requests UploadGuard rejected before
+    routing, and unknown /api paths that only reached the dashboard's catch-all route (include_in_schema=False) to be
+    answered 404. Their path is arbitrary client text, and /metrics/system shows routes to every tenant, so storing
+    it would let anyone write into (and read others' typos from) a shared table and push real routes out of its top
+    100. Their status codes still show up under the one bucket."""
+    route = scope.get("route")
+    if route is None or not getattr(route, "include_in_schema", False):
+        return UNMATCHED_ROUTE
     path: str = scope.get("path", "")
     params = scope.get("path_params") or {}
-    if scope.get("route") is not None and params:
+    if params:
         name_by_value = {str(value): name for name, value in params.items()}
         path = "/".join("{" + name_by_value[s] + "}" if s in name_by_value else s for s in path.split("/"))
     return _normalize_ids(path)[:MAX_ROUTE_LEN]

@@ -1,6 +1,10 @@
 # Dev-only overrides (merged automatically by `docker compose up`).
-# Bind-mounts source and enables auto-reload. The demo runs `docker compose -f compose.yaml up` instead,
-# i.e. the built image with no reload, so a file save can never restart the API mid-demo.
+# Bind-mounts source and enables auto-reload. The demo runs `docker compose -f compose.yaml up` (`make demo`) instead,
+# i.e. the built image with no reload, so a file save can never restart the API or a worker mid-demo.
+# Workers restart on a save with SIGINT (Celery's warm shutdown: finish the running task, then exit). watchfiles waits
+# --sigint-timeout seconds (60, like stop_grace_period) before SIGKILL; its default of 5 s killed in-flight tasks,
+# whose unacked messages then came back only after the 900 s visibility timeout.
+# The dashboard is served on :8000 here too: the image keeps the built SPA in /srv/spa, outside the ./app mount.
 services:
   migrate:
     volumes: [./app:/srv/app, ./migrations:/srv/migrations, ./scripts:/srv/scripts]
@@ -8,8 +12,8 @@ services:
     command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload", "--reload-dir", "/srv/app"]
     volumes: [./app:/srv/app, ./migrations:/srv/migrations, ./scripts:/srv/scripts, ./evals:/srv/evals]
   worker-ingest:
-    command: ["watchfiles", "--filter", "python", "celery -A app.worker.celery_app worker -Q ingest -c 2 -n ingest@%h --max-memory-per-child=400000 --loglevel=INFO", "/srv/app"]
+    command: ["watchfiles", "--filter", "python", "--sigint-timeout", "60", "celery -A app.worker.celery_app worker -Q ingest -c 2 -n ingest@%h --max-memory-per-child=400000 --loglevel=INFO", "/srv/app"]
     volumes: [./app:/srv/app]
   worker-ai:
-    command: ["watchfiles", "--filter", "python", "celery -A app.worker.celery_app worker -Q ai -c 4 -n ai@%h --loglevel=INFO", "/srv/app"]
+    command: ["watchfiles", "--filter", "python", "--sigint-timeout", "60", "celery -A app.worker.celery_app worker -Q ai -c 4 -n ai@%h --loglevel=INFO", "/srv/app"]
     volumes: [./app:/srv/app]
