@@ -8,7 +8,7 @@ pnpm install
 pnpm dev        # http://localhost:5173; /api, /health, /docs are proxied to the API on :8000
 pnpm build      # type-check (tsc -b) + production bundle in dist/
 pnpm lint       # oxlint
-pnpm test       # node --test: SSE parser, citation streaming, answer helpers (no extra test dependencies)
+pnpm test       # node --test: SSE parser, citation streaming, answer helpers, markdown safety, readiness timeout
 ```
 
 In production the Dockerfile builds `dist/` and FastAPI serves it from `app/static/spa`, so the browser talks to one
@@ -38,7 +38,7 @@ origin: no CORS, and no API URL baked in at build time. Every request uses a rel
 | UI | Endpoint |
 |---|---|
 | Metadata, status, live progress | `GET /api/v1/documents/{id}` · `.../events` |
-| Insights: summary, key points with page links, type, category, tags, entities, sentiment and rationale, risk flags (severity, verified quote, page link), "Sampled coverage" badge, pending/processing/failed states | `GET /api/v1/documents/{id}/insights` |
+| Insights: summary, key points with page links, type, category, tags, entities, sentiment and rationale, risk flags (severity, verified quote, page link), "Sampled coverage" badge, pending/processing/failed states. Page links read "p. N" for PDFs; DOCX/Markdown/TXT have sections or parts instead of pages, so their links show the stored label ("§ Termination") | `GET /api/v1/documents/{id}/insights` · `.../pages/{n}` (labels, non-PDF only) |
 | Suggested question "Ask": creates a chat scoped to this document, opens it, and sends the question | `POST /api/v1/chat/sessions` then the chat stream |
 | Custom summary (length, tone, focus) with a "Cached" badge | `POST /api/v1/documents/{id}/summaries` |
 | Page viewer with prev/next; page links highlight the quoted text | `GET /api/v1/documents/{id}/pages/{n}` |
@@ -71,7 +71,7 @@ yet" instead of an error.
 
 ### Header
 "Vault AI", navigation, a health dot polled every 15 s from `GET /health/ready`: ok (green), degraded (amber, with
-the failing checks in the tooltip), unavailable (red, including "API unreachable"). Settings stores the API key and
+the failing checks in the tooltip), unavailable (red, including "API unreachable" and no answer within 5 s). Settings stores the API key and
 reloads the page so no other owner's data stays on screen.
 
 ## Code layout

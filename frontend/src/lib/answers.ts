@@ -47,6 +47,24 @@ export interface AnswerView {
   error: TurnError | null
 }
 
+/**
+ * Plain-language explanations of the server's warning codes (design §2b), for answer warnings AND session warnings
+ * (GET /chat/sessions/{id} `warnings`), so the chat header never shows a raw code like "docs_not_ready".
+ * Unknown codes (a newer server) are shown as-is rather than hidden.
+ */
+const WARNING_TEXT: Record<string, string> = {
+  fallback_model: 'The main model was slow to start, so the fast fallback model answered.',
+  keyword_only: 'Query embedding timed out; keyword-only retrieval was used.',
+  condense_fallback: 'Rewriting the follow-up timed out; your question was used as typed.',
+  docs_not_ready: 'Some documents in this chat are still processing and are not searched until they are ready.',
+  docs_failed: 'Some documents in scope failed to process and are excluded.',
+  truncated: 'The answer was cut off at the length limit.',
+}
+
+export function warningText(code: string): string {
+  return Object.hasOwn(WARNING_TEXT, code) ? WARNING_TEXT[code] : code // hasOwn: a code like "toString" stays text
+}
+
 /** Warnings are free-form on MessageOut (list[Any]); accept plain codes or {code: ...} objects. */
 export function warningCodes(warnings: unknown[] | undefined): string[] {
   return (warnings ?? []).map((w) => {

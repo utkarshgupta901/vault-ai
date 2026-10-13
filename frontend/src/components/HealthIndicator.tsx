@@ -1,4 +1,5 @@
 import { getReadiness } from '../api/metrics'
+import { READY_TIMEOUT_MS } from '../api/readiness'
 import type { ReadyResponse } from '../api/types'
 import { useApi, useInterval } from '../hooks/useApi'
 import { cx } from '../lib/cx'
@@ -31,7 +32,8 @@ function failingChecks(health: ReadyResponse): string[] {
 /**
  * Readiness from GET /health/ready. "degraded" (amber) means soft dependencies such as Redis or a worker pool are
  * down but the API still serves; "unavailable" (red) means a hard dependency (DB, pgvector, schema) failed, or the
- * API itself cannot be reached.
+ * API cannot be reached or did not answer within READY_TIMEOUT_MS. The timeout matters: a wedged API accepts the
+ * connection and never answers, and the dot must turn red then rather than keep showing the last "ok".
  */
 export function HealthIndicator() {
   const { data, loading, reload } = useApi<ReadyResponse | null>('health', getReadiness)
@@ -64,7 +66,7 @@ export function HealthIndicator() {
             ))}
           </ul>
         )}
-        {data === null && <p className="mt-1 text-zinc-500">The API did not respond.</p>}
+        {data === null && <p className="mt-1 text-zinc-500">The API did not respond (or took over {READY_TIMEOUT_MS / 1000} s).</p>}
         {data?.models && (
           <p className="mt-2 border-t border-zinc-100 pt-2 text-zinc-500">
             Models: {Object.entries(data.models).map(([role, model]) => `${role} ${model}`).join(' · ')}

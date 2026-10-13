@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { isUnverified, rewriteDiffers, warningCodes } from '../src/lib/answers.ts'
+import { isUnverified, rewriteDiffers, warningCodes, warningText } from '../src/lib/answers.ts'
 import { fmtUsd } from '../src/lib/format.ts'
 
 test('"Interpreted as" only when the rewrite changed the question', () => {
@@ -17,6 +17,16 @@ test('unverified when ungrounded or any invalid citation', () => {
 
 test('warnings accept plain codes and {code} objects', () => {
   assert.deepEqual(warningCodes(['keyword_only', { code: 'fallback_model', detail: 'x' }]), ['keyword_only', 'fallback_model'])
+})
+
+test('session and answer warning codes read as sentences; unknown codes are shown, not hidden', () => {
+  for (const code of ['docs_not_ready', 'docs_failed', 'truncated', 'fallback_model', 'keyword_only', 'condense_fallback']) {
+    assert.match(warningText(code), /^[A-Z].*\.$/, code)
+  }
+  assert.equal(warningText('docs_failed'), 'Some documents in scope failed to process and are excluded.')
+  assert.equal(warningText('truncated'), 'The answer was cut off at the length limit.')
+  assert.equal(warningText('some_future_code'), 'some_future_code')
+  assert.equal(warningText('toString'), 'toString')
 })
 
 test('money accepts Pydantic Decimal strings', () => {
