@@ -1,0 +1,27 @@
+# secrets & local state
+.env
+.env.*
+!.env.example
+prep/
+demo_snapshot/
+*.dump
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# node
+frontend/node_modules/
+frontend/dist/
+app/static/spa/
+
+# os / editors
+.DS_Store
+.idea/
+.vscode/

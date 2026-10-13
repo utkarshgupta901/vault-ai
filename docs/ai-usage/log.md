@@ -1,0 +1,11 @@
+# AI usage log (real events, appended as the build progresses)
+
+| When (2026-10-13) | Tool / mode | What the AI did | What I (human) did / verified |
+|---|---|---|---|
+| 16:10 | Claude Code, plan mode | Checked local environment read-only (ports, Docker, existing DBs) and asked me to choose provider, frontend, RAG style, cloud, teaching style | Made every product/stack decision |
+| 16:14–17:20 | Claude Code workflow (9 agents) | Design panel: 2 researchers (verified versions/models/prices on the web), 3 architects (MVP / AI-first / production lenses), 1 judge (rubric scorecard + merge), 2 adversarial "panel interviewer" agents that cross-examined the design (31 fixes), 1 finalizer. Outputs in `design-review/` | Reviewed the scorecard and decision points; overrode the panel on frontend (React instead of static HTML) and storage (S3/object storage instead of a shared volume, for cloud deploys) |
+| 17:05 | Claude Code subagent | Verified Render deployment facts (paid-only workers / pre-deploy, Key Value noeviction, R2 checksum gotcha) | Chose Render + R2 |
+| 17:30 | Claude Code | Live-probed the OpenAI SDK v3 + GPT-6 models before writing code (Responses API parse/stream, effort values, embedding dims) — caught that `gpt-6.1-sol` rejects effort `none` | Confirmed key access to all planned models |
+| 17:35 | Claude Code | Found MinIO's free images were withdrawn; tested RustFS / SeaweedFS / Bitnami-legacy with the app's boto3 config and picked RustFS 1.0.1 | Approved the swap (same S3 API, R2 in cloud) |
+| 17:40–18:10 | Claude Code | Wrote the WP0 foundation (config, models, hand-written SQL migration, errors, auth, provider layer with Fake, storage, Celery, upload path) + 25 tests; tests caught a jsonb parameter-typing bug in delete-redaction SQL | Reviewed contracts; ran the walking skeleton end to end |
+| 18:12 | Claude Code | `smoke_llm.py`: measured TTFT — Sol p50 3.0 s / p95 10.4 s vs Luna p50 0.88 s / p95 0.96 s | Decision pending eval: answer model chosen by measured quality vs latency |

@@ -1,0 +1,15 @@
+# Dev-only overrides (merged automatically by `docker compose up`).
+# Bind-mounts source and enables auto-reload. The demo runs `docker compose -f compose.yaml up` instead,
+# i.e. the built image with no reload, so a file save can never restart the API mid-demo.
+services:
+  migrate:
+    volumes: [./app:/srv/app, ./migrations:/srv/migrations, ./scripts:/srv/scripts]
+  api:
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload", "--reload-dir", "/srv/app"]
+    volumes: [./app:/srv/app, ./migrations:/srv/migrations, ./scripts:/srv/scripts, ./evals:/srv/evals]
+  worker-ingest:
+    command: ["watchfiles", "--filter", "python", "celery -A app.worker.celery_app worker -Q ingest -c 2 -n ingest@%h --max-memory-per-child=400000 --loglevel=INFO", "/srv/app"]
+    volumes: [./app:/srv/app]
+  worker-ai:
+    command: ["watchfiles", "--filter", "python", "celery -A app.worker.celery_app worker -Q ai -c 4 -n ai@%h --loglevel=INFO", "/srv/app"]
+    volumes: [./app:/srv/app]
