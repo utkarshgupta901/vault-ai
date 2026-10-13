@@ -263,3 +263,23 @@ def test_structural_references_become_identifier_phrases() -> None:
     assert t.id_terms == ["appendix <-> c", "exhibit <-> b", "section <-> 9"]
     assert extract_terms("Which part of the plan covers part ii?").id_terms == ["part <-> ii"]
     assert extract_terms("appendix (c)").id_terms == []            # not a clean reference: no phrase, no operators
+
+
+def test_derived_values_inherit_grounding_from_their_calculation() -> None:
+    from app.rag.citations import Source, check_answer
+    sources = {"S1": Source("Proposal A", "Implementation fee $420,000. Annual subscription $60,000."),
+               "S2": Source("Proposal B", "Implementation fee $380,000. Annual subscription $95,000.")}
+    answer = ("BrightPath costs **$600,000** over three years: $420,000 + 3 x $60,000 = $600,000 [S1]. "
+              "CoreLink costs $380,000 + 3 x $95,000 = $665,000 [S2]. "
+              "Difference: $665,000 - $600,000 = $65,000 [S1][S2].")
+    check = check_answer(answer, sources)
+    assert check.ungrounded_facts == 0 and check.uncited_claims == 0
+    # an input that is NOT derived and NOT in the sources is still caught
+    assert check_answer("It costs $999,000 + $1 = $999,001 [S1].", sources).ungrounded_facts >= 1
+
+
+def test_refusals_are_not_grounding_checked() -> None:
+    from app.rag.citations import Source, check_answer
+    sources = {"S1": Source("Handbook", "Remote work stipend of $500 per year.")}
+    check = check_answer("I couldn't find this in your documents. They do not mention a 401(k) match [S1].", sources)
+    assert check.answer_type == "not_found" and check.ungrounded_facts == 0 and check.uncited_claims == 0

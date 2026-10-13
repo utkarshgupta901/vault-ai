@@ -121,6 +121,20 @@ def source_facts(text: str) -> set[str]:
     return extract_facts(text, min_bare=Decimal(0)) | {k for k in raw if k is not None}
 
 
+def derived_facts(answer: str) -> set[str]:
+    """Results of calculations shown anywhere in the answer (the part after the last '=' of each sentence).
+
+    A derived value inherits its grounding from the calculation that produced it, whose inputs ARE checked. So it may
+    be stated before its calculation ("20 days: 18 + 2 = 20") or reused as an input later ("$665k - $600k = $65k")
+    without being mistaken for a fact the sources should contain."""
+    derived: set[str] = set()
+    for sentence in split_sentences(answer):
+        body = strip_citations(sentence)
+        if "=" in body:
+            derived |= extract_facts(body[body.rindex("=") + 1:])
+    return derived
+
+
 def checked_facts(sentence: str) -> set[str]:
     """Facts that must be grounded. In a shown calculation ("$420k + 3 x $60k = $600k [S2]") the result after the
     last '=' is computed, not quoted, so only the inputs before it are checked (rule 2 of answer.v2)."""
@@ -201,6 +215,9 @@ class AnswerCheck:
 def check_answer(answer: str, sources: Mapping[str, SourceText]) -> AnswerCheck:
     """`sources` maps each provided ref ("S1") to the chunk the model saw for it."""
     facts_by_ref = {ref: source_facts(f"{src.header}\n{src.content}") for ref, src in sources.items()}
+    refusal = is_refusal(answer)
+    # A refusal may name facts it did NOT find ("no 401(k) match"); grounding them against the sources is meaningless.
+    derived = derived_facts(answer)
     order: list[str] = []                       # valid refs, first appearance
     invalid: list[str] = []
     tokens_by_ref: dict[str, set[str]] = {}
@@ -212,11 +229,11 @@ def check_answer(answer: str, sources: Mapping[str, SourceText]) -> AnswerCheck:
         valid = [r for r in dict.fromkeys(cited) if r in sources]
         invalid.extend(r for r in cited if r not in sources and r not in invalid)
         if not valid:
-            if extract_facts(sentence):
+            if not refusal and extract_facts(sentence) - derived:
                 uncited += 1
             continue
         allowed = set().union(*(facts_by_ref[r] for r in valid))
-        missing = checked_facts(sentence) - allowed
+        missing = set() if refusal else checked_facts(sentence) - allowed - derived
         ungrounded += len(missing)
         for ref in valid:
             if ref not in order:
@@ -230,7 +247,7 @@ def check_answer(answer: str, sources: Mapping[str, SourceText]) -> AnswerCheck:
         snippet, score = best_sentence(tokens_by_ref.get(ref, set()), sources[ref].content)
         citations.append(CitationCheck(ref, snippet, round(score, 3), score < WEAK_OVERLAP or ref in weak_refs))
 
-    if is_refusal(answer):
+    if refusal:
         answer_type = "not_found"
     elif not citations:
         answer_type = "ungrounded"
