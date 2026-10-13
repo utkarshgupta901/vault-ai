@@ -21,6 +21,7 @@ from tests.ingestion.helpers import (
     make_pdf,
     runs_of,
 )
+from tests.insights.helpers import canned_insights
 
 
 async def _get(client: AsyncClient, doc_id: str) -> dict:
@@ -161,3 +162,27 @@ async def test_insights_enqueue_failure_keeps_document_ready(
     doc = await _get(client, await _upload_id(client, "a.txt", b"Employees receive 18 PTO days per year."))
     assert doc["status"] == "ready"
     assert doc["insights_status"] == "failed" and doc["insights_error_code"] == "QUEUE_UNAVAILABLE"
+
+
+async def test_reprocess_after_insights_renamed_the_document_re_embeds_nothing(
+    client: AsyncClient, fake: FakeProvider
+) -> None:
+    # Insights replace documents.title with the model's title. Chunk headers (and so embed_hash) must not follow it,
+    # or every reprocess of a ready document pays to embed every chunk again and retrieves differently.
+    fake.json_responses["DocumentInsights"] = canned_insights(title="Employee Handbook 2026")
+    doc_id = await _upload_id(client, "Larkspur_Handbook.pdf", make_pdf())
+    assert get_doc(doc_id).title == "Employee Handbook 2026"
+    before = chunks_of(doc_id)
+    embeds_before = [c for c in fake.calls if c["op"] == "embed"]
+
+    r = await client.post(f"/api/v1/documents/{doc_id}/reprocess", headers=DEMO, json={"scope": "all"})
+    assert r.status_code == 202, r.text
+    assert (await _get(client, doc_id))["status"] == "ready"
+
+    after = chunks_of(doc_id)
+    assert [c.header for c in after] == [c.header for c in before] == [
+        "Larkspur Handbook (p. 1)", "Larkspur Handbook (p. 2)", "Larkspur Handbook (p. 3)"]
+    assert [c.embed_hash for c in after] == [c.embed_hash for c in before]
+    assert [c for c in fake.calls if c["op"] == "embed"] == embeds_before      # no embedding call at all
+    assert count("SELECT count(*) FROM ai_usage WHERE operation = 'embed_chunks' AND document_id = :d",
+                 d=doc_id) == 1                                                # still only the first ingest's batch

@@ -26,12 +26,13 @@ from pypdf.errors import DependencyError, PyPdfError
 
 from app.config import settings
 from app.core.errors import ErrorCode, PermanentError
-from app.ingestion.chunking import split_by_tokens
+from app.ingestion.chunking import count_tokens, split_by_tokens
 from app.ingestion.sniff import DOCX, MD, PDF, TXT
 
 log = structlog.get_logger(__name__)
 
 SECTION_TOKENS = 1500       # max size of a DOCX/MD section page or a TXT pseudo-page
+MAX_HEADING_TOKENS = 64     # a longer "heading" is a body paragraph that was styled as one (see _sections)
 MIN_PAGE_CHARS = 20         # a PDF page with less text than this has no usable text layer (scan, figure, blank)
 LABEL_HEADING_CHARS = 60
 
@@ -169,11 +170,15 @@ class _Section:
 
 def _sections(blocks: list[_Block]) -> list[_Section]:
     """Group blocks under their heading. A heading stack turns levels into a breadcrumb: a new Heading 2 replaces the
-    previous Heading 2 (and anything deeper) but stays under the current Heading 1."""
+    previous Heading 2 (and anything deeper) but stays under the current Heading 1.
+
+    A "heading" over MAX_HEADING_TOKENS is kept as body text instead. Real Word files contain whole paragraphs styled
+    'Heading 1' or 'Title' (and Markdown files long '#' lines); as a heading, that paragraph would be copied into the
+    page text of every part and into every chunk's header, pushing embedding inputs past the 8,192-token limit."""
     sections = [_Section(heading=None, heading_path=None)]
     stack: list[tuple[int, str]] = []
     for block in blocks:
-        if block.level is None:
+        if block.level is None or count_tokens(block.text) > MAX_HEADING_TOKENS:
             sections[-1].body.append(block.text)
             continue
         while stack and stack[-1][0] >= block.level:

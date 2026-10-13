@@ -11,12 +11,15 @@ Each helper returns a statement with RETURNING id: zero rows back = "superseded 
 """
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import Update, func, update
+from sqlalchemy import Update, and_, func, or_, update
 
 from app.models import Document
+
+IN_FLIGHT = ("queued", "processing")             # Document.status values a worker is (supposedly) working on
+INSIGHTS_IN_FLIGHT = ("pending", "processing")   # the same for Document.insights_status
 
 TRANSITIONS: dict[str, set[str]] = {
     "queued": {"processing", "failed", "queued"},
@@ -86,6 +89,29 @@ def requeue_stmt(document_id: uuid.UUID, new_run_id: uuid.UUID, *, scope: str = 
     return update(Document).where(Document.id == document_id).values(**values).returning(Document.id)
 
 
+def reprocess_stmt(document_id: uuid.UUID, new_run_id: uuid.UUID, *, scope: str, stale_minutes: int) -> Update:
+    """requeue_stmt with the reprocess preconditions inside the WHERE clause, so check-and-requeue is ONE atomic
+    statement. Zero rows back = another reprocess got there first (the caller answers 409).
+
+    Why not just check in Python first: two near-simultaneous requests (two tabs, "Reprocess" then "Regenerate
+    insights") both pass a read-then-write check, and the second UPDATE would overwrite current_run_id with a run
+    whose task can never claim the document (e.g. an insights run on a document that is now 'queued'), leaving it
+    stuck with no runnable task. Postgres re-evaluates this WHERE on the newest row version after waiting for the
+    first writer's lock, so the loser matches zero rows instead.
+
+      scope=all       status is ready/failed, or queued/processing with no progress for `stale_minutes`
+      scope=insights  status is ready, and insights are ready/failed or stuck pending/processing (stale)
+    """
+    stale = Document.updated_at < func.now() - timedelta(minutes=stale_minutes)
+    if scope == "all":
+        allowed = or_(Document.status.in_(["ready", "failed"]), and_(Document.status.in_(IN_FLIGHT), stale))
+    else:
+        allowed = and_(Document.status == "ready",
+                       or_(Document.insights_status.in_(["ready", "failed"]),
+                           and_(Document.insights_status.in_(INSIGHTS_IN_FLIGHT), stale)))
+    return requeue_stmt(document_id, new_run_id, scope=scope).where(allowed)
+
+
 def claim_insights_stmt(document_id: uuid.UUID, run_id: uuid.UUID) -> Update:
     return (
         _fenced(document_id, run_id)
@@ -113,5 +139,17 @@ def insights_fail_stmt(document_id: uuid.UUID, run_id: uuid.UUID, code: str) -> 
     )
 
 
+def _idle(updated_at: datetime, now: datetime, stale_minutes: int) -> bool:
+    return (now - updated_at).total_seconds() > stale_minutes * 60
+
+
 def is_stale(status: str, updated_at: datetime, now: datetime, stale_minutes: int) -> bool:
-    return status in ("queued", "processing") and (now - updated_at).total_seconds() > stale_minutes * 60
+    return status in IN_FLIGHT and _idle(updated_at, now, stale_minutes)
+
+
+def is_insights_stale(insights_status: str, updated_at: datetime, now: datetime, stale_minutes: int) -> bool:
+    """Insights that say pending/processing but have made no progress for `stale_minutes`: the task was lost
+    (lock wait gave up, hard time limit, worker died between 'ready' and the insights publish). Same clock as
+    is_stale: insights only run once status=ready, and every insights write (claim, ready, failed) sets updated_at,
+    while a healthy attempt is cut off by the 9-minute soft limit long before 15 minutes pass without a write."""
+    return insights_status in INSIGHTS_IN_FLIGHT and _idle(updated_at, now, stale_minutes)

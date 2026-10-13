@@ -2,20 +2,23 @@
 
 import asyncio
 import time
+import unicodedata
 import uuid
 from collections.abc import AsyncIterator
 from typing import Annotated, Literal
+from urllib.parse import quote
 
 import anyio
-from fastapi import APIRouter, Depends, File, Query, Response, UploadFile, status
+from fastapi import APIRouter, Depends, File, Path, Query, Response, UploadFile, status
 from fastapi.responses import StreamingResponse
 from fastapi.sse import EventSourceResponse, ServerSentEvent
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.background import BackgroundTask
 
 from app.core.auth import CurrentUser, get_current_user
 from app.core.db import async_session, get_db
-from app.core.ratelimit import UPLOAD_GUARDS
+from app.core.ratelimit import AI_GUARDS, UPLOAD_GUARDS
 from app.models import Document
 from app.schemas.common import ERROR_RESPONSES, Page
 from app.schemas.documents import (
@@ -37,6 +40,7 @@ Db = Annotated[AsyncSession, Depends(get_db)]
 
 EVENTS_POLL_S = 0.5
 EVENTS_MAX_S = 600
+MAX_PAGE_NO = 100_000   # far above MAX_PAGES / any section count; keeps the value inside Postgres int4
 
 
 def _links(document_id: uuid.UUID) -> UploadLinks:
@@ -124,29 +128,51 @@ async def document_events(
 
 
 @router.get("/{document_id}/pages/{page_no}", response_model=PageOut, summary="Extracted text of one page (citation click-through)")
-async def get_page(document_id: uuid.UUID, page_no: int, user: User, db: Db) -> PageOut:
+async def get_page(document_id: uuid.UUID, page_no: Annotated[int, Path(ge=1, le=MAX_PAGE_NO)], user: User,
+                   db: Db) -> PageOut:
+    """Out-of-range page numbers are a 422 here; unbounded, 2147483648 reached Postgres and failed as a 500."""
     page = await svc.get_page(db, user.id, document_id, page_no)
     return PageOut(document_id=document_id, page_no=page.page_no, label=page.label,
                    heading_path=page.heading_path, text=page.text)
 
 
+def content_disposition(disposition: str, filename: str) -> str:
+    """RFC 6266 header that works for any filename: `filename*` carries the real name (RFC 5987: UTF-8,
+    percent-encoded) and `filename` is a plain-ASCII fallback for old clients.
+
+    Header values must be Latin-1 (Starlette encodes them so), so putting 'Q3 report — final.pdf' or a CJK name in
+    a plain filename="..." raised UnicodeEncodeError: a 500 on download. The fallback decomposes accents
+    ('é' -> 'e'), and replaces every other non-ASCII or control character, quote and backslash with '_', which also
+    rules out header injection via CR/LF."""
+    decomposed = "".join(c for c in unicodedata.normalize("NFKD", filename) if not unicodedata.combining(c))
+    fallback = "".join(c if " " <= c <= "~" and c not in '"\\' else "_" for c in decomposed)
+    return f"{disposition}; filename=\"{fallback}\"; filename*=UTF-8''{quote(filename, safe='')}"
+
+
 @router.get("/{document_id}/file", summary="Download the original file", response_class=StreamingResponse)
 async def get_file(document_id: uuid.UUID, user: User, db: Db) -> StreamingResponse:
     doc = await svc.get_owned(db, user.id, document_id)
+    # Headers first: nothing that can fail runs between opening the S3 stream and handing it to the response.
+    headers = {
+        "Content-Disposition": content_disposition(
+            "inline" if doc.mime_type == "application/pdf" else "attachment", doc.filename),
+        "X-Content-Type-Options": "nosniff",
+        "Content-Length": str(doc.size_bytes),
+    }
     body = await anyio.to_thread.run_sync(storage.open_stream, doc.storage_key)
-    disposition = "inline" if doc.mime_type == "application/pdf" else "attachment"
-    safe_name = doc.filename.replace('"', "")
     return StreamingResponse(
         body.iter_chunks(1024 * 1024),  # sync iterator -> Starlette runs it in a threadpool
         media_type=doc.mime_type,
-        headers={"Content-Disposition": f'{disposition}; filename="{safe_name}"',
-                 "X-Content-Type-Options": "nosniff", "Content-Length": str(doc.size_bytes)},
+        headers=headers,
+        background=BackgroundTask(body.close),  # after the last byte or a disconnect: free the S3 connection
     )
 
 
 @router.post("/{document_id}/reprocess", response_model=ReprocessResponse, status_code=status.HTTP_202_ACCEPTED,
-             summary="Re-run processing (all stages, or insights only)")
+             summary="Re-run processing (all stages, or insights only)", dependencies=AI_GUARDS)
 async def reprocess_document(document_id: uuid.UUID, body: ReprocessRequest, user: User, db: Db) -> ReprocessResponse:
+    """Queues paid model work (embeddings for changed chunks, the insights call), so it shares the `ai` rate limit
+    and the daily cost quota with summaries and compare."""
     doc, run_id = await svc.reprocess(db, user.id, document_id, body.scope)
     return ReprocessResponse(document=svc.to_out(doc), run_id=run_id)
 

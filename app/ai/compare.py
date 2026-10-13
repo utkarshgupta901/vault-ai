@@ -146,7 +146,9 @@ async def _generate(prompt_input: str, owner_id: uuid.UUID) -> tuple[Comparison,
         await record_failed_call(usage=Usage(model=model), error_code=ErrorCode.UPSTREAM_TIMEOUT, **failed)
         raise AppError(ErrorCode.UPSTREAM_TIMEOUT, 504, "The comparison took too long; please try again.") from exc
     except ProviderError as exc:
-        await record_failed_call(usage=Usage(model=model), error_code=ErrorCode.UPSTREAM_AI_ERROR, **failed)
+        # exc.usage: a truncated/refused/unparsable reply was still billed, so record its real tokens.
+        await record_failed_call(usage=exc.usage or Usage(model=model), error_code=ErrorCode.UPSTREAM_AI_ERROR,
+                                 **failed)
         raise AppError(ErrorCode.UPSTREAM_AI_ERROR, 502, "The AI provider could not produce a comparison.",
                        {"kind": exc.kind}) from exc
 

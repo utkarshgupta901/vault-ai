@@ -36,7 +36,10 @@ def insights_body(attempt: Attempt) -> None:
     """Run the insights generator (app/ai/insights.py) and record its stage timings on the attempt.
 
     run_insights loads the pages, calls the model, verifies the result and writes it in one fenced transaction; it
-    raises ProviderError/PermanentError and leaves claiming, retries and processing_runs to run_attempt."""
+    raises ProviderError/PermanentError and leaves claiming, retries and processing_runs to run_attempt. When it
+    stored nothing because a reprocess or delete took over, this raises RunSuperseded, so the attempt is recorded
+    as failed/SUPERSEDED exactly like a superseded ingest, never as 'succeeded' (which would inflate success rates
+    in /metrics/processing)."""
     try:
         from app.ai.insights import run_insights
     except ModuleNotFoundError as exc:
@@ -44,10 +47,12 @@ def insights_body(attempt: Attempt) -> None:
             raise
         _insights_ready_without_content(attempt)
         return
-    timings = run_insights(attempt.document_id, attempt.run_id, task_id=attempt.task_id,
-                           request_id=attempt.request_id)
-    for stage, ms in (timings or {}).items():
+    result = run_insights(attempt.document_id, attempt.run_id, task_id=attempt.task_id,
+                          request_id=attempt.request_id)
+    for stage, ms in result.timings.items():
         attempt.record_stage(stage, ms)
+    if not result.written:
+        raise RunSuperseded()
 
 
 def _insights_ready_without_content(attempt: Attempt) -> None:

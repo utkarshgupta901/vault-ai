@@ -2,6 +2,8 @@
 
 from app.config import settings
 from app.ingestion.chunking import (
+    MAX_HEADER_TOKENS,
+    MAX_LABEL_TOKENS,
     MIN_TAIL_TOKENS,
     _split_raw,
     build_header,
@@ -13,6 +15,7 @@ from app.ingestion.chunking import (
 )
 from app.ingestion.extract import PageText
 from app.ingestion.pipeline import _Pending, batches
+from app.ingestion.titles import filename_title
 
 MODEL, DIMS = "text-embedding-3-small", 1536
 
@@ -115,3 +118,22 @@ def test_batches_respect_both_item_and_token_limits() -> None:
     assert [len(b) for b in batches(items, max_items=128, max_tokens=250)] == [2, 2, 2, 2, 2]
     assert [len(b) for b in batches(items, max_items=128, max_tokens=50)] == [1] * 10   # one oversize item still goes
     assert batches([], max_items=4, max_tokens=100) == []
+
+
+def test_header_is_capped_and_keeps_its_location() -> None:
+    # The header is repeated in every chunk's embedding input (8,192-token limit per input), so it has a hard cap.
+    header = build_header("Handbook", _words("heading", 3000), "p. 4")
+    assert count_tokens(header) <= MAX_HEADER_TOKENS + 2
+    assert header.startswith("Handbook > heading0 ") and header.endswith("… (p. 4)")
+    assert count_tokens(build_header(None, None, _words("label", 500))) <= MAX_LABEL_TOKENS + 3
+
+
+def test_normal_headers_are_unchanged_by_the_cap() -> None:
+    # Existing chunks keep their embed_hash: the cap only touches headers that were over the limit anyway.
+    assert build_header("Handbook", "Leave > PTO", "§ PTO") == "Handbook > Leave > PTO (§ PTO)"
+
+
+def test_filename_title_depends_only_on_the_filename() -> None:
+    assert filename_title("Larkspur_Handbook-2026.pdf") == "Larkspur Handbook 2026"
+    assert filename_title("NIST.AI.100-1.pdf") == "NIST.AI.100 1"
+    assert filename_title("___.txt") == "___.txt"          # never empty

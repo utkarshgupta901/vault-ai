@@ -56,11 +56,20 @@ def put_file(key: str, fileobj: IO[bytes], content_type: str) -> None:
 
 
 def download_to_temp(key: str, suffix: str = "") -> Path:
-    """Worker side: stream the object to a temp file and return its path (caller deletes it)."""
+    """Worker side: stream the object to a temp file and return its path (caller deletes it).
+
+    If the download fails (missing key, read timeout, soft time limit mid-transfer) the partial file is deleted here:
+    the caller never got a path, so nobody else could. Every transient retry would otherwise leave up to 25 MB
+    behind in the worker's /tmp."""
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-    with tmp:
-        _client().download_fileobj(settings.S3_BUCKET, key, tmp)
-    return Path(tmp.name)
+    path = Path(tmp.name)
+    try:
+        with tmp:
+            _client().download_fileobj(settings.S3_BUCKET, key, tmp)
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+    return path
 
 
 def open_stream(key: str) -> Any:

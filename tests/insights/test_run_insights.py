@@ -11,11 +11,13 @@ from sqlalchemy import select, text
 
 from app.ai.fake_provider import FakeProvider
 from app.ai.insights import RETRY_OUTPUT_TOKENS, run_insights
-from app.ai.provider import ProviderError
+from app.ai.provider import ProviderError, Usage
 from app.config import settings
 from app.core.db import async_session, sync_session
 from app.core.errors import ErrorCode, PermanentError
 from app.models import AIUsage, Document, DocumentInsight
+from app.worker.tasks import generate_insights
+from tests.ingestion.helpers import requeue, runs_of
 from tests.insights.helpers import canned_insights, sql, start_insights_run, upload_ready
 
 
@@ -48,9 +50,9 @@ async def test_run_insights_writes_verified_insights_and_marks_ready(client: Asy
     run_id = await start_insights_run(doc_id)
     fake.json_responses["DocumentInsights"] = canned_insights()
 
-    timings = run_insights(doc_id, run_id, task_id="task-1", request_id="req-1")
+    result = run_insights(doc_id, run_id, task_id="task-1", request_id="req-1")
 
-    assert set(timings) == {"load", "llm", "verify", "write"}
+    assert set(result.timings) == {"load", "llm", "verify", "write"} and result.written
     doc, ins = await _state(doc_id)
     assert ins is not None
     # verified insights row
@@ -112,9 +114,9 @@ async def test_stale_run_id_spends_nothing_and_writes_nothing(client: AsyncClien
     await start_insights_run(doc_id)
     seen = _spy_json(fake)
 
-    timings = run_insights(doc_id, uuid.uuid4(), task_id="stale", request_id=None)
+    result = run_insights(doc_id, uuid.uuid4(), task_id="stale", request_id=None)
 
-    assert set(timings) == {"load"} and seen == []
+    assert set(result.timings) == {"load"} and not result.written and seen == []
     doc, ins = await _state(doc_id)
     assert ins is None and doc.insights_status == "processing"
     assert await _usage_rows("stale") == []
@@ -130,7 +132,7 @@ async def test_run_superseded_during_llm_call_writes_only_usage(client: AsyncCli
         return canned_insights()
 
     fake.json_responses["DocumentInsights"] = reprocess_while_thinking
-    run_insights(doc_id, run_id, task_id="superseded", request_id=None)
+    assert not run_insights(doc_id, run_id, task_id="superseded", request_id=None).written
 
     doc, ins = await _state(doc_id)
     assert ins is None and doc.insights_status == "processing" and doc.title != "Brightline MSA"
@@ -141,7 +143,8 @@ async def test_deleted_document_is_a_quiet_no_op(client: AsyncClient, fake: Fake
     doc_id = await upload_ready(client)
     run_id = await start_insights_run(doc_id)
     await sql("DELETE FROM documents WHERE id = :id", id=doc_id)
-    assert set(run_insights(doc_id, run_id, task_id="gone", request_id=None)) == {"load"}
+    result = run_insights(doc_id, run_id, task_id="gone", request_id=None)
+    assert set(result.timings) == {"load"} and not result.written
 
 
 async def test_truncated_output_retries_once_with_a_bigger_budget(client: AsyncClient, fake: FakeProvider) -> None:
@@ -204,3 +207,64 @@ async def test_long_document_is_sampled(client: AsyncClient, fake: FakeProvider,
     assert 'pages="30" coverage="sampled"' in prompt_input
     assert '<page n="1"' in prompt_input and '<page n="30"' in prompt_input
     assert (await _state(doc_id))[1].coverage == "sampled"
+
+
+# --- billed failures are in the cost ledger (rule 7) -------------------------------------------------------------
+def _billed(kind: str, message: str, output_tokens: int = 8000) -> ProviderError:
+    """A reply OpenAI charged for but that is unusable: the provider attaches its usage."""
+    return ProviderError(kind, message, usage=Usage(model=settings.INSIGHTS_MODEL, input_tokens=1200,
+                                                    output_tokens=output_tokens))
+
+
+async def test_truncated_calls_are_recorded_as_failed_usage(client: AsyncClient, fake: FakeProvider) -> None:
+    doc_id = await upload_ready(client)
+    run_id = await start_insights_run(doc_id)
+    fake.fail_next.extend([_billed("incomplete", "cut", 8000), _billed("incomplete", "cut", 16000)])
+
+    with pytest.raises(PermanentError):
+        run_insights(doc_id, run_id, task_id="trunc", request_id="req-t")
+
+    rows = sorted(await _usage_rows("trunc"), key=lambda r: r.output_tokens)
+    assert [(r.success, r.error_code, r.output_tokens) for r in rows] == [
+        (False, "INSIGHTS_TRUNCATED", 8000), (False, "INSIGHTS_TRUNCATED", 16000)]
+    assert all(r.cost_usd > 0 and r.operation == "insights" and r.document_id == doc_id for r in rows)
+
+
+async def test_truncated_then_successful_call_records_both(client: AsyncClient, fake: FakeProvider) -> None:
+    doc_id = await upload_ready(client)
+    run_id = await start_insights_run(doc_id)
+    fake.fail_next.append(_billed("incomplete", "cut"))
+    fake.json_responses["DocumentInsights"] = canned_insights()
+
+    assert run_insights(doc_id, run_id, task_id="retry", request_id=None).written
+
+    rows = await _usage_rows("retry")
+    assert sorted((r.success, r.error_code) for r in rows) == [(False, "INSIGHTS_TRUNCATED"), (True, None)]
+
+
+async def test_unbilled_failures_write_no_usage(client: AsyncClient, fake: FakeProvider) -> None:
+    # An HTTP-level failure has no usage: nothing was billed, so nothing is recorded (and nothing is invented).
+    doc_id = await upload_ready(client)
+    run_id = await start_insights_run(doc_id)
+    fake.fail_next.append(ProviderError("bad_request", "invalid model", status_code=400))
+    with pytest.raises(PermanentError):
+        run_insights(doc_id, run_id, task_id="http400", request_id=None)
+    assert await _usage_rows("http400") == []
+
+
+async def test_superseded_insights_attempt_is_not_recorded_as_succeeded(client: AsyncClient,
+                                                                       fake: FakeProvider) -> None:
+    doc_id = await upload_ready(client)
+    run_id = requeue(doc_id, scope="insights")
+
+    def reprocess_while_thinking(_: str) -> Any:
+        with sync_session() as s:   # a newer run takes over while the model is working
+            s.execute(text("UPDATE documents SET current_run_id = gen_random_uuid() WHERE id = :id"), {"id": doc_id})
+        return canned_insights()
+
+    fake.json_responses["DocumentInsights"] = reprocess_while_thinking
+    generate_insights.apply(kwargs={"document_id": str(doc_id), "run_id": str(run_id)})
+
+    attempts = [r for r in runs_of(doc_id, "insights") if r.run_id == run_id]
+    assert [(r.status, r.error_code) for r in attempts] == [("failed", "SUPERSEDED")]
+    assert set(attempts[0].stage_ms) == {"load", "llm", "verify", "write"}    # timings are kept
