@@ -7,6 +7,14 @@ idempotent and fenced by run_id (see services/state.py and worker/attempt.py).
 
 Queues: `ingest` (extract/chunk/embed — CPU + embeddings API) and `ai` (LLM insights). Separate queues mean a slow
 LLM call can never block ingestion, and each pool scales independently.
+
+Broker connections in the API process: every publish borrows one connection from Celery's pool for the length of a
+single LPUSH, and /health/ready's worker inspect uses its own connection (see api/health.py). No code path holds one
+pool connection while waiting for another, so a bounded pool cannot deadlock, and we keep Celery's default bound of 10
+(caps Redis connections per process). `broker_pool_limit=None` would also avoid the 2026-10-13 deadlock, but it opens
+and closes a connection (TCP + TLS in the cloud) for every publish and has no upper bound under bursts.
+The socket timeouts make a broker that is down OR accepts connections but never answers fail a call within seconds;
+without `socket_timeout` a publish could block its thread forever. dispatch.py adds an overall bound on top.
 """
 
 import structlog
@@ -25,9 +33,11 @@ celery_app.conf.update(
     task_serializer="json",
     accept_content=["json"],
     broker_connection_retry_on_startup=True,
+    broker_pool_limit=10,              # Celery's default, stated on purpose (see the module docstring)
     broker_transport_options={
         "visibility_timeout": 900,     # unacked msg redelivered after 15 min; > hard time limit, so no double-runs
         "socket_connect_timeout": 2,
+        "socket_timeout": 5,           # > kombu's 1 s BRPOP timeout, so idle workers are unaffected
     },
     task_soft_time_limit=540,          # raises SoftTimeLimitExceeded inside the task -> clean failure
     task_time_limit=600,               # hard kill

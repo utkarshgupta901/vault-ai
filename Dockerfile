@@ -31,7 +31,9 @@ COPY migrations ./migrations
 COPY app ./app
 COPY scripts ./scripts
 COPY evals ./evals
-COPY --from=web /web/dist ./app/static/spa
+# The SPA lives outside ./app on purpose: the dev stack bind-mounts ./app over /srv/app, which used to hide the build,
+# so `make up` served a JSON 404 at :8000. app/main.py serves /srv/spa when it exists (SPA_DIR overrides).
+COPY --from=web /web/dist /srv/spa
 
 RUN useradd --create-home --uid 10001 vault && chown -R vault /srv
 USER vault

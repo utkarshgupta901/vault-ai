@@ -2,20 +2,32 @@ SHELL := /bin/bash
 COMPOSE := docker compose
 API := http://localhost:8000
 KEY ?= vault-demo-key
+QUOTA_USER ?= demo
+QUOTA_USD ?= 100
 
 .DEFAULT_GOAL := help
-.PHONY: help up demo down reset logs ps migrate seed test test-fast lint fmt smoke smoke-llm eval eval-demo eval-retrieval doctor workers web-dev web-build psql redis-cli snapshot-demo restore-demo freeze-starters
+.PHONY: help up demo demo-luna raise-quota down reset logs ps migrate seed test test-fast lint fmt smoke smoke-llm eval eval-demo eval-retrieval doctor workers web-dev web-build psql redis-cli snapshot-demo restore-demo freeze-starters
 
 help: ## Show targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
 
-up: ## Dev stack (bind mounts + auto-reload)
+up: ## Dev stack (bind mounts + auto-reload: a file save restarts the API/workers, so not for presenting)
 	$(COMPOSE) up -d --build
 	@$(MAKE) --no-print-directory wait
 
-demo: ## Demo stack: built image only, no reload, no bind mounts
+demo: ## PRESENTATION MODE: built image only, no reload, no bind mounts (also switches back from demo-luna)
 	$(COMPOSE) -f compose.yaml up -d --build
 	@$(MAKE) --no-print-directory wait
+
+# Only the api container is recreated (--no-deps): workers, data and queues are untouched. Run it after `make demo`
+# (it reuses the image that built); `make demo` again returns the API to the default answer model.
+demo-luna: ## Demo stack with answers on gpt-6-luna (effort low): faster first token if Sol is slow today
+	ANSWER_MODEL=gpt-6-luna ANSWER_EFFORT=low $(COMPOSE) -f compose.yaml up -d --no-deps --force-recreate api
+	@$(MAKE) --no-print-directory wait
+
+raise-quota: ## Raise a user's daily AI spend limit (default: demo -> 100 USD; QUOTA_USER=, QUOTA_USD=)
+	$(COMPOSE) exec -T postgres psql -U vault -d vault -v ON_ERROR_STOP=1 \
+		-c "UPDATE users SET daily_cost_limit_usd = $(QUOTA_USD) WHERE name = '$(QUOTA_USER)' RETURNING name, daily_cost_limit_usd"
 
 wait:
 	@echo -n "waiting for API"; for i in $$(seq 1 60); do curl -sf $(API)/health/live >/dev/null && echo " ok" && exit 0; echo -n "."; sleep 2; done; echo " timeout"; exit 1

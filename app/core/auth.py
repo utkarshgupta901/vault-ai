@@ -8,6 +8,7 @@ The dependency opens its own short DB session (instead of reusing a request-scop
 streaming routes, where a request-scoped session would stay open for the whole stream."""
 
 import hashlib
+import time
 import uuid
 from dataclasses import dataclass
 from decimal import Decimal
@@ -23,6 +24,10 @@ from app.models import User
 
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False, description="Your Vault API key.")
 
+KNOWN_KEY_TTL_S = 60.0
+_MAX_KNOWN_KEYS = 1024
+_known_key_hashes: dict[str, float] = {}   # sha256(valid key) -> monotonic expiry
+
 
 @dataclass(frozen=True)
 class CurrentUser:
@@ -34,6 +39,28 @@ class CurrentUser:
 
 def hash_api_key(key: str) -> str:
     return hashlib.sha256(key.encode()).hexdigest()
+
+
+async def is_known_api_key(api_key: str) -> bool:
+    """Does any user have this key? A cheap pre-check for UploadGuard, which must reject a bogus key BEFORE the
+    request body is read (FastAPI reads the body before dependencies such as get_current_user run).
+
+    Only hashes of valid keys are cached (for KNOWN_KEY_TTL_S), so a stream of random keys can't grow the cache; each
+    unknown key costs one lookup on the unique index users.api_key_hash. It is a filter, not the authority:
+    get_current_user still checks the database on every request, so a key revoked within the TTL is still refused
+    (only its body gets read first)."""
+    digest = hash_api_key(api_key)
+    now = time.monotonic()
+    if _known_key_hashes.get(digest, 0.0) > now:
+        return True
+    async with async_session() as session:
+        found = await session.scalar(select(User.id).where(User.api_key_hash == digest))
+    if found is None:
+        return False
+    if len(_known_key_hashes) >= _MAX_KNOWN_KEYS:   # only real keys land here; the bound is a safety net
+        _known_key_hashes.clear()
+    _known_key_hashes[digest] = now + KNOWN_KEY_TTL_S
+    return True
 
 
 async def get_current_user(request: Request, api_key: str | None = Security(api_key_header)) -> CurrentUser:
