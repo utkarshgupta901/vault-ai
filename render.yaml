@@ -1,0 +1,108 @@
+# Render Blueprint for Vault AI (https://render.com/docs/blueprint-spec).
+#
+#   vault-api     Docker web service: FastAPI + the built React dashboard (single origin), runs migrations pre-deploy
+#   vault-worker  Docker background worker: same image, Celery consuming both queues (ingest, ai)
+#   vault-kv      Key Value (Valkey 8) as the Celery broker + cache; noeviction so queued tasks are never dropped
+#   vault-db      Postgres 17 (pgvector is enabled by migration 0001: CREATE EXTENSION vector)
+#
+# Object storage is external (Render has no GA object store): create a Cloudflare R2 bucket (or AWS S3) and paste its
+# endpoint + keys when the Blueprint asks for the `sync: false` values. Background workers and preDeployCommand need
+# paid instance types; see docs/DEPLOY_RENDER.md for cost and the free single-container fallback.
+
+services:
+  - type: web
+    name: vault-api
+    runtime: docker
+    region: oregon
+    plan: 0.5c-512mb                # cheapest paid instance ($7/mo); workers and preDeployCommand need a paid plan
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    # The image's default CMD runs: uvicorn app.main:app --host 0.0.0.0 --port ${PORT}
+    preDeployCommand: python -m app.cli bootstrap        # alembic upgrade head + ensure bucket + seed API users
+    healthCheckPath: /health/live
+    autoDeploy: true
+    envVars:
+      - key: APP_ENV
+        value: prod
+      - key: LOG_JSON
+        value: "true"
+      - key: DATABASE_URL                                # postgres:// is normalized to postgresql+psycopg:// in app/config.py
+        fromDatabase: { name: vault-db, property: connectionString }
+      - key: BROKER_URL                                  # internal redis:// URL (no TLS inside Render's private network)
+        fromService: { type: keyvalue, name: vault-kv, property: connectionString }
+      - key: CACHE_URL                                   # same instance; cache/rate-limit keys use their own prefixes
+        fromService: { type: keyvalue, name: vault-kv, property: connectionString }
+      - key: DB_POOL_SIZE                                # small pools: the cheapest Postgres allows ~100 connections
+        value: "3"
+      - key: DB_MAX_OVERFLOW
+        value: "2"
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: S3_ENDPOINT_URL                             # e.g. https://<account_id>.r2.cloudflarestorage.com
+        sync: false
+      - key: S3_ACCESS_KEY_ID
+        sync: false
+      - key: S3_SECRET_ACCESS_KEY
+        sync: false
+      - key: S3_BUCKET
+        value: vault-uploads
+      - key: S3_REGION                                   # "auto" for R2; the real region for AWS S3
+        value: auto
+      - key: SEED_DEMO_API_KEY                           # API keys for the seeded users (only their sha256 is stored)
+        sync: false
+      - key: SEED_OTHER_API_KEY
+        sync: false
+      - key: SEED_EVAL_API_KEY
+        sync: false
+      - key: CORS_ORIGINS                                # the dashboard is same-origin; only needed for other clients
+        value: '[]'
+
+  - type: worker
+    name: vault-worker
+    runtime: docker
+    region: oregon
+    plan: 0.5c-512mb                # cheapest paid instance ($7/mo); workers and preDeployCommand need a paid plan
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    # One worker process consumes both queues on the smallest plan; split into two services to scale them separately.
+    dockerCommand: celery -A app.worker.celery_app worker -Q ingest,ai -c 2 --max-memory-per-child=300000 --loglevel=INFO
+    autoDeploy: true
+    envVars:
+      - key: APP_ENV
+        value: prod
+      - key: LOG_JSON
+        value: "true"
+      - key: DATABASE_URL
+        fromDatabase: { name: vault-db, property: connectionString }
+      - key: BROKER_URL
+        fromService: { type: keyvalue, name: vault-kv, property: connectionString }
+      - key: CACHE_URL
+        fromService: { type: keyvalue, name: vault-kv, property: connectionString }
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: S3_ENDPOINT_URL
+        sync: false
+      - key: S3_ACCESS_KEY_ID
+        sync: false
+      - key: S3_SECRET_ACCESS_KEY
+        sync: false
+      - key: S3_BUCKET
+        value: vault-uploads
+      - key: S3_REGION
+        value: auto
+
+  - type: keyvalue
+    name: vault-kv
+    region: oregon
+    plan: free                      # 25 MB, no persistence: fine for a demo; use a paid plan to keep queued tasks across restarts
+    maxmemoryPolicy: noeviction     # a broker must never silently evict queued tasks
+    ipAllowList: []                 # internal connections only
+
+databases:
+  - name: vault-db
+    region: oregon
+    plan: 0.1c-256mb                # cheapest paid Postgres (~$6/mo + storage); "free" expires after 30 days
+    postgresMajorVersion: "17"
+    databaseName: vault
+    user: vault
+    ipAllowList: []                 # internal only
