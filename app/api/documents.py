@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth import CurrentUser, get_current_user
 from app.core.db import async_session, get_db
+from app.core.ratelimit import UPLOAD_GUARDS
 from app.models import Document
 from app.schemas.common import ERROR_RESPONSES, Page
 from app.schemas.documents import (
@@ -50,6 +51,7 @@ def _links(document_id: uuid.UUID) -> UploadLinks:
     summary="Upload a document (PDF, DOCX, TXT, MD)",
     responses={200: {"model": UploadResponse, "description": "Duplicate of an existing document (no new work)"},
                411: {}, 413: {}, 415: {}, 503: {}},
+    dependencies=UPLOAD_GUARDS,
 )
 async def upload_document(user: User, db: Db, response: Response, file: UploadFile = File(...)) -> UploadResponse:
     """Validates and stores the file, then queues it for async processing and returns **202** immediately.

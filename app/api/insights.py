@@ -14,6 +14,7 @@ from app.ai import summaries
 from app.ai.compare import CompareOut, CompareRequest, compare_documents
 from app.core.auth import CurrentUser, get_current_user
 from app.core.db import get_db
+from app.core.ratelimit import AI_GUARDS
 from app.models import DocumentInsight
 from app.schemas.common import ERROR_RESPONSES
 from app.schemas.documents import SummaryOut, SummaryRequest
@@ -37,7 +38,7 @@ def insights_payload(row: DocumentInsight) -> dict[str, Any]:
 
 # Registered before the /documents/{document_id}/... routes so the literal path can never be read as an id.
 @router.post("/documents/compare", response_model=CompareOut, summary="Compare 2-4 documents side by side",
-             responses={409: {}, 502: {}, 504: {}})
+             responses={409: {}, 502: {}, 504: {}}, dependencies=AI_GUARDS)
 async def compare(body: CompareRequest, user: User) -> CompareOut:
     """Structured comparison over the **full text** of each document (no retrieval): dimensions with one value
     per document (with a verified page), similarities, differences and a summary. Documents totalling more than
@@ -56,7 +57,7 @@ async def get_insights(document_id: uuid.UUID, user: User, db: Db) -> InsightsOu
 
 
 @router.post("/documents/{document_id}/summaries", response_model=SummaryOut, summary="Custom summary (cached)",
-             responses={409: {}, 502: {}, 504: {}})
+             responses={409: {}, 502: {}, 504: {}}, dependencies=AI_GUARDS)
 async def create_summary(document_id: uuid.UUID, body: SummaryRequest, user: User) -> SummaryOut:
     """Summary with a chosen length (short ~80 words, medium ~200, detailed ~450), tone (neutral, executive,
     technical, simple) and optional focus. Identical requests are served from the cache (`cached: true`)."""
