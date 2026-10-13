@@ -9,13 +9,17 @@
 
 import os
 
+# Parallel agents each set TEST_DB_NAME / TEST_CACHE_DB so their test runs never truncate each other's data.
+TEST_DB = os.environ.get("TEST_DB_NAME", "vault_test")
+TEST_CACHE_DB = os.environ.get("TEST_CACHE_DB", "14")
+
 os.environ.update({
     "APP_ENV": "test",
     "LLM_PROVIDER": "fake",
     "OPENAI_API_KEY": "",
-    "DATABASE_URL": "postgresql+psycopg://vault:vault@localhost:5433/vault_test",
+    "DATABASE_URL": f"postgresql+psycopg://vault:vault@localhost:5433/{TEST_DB}",
     "BROKER_URL": "redis://localhost:6380/15",
-    "CACHE_URL": "redis://localhost:6380/14",
+    "CACHE_URL": f"redis://localhost:6380/{TEST_CACHE_DB}",
     "S3_ENDPOINT_URL": "http://localhost:9200",
     "S3_BUCKET": "vault-test",
     "LOG_LEVEL": "WARNING",
@@ -56,8 +60,8 @@ def _services() -> Iterator[None]:
     """Create + migrate the test database, ensure the bucket, seed users. Runs once per session."""
     admin = "postgresql://vault:vault@localhost:5433/vault"
     with psycopg.connect(admin, autocommit=True) as conn:
-        if not conn.execute("SELECT 1 FROM pg_database WHERE datname = 'vault_test'").fetchone():
-            conn.execute("CREATE DATABASE vault_test")
+        if not conn.execute("SELECT 1 FROM pg_database WHERE datname = %s", (TEST_DB,)).fetchone():
+            conn.execute(f'CREATE DATABASE "{TEST_DB}"')
     from app.cli import ensure_bucket, migrate, seed_users
 
     migrate(settings.DATABASE_URL)
