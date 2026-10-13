@@ -4,7 +4,7 @@ API := http://localhost:8000
 KEY ?= vault-demo-key
 
 .DEFAULT_GOAL := help
-.PHONY: help up demo down reset logs ps migrate seed test test-fast lint fmt smoke smoke-llm eval eval-demo doctor workers web-dev web-build psql redis-cli
+.PHONY: help up demo down reset logs ps migrate seed test test-fast lint fmt smoke smoke-llm eval eval-demo eval-retrieval doctor workers web-dev web-build psql redis-cli snapshot-demo restore-demo freeze-starters
 
 help: ## Show targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
@@ -62,6 +62,18 @@ eval: ## RAG evaluation over the golden set (eval user)
 
 eval-demo: ## Only demo-tagged cases, each repeated 3x (must pass 3/3)
 	uv run python evals/run_eval.py --api $(API) --key vault-eval-key --tag demo --repeat 3
+
+eval-retrieval: ## Retrieval-only metrics (hit@k, MRR per mode), no LLM answers
+	uv run python evals/run_eval.py --api $(API) --key vault-eval-key --retrieval-only
+
+freeze-starters: ## Freeze the demo docs' suggested questions into evals/golden_starters.yaml
+	uv run python scripts/freeze_starters.py --api $(API) --key $(KEY)
+
+snapshot-demo: ## Save the demo DB + S3 objects to demo_snapshot/
+	bash scripts/snapshot_demo.sh
+
+restore-demo: ## Restore the demo DB + S3 objects from demo_snapshot/ (overwrites current data)
+	bash scripts/restore_demo.sh
 
 doctor: ## Pre-demo checks: ports, health, workers, spend
 	uv run python scripts/doctor.py --api $(API) --key $(KEY)

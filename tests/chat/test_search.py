@@ -15,6 +15,7 @@ HANDBOOK = "Larkspur employees receive 18 PTO days per year. Every incident need
 async def test_search_shape_and_identifier_hit(client: AsyncClient, db: AsyncSession, fake: FakeProvider) -> None:
     ops = await upload_ready(client, "ops.txt", OPS)
     await upload_ready(client, "handbook.txt", HANDBOOK)
+    fake.calls.clear()                      # ingestion (insights) calls the model; the search itself must not
     r = await client.get(f"{API}/search", params={"q": "What happened in incident LRK-4471?"}, headers=DEMO)
     assert r.status_code == 200, r.text
     body = r.json()

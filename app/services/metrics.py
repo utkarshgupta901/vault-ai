@@ -171,7 +171,7 @@ async def document_stats(db: AsyncSession, owner_id: uuid.UUID) -> DocumentStats
 _RUN_COUNTS = text("""
 SELECT count(*)                                       AS attempts,
        count(*) FILTER (WHERE status = 'succeeded')   AS succeeded,
-       count(*) FILTER (WHERE status = 'failed')      AS failed,
+       count(*) FILTER (WHERE status = 'failed' AND error_code IS DISTINCT FROM 'SUPERSEDED') AS failed,  -- a reprocess taking over is not a failure
        count(*) FILTER (WHERE status = 'retrying')    AS retried,
        count(*) FILTER (WHERE error_code = 'WORKER_LOST') AS crashed
 FROM processing_runs
@@ -202,7 +202,7 @@ ORDER BY s.key
 _RUN_FAILURES = text("""
 SELECT coalesce(error_code, 'UNKNOWN') AS key, count(*) AS count
 FROM processing_runs
-WHERE owner_id = :owner_id AND started_at >= :since AND status = 'failed'
+WHERE owner_id = :owner_id AND started_at >= :since AND status = 'failed' AND error_code IS DISTINCT FROM 'SUPERSEDED'
 GROUP BY 1
 ORDER BY 2 DESC, 1
 """)
@@ -210,7 +210,7 @@ ORDER BY 2 DESC, 1
 _RUN_THROUGHPUT = text("""
 SELECT h.hour,
        count(r.id) FILTER (WHERE r.status = 'succeeded') AS succeeded,
-       count(r.id) FILTER (WHERE r.status = 'failed')    AS failed
+       count(r.id) FILTER (WHERE r.status = 'failed' AND r.error_code IS DISTINCT FROM 'SUPERSEDED') AS failed
 FROM generate_series(date_trunc('hour', CAST(:since AS timestamptz) AT TIME ZONE 'UTC'),
                      date_trunc('hour', CAST(:now AS timestamptz) AT TIME ZONE 'UTC'),
                      interval '1 hour') AS h(hour)
@@ -226,7 +226,7 @@ SELECT r.document_id, d.filename, r.task, r.error_code, r.error_message,
        coalesce(r.finished_at, r.started_at) AS at
 FROM processing_runs r
 LEFT JOIN documents d ON d.id = r.document_id AND d.owner_id = r.owner_id
-WHERE r.owner_id = :owner_id AND r.started_at >= :since AND r.status = 'failed'
+WHERE r.owner_id = :owner_id AND r.started_at >= :since AND r.status = 'failed' AND r.error_code IS DISTINCT FROM 'SUPERSEDED'
 ORDER BY at DESC, r.id DESC
 LIMIT :limit
 """)

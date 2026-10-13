@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth import CurrentUser, get_current_user
 from app.core.db import get_db
+from app.core.ratelimit import CHAT_GUARDS
 from app.schemas.chat import (
     AskResponse,
     CitationsEvent,
@@ -91,7 +92,8 @@ Turn = Annotated[svc.Turn, Depends(_start_turn)]
 
 
 @router.post("/sessions/{session_id}/messages", response_model=AskResponse,
-             summary="Ask a question (JSON response)", responses={**ASK_ERRORS, 502: {}, 504: {}})
+             summary="Ask a question (JSON response)", responses={**ASK_ERRORS, 502: {}, 504: {}},
+             dependencies=CHAT_GUARDS)  # route dependencies run before _start_turn writes any row
 async def ask(turn: Turn) -> AskResponse:
     """Same pipeline as the streaming endpoint, returned as one JSON body once the answer is complete (overall
     deadline JSON_ANSWER_TIMEOUT_S -> 504 UPSTREAM_TIMEOUT). Retrying with the same `client_message_id` returns
@@ -100,7 +102,8 @@ async def ask(turn: Turn) -> AskResponse:
 
 
 @router.post("/sessions/{session_id}/messages/stream", response_class=EventSourceResponse,
-             summary="Ask a question (Server-Sent Events)", responses=ASK_ERRORS)
+             summary="Ask a question (Server-Sent Events)", responses=ASK_ERRORS,
+             dependencies=CHAT_GUARDS)
 async def ask_stream(turn: Turn) -> AsyncIterator[ServerSentEvent]:
     """Events, in order: `meta` (sources, standalone query, warnings), `token` (repeated), `citations` (checked
     citations, answer type, confidence, signals), `followups` (optional), `done` (usage, timings). A failure after

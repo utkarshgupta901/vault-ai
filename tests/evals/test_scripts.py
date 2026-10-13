@@ -12,7 +12,7 @@ import yaml
 
 from evals import golden
 from evals.api_client import VaultClient, is_terminal, parse_sse
-from evals.corpus import DEMO_DOCS, SEED_FILES
+from evals.corpus import DEMO_DOCS, SEED_FILES, user_files
 from tests.evals.fake_api import FakeVaultApi, transport
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -111,7 +111,8 @@ def test_seed_is_idempotent_then_doctor_is_green(capsys: pytest.CaptureFixture[s
     assert len(api.docs) == n_docs and "duplicate" in capsys.readouterr().out
     assert doctor.main(["--api", "http://vault.test"], transport=transport(api)) == 0
     out = capsys.readouterr().out
-    assert "0 FAIL" in out and "5/5 seed files ready" in out
+    expected = len(SEED_FILES) + len(user_files())          # + a real document in demo_docs/user/, if present
+    assert "0 FAIL" in out and f"{expected}/{expected} seed files ready" in out
 
 
 def test_seed_reports_missing_files(tmp_path: Path) -> None:

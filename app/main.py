@@ -14,7 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from app.api import documents, health
 from app.config import settings
 from app.core.db import get_async_engine
-from app.core.errors import install_error_handlers
+from app.core.errors import AppError, ErrorCode, install_error_handlers
 from app.core.logging import configure_logging
 from app.core.request_context import RequestIdMiddleware
 from app.core.upload_guard import UploadGuardMiddleware
@@ -76,6 +76,8 @@ def create_app() -> FastAPI:
 
         @app.get("/{path:path}", include_in_schema=False)
         async def spa(path: str) -> FileResponse:
+            if path.startswith(("api/", "health/")):  # unknown API path: a JSON 404, never the dashboard HTML
+                raise AppError(ErrorCode.NOT_FOUND, 404, f"No route for /{path}.")
             candidate = (SPA_DIR / path).resolve()
             if path and candidate.is_file() and SPA_DIR.resolve() in candidate.parents:
                 return FileResponse(candidate)

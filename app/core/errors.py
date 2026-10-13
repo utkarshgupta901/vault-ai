@@ -57,6 +57,8 @@ class ErrorCode(StrEnum):
     PROCESSING_TIMEOUT = "PROCESSING_TIMEOUT"
     PROCESSING_CRASHED = "PROCESSING_CRASHED"
     WORKER_LOST = "WORKER_LOST"
+    SUPERSEDED = "SUPERSEDED"                 # processing_runs only: a reprocess took over this attempt
+    PROCESSING_ERROR = "PROCESSING_ERROR"     # unexpected exception in a worker (retryable via reprocess)
     PROVIDER_UNAVAILABLE = "PROVIDER_UNAVAILABLE"
     PROVIDER_BAD_REQUEST = "PROVIDER_BAD_REQUEST"
     INSIGHTS_REFUSED = "INSIGHTS_REFUSED"

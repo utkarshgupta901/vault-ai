@@ -104,6 +104,7 @@ class MessageOut(ApiModel):
     cost_usd: Decimal | None = None
     ttft_ms: int | None = None
     latency_ms: int | None = None
+    timings: dict[str, int] | None = None   # {condense?, embed?, retrieve, ttft?, total} in ms
     created_at: datetime
 
 
