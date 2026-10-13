@@ -1,7 +1,7 @@
 import { AlertCircle, CircleSlash, Info, RotateCw, SearchX, ShieldAlert, ShieldCheck, ShieldQuestion, Sparkles, User } from 'lucide-react'
 import { useMemo } from 'react'
 import type { Confidence } from '../../api/types'
-import { isUnverified, rewriteDiffers, type AnswerView } from '../../lib/answers'
+import { isUnverified, rewriteDiffers, warningText, type AnswerView } from '../../lib/answers'
 import { buildCitationLookup, splitIncompleteMarker, type CitationInfo } from '../../lib/citations'
 import { cx } from '../../lib/cx'
 import { fmtMs, fmtUsd } from '../../lib/format'
@@ -18,14 +18,6 @@ export function UserMessage({ content }: { content: string }) {
       </div>
     </div>
   )
-}
-
-/** Plain-language explanations of the server's warning codes (design §2b); unknown codes are shown as-is. */
-const WARNING_TEXT: Record<string, string> = {
-  fallback_model: 'The main model was slow to start, so the fast fallback model answered.',
-  keyword_only: 'Query embedding timed out; keyword-only retrieval was used.',
-  condense_fallback: 'Rewriting the follow-up timed out; your question was used as typed.',
-  docs_not_ready: 'Some documents in this chat are still processing and were not searched.',
 }
 
 const CONFIDENCE: Record<Confidence, { tone: Tone; icon: typeof ShieldCheck; label: string }> = {
@@ -130,7 +122,7 @@ function AnswerFooter({ view }: { view: AnswerView }) {
             <li key={w} className="flex items-start gap-1.5 text-xs text-zinc-500">
               <Info className="mt-0.5 size-3.5 shrink-0" aria-hidden />
               <span>
-                {WARNING_TEXT[w] ?? w} <span className="font-mono text-zinc-400">({w})</span>
+                {warningText(w)} <span className="font-mono text-zinc-400">({w})</span>
               </span>
             </li>
           ))}

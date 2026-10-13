@@ -1,5 +1,6 @@
 /** Typed calls for /api/v1/metrics/* (app/schemas/metrics.py) and the readiness probe. */
 import { getApiKey, request } from './client'
+import { fetchReadiness } from './readiness'
 import type {
   AIUsageMetrics,
   ChatMetrics,
@@ -26,13 +27,7 @@ export const getChatMetrics = (signal?: AbortSignal) =>
 export const getSystemMetrics = (signal?: AbortSignal) =>
   request<SystemMetrics>(`${BASE}/system`, { query: { window: '1h' }, signal })
 
-/** /health/ready answers 503 *with a JSON body* when a hard dependency is down, so read the body for any status
- *  instead of treating 503 as an exception. Returns null when the API is unreachable. */
-export async function getReadiness(signal?: AbortSignal): Promise<ReadyResponse | null> {
-  try {
-    const res = await fetch('/health/ready', { headers: { 'X-API-Key': getApiKey() }, signal })
-    return (await res.json()) as ReadyResponse
-  } catch {
-    return null
-  }
-}
+/** Readiness probe for the health dot: null when the API is unreachable or slower than READY_TIMEOUT_MS
+ *  (see readiness.ts for the timeout and abort handling). */
+export const getReadiness = (signal?: AbortSignal): Promise<ReadyResponse | null> =>
+  fetchReadiness({ 'X-API-Key': getApiKey() }, signal)

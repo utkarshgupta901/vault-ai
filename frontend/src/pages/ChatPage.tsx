@@ -14,7 +14,7 @@ import { Badge, Button, EmptyState, ErrorState, Skeleton } from '../components/u
 import { useApi } from '../hooks/useApi'
 import { useChat } from '../hooks/useChat'
 import { useToast } from '../hooks/useToast'
-import { fromLive, fromMessage, questionFor } from '../lib/answers'
+import { fromLive, fromMessage, questionFor, warningText } from '../lib/answers'
 import type { CitationInfo } from '../lib/citations'
 import { sessionLabel } from '../lib/sessions'
 
@@ -164,12 +164,19 @@ function SessionHeader({ session, docNames }: { session: SessionOut | undefined;
         ) : (
           session.document_ids.map((id) => <Badge key={id}>{docNames.get(id) ?? 'Document (processing or removed)'}</Badge>)
         )}
-        {session.warnings.map((w) => (
-          <Badge key={w} tone="amber" icon={TriangleAlert}>
-            {w}
-          </Badge>
-        ))}
       </div>
+      {session.warnings.length > 0 && (
+        <ul className="mt-1.5 space-y-0.5">
+          {session.warnings.map((w) => (
+            <li key={w} className="flex items-start gap-1.5 text-xs text-amber-800">
+              <TriangleAlert className="mt-0.5 size-3.5 shrink-0" aria-hidden />
+              <span>
+                {warningText(w)} <span className="font-mono text-amber-600/70">({w})</span>
+              </span>
+            </li>
+          ))}
+        </ul>
+      )}
     </div>
   )
 }

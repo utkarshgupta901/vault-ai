@@ -151,6 +151,7 @@ export function DocumentDetailPage() {
           ) : (
             <InsightsPanel
               documentId={doc.id}
+              mimeType={doc.mime_type}
               status={doc.insights_status}
               onOpenPage={openPage}
               onAsk={(q) => ask(q)}

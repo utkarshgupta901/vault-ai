@@ -1,14 +1,17 @@
 import { AlertTriangle, CircleHelp, Lightbulb, MessageSquarePlus, ShieldAlert, Sparkles } from 'lucide-react'
 import type { ReactNode } from 'react'
-import { isRouteMissing } from '../../api/client'
-import { getInsights } from '../../api/documents'
+import { isAbortError, isRouteMissing } from '../../api/client'
+import { getInsights, getPage } from '../../api/documents'
 import type { DocumentInsights, Entity, InsightsStatus, RiskFlag } from '../../api/types'
 import { useApi } from '../../hooks/useApi'
+import { hasRealPages, pageRefLabel } from '../../lib/documents'
 import { fmtDate, fmtDateTime, humanize } from '../../lib/format'
 import { Badge, Button, Card, CardHeader, EmptyState, ErrorState, Skeleton, Spinner, type Tone } from '../ui'
 
 interface InsightsPanelProps {
   documentId: string
+  /** Decides how page chips are labelled: PDFs have pages, other formats have sections/parts (lib/documents.ts). */
+  mimeType: string
   /** Live insights status from the document row; a change triggers a refetch of the insights. */
   status: InsightsStatus
   onOpenPage: (page: number, highlight?: string) => void
@@ -18,7 +21,7 @@ interface InsightsPanelProps {
 }
 
 /** Structured AI insights (GET /documents/{id}/insights). Quotes and pages were verified server-side. */
-export function InsightsPanel({ documentId, status, onOpenPage, onAsk, onRegenerate, askBusy }: InsightsPanelProps) {
+export function InsightsPanel({ documentId, mimeType, status, onOpenPage, onAsk, onRegenerate, askBusy }: InsightsPanelProps) {
   const { data, error, reload } = useApi(`insights:${documentId}:${status}`, (signal) => getInsights(documentId, signal))
 
   let body
@@ -54,7 +57,9 @@ export function InsightsPanel({ documentId, status, onOpenPage, onAsk, onRegener
       </EmptyState>
     )
   } else {
-    body = <InsightsBody insights={data.insights} onOpenPage={onOpenPage} onAsk={onAsk} askBusy={askBusy} />
+    body = (
+      <InsightsBody documentId={documentId} mimeType={mimeType} insights={data.insights} onOpenPage={onOpenPage} onAsk={onAsk} askBusy={askBusy} />
+    )
   }
 
   return (
@@ -87,16 +92,57 @@ function InsightsSkeleton() {
 const SEVERITY_TONE: Record<RiskFlag['severity'], Tone> = { high: 'red', medium: 'amber', low: 'neutral' }
 const SENTIMENT_TONE: Record<DocumentInsights['sentiment'], Tone> = { positive: 'green', neutral: 'neutral', negative: 'red', mixed: 'amber' }
 
-function PageLink({ page, onOpen }: { page: number | null; onOpen: () => void }) {
+const NO_LABELS: ReadonlyMap<number, string> = new Map()
+
+/**
+ * Stored labels ("§ Termination", "part 2") of the pages the insights point at, fetched only for documents without
+ * real pages (see hasRealPages). One small GET per distinct page, one at a time, so a dozen chips never send a burst;
+ * a page that fails to load keeps its fallback label and its chip still opens the viewer.
+ */
+function usePageLabels(documentId: string, pages: number[], enabled: boolean): ReadonlyMap<number, string> {
+  const key = enabled && pages.length > 0 ? `page-labels:${documentId}:${pages.join(',')}` : null
+  const { data } = useApi(key, async (signal) => {
+    const labels = new Map<number, string>()
+    for (const page of pages) {
+      try {
+        labels.set(page, (await getPage(documentId, page, signal)).label)
+      } catch (err) {
+        if (isAbortError(err)) throw err
+      }
+    }
+    return labels
+  })
+  return data ?? NO_LABELS
+}
+
+function PageLink({ page, label, onOpen }: { page: number | null; label: string; onOpen: () => void }) {
   if (page == null) return null
   return (
-    <button type="button" onClick={onOpen} className="ml-1 rounded bg-zinc-100 px-1.5 py-0.5 font-mono text-[0.7rem] text-zinc-600 hover:bg-accent-50 hover:text-accent-700" aria-label={`Open page ${page}`}>
-      p. {page}
+    <button
+      type="button"
+      onClick={onOpen}
+      title={label}
+      className="ml-1 max-w-56 truncate rounded bg-zinc-100 px-1.5 py-0.5 align-bottom font-mono text-[0.7rem] text-zinc-600 hover:bg-accent-50 hover:text-accent-700"
+      aria-label={`Open ${label} in the page viewer`}
+    >
+      {label}
     </button>
   )
 }
 
-function InsightsBody({ insights, onOpenPage, onAsk, askBusy }: { insights: DocumentInsights; onOpenPage: (page: number, highlight?: string) => void; onAsk: (q: string) => void; askBusy: boolean }) {
+interface InsightsBodyProps {
+  documentId: string
+  mimeType: string
+  insights: DocumentInsights
+  onOpenPage: (page: number, highlight?: string) => void
+  onAsk: (q: string) => void
+  askBusy: boolean
+}
+
+function InsightsBody({ documentId, mimeType, insights, onOpenPage, onAsk, askBusy }: InsightsBodyProps) {
+  const pages = [...new Set([...insights.key_points, ...insights.risk_flags].flatMap((item) => (item.page == null ? [] : [item.page])))].sort((a, b) => a - b)
+  const labels = usePageLabels(documentId, pages, !hasRealPages(mimeType))
+  const pageLabel = (page: number | null) => (page == null ? '' : pageRefLabel(mimeType, page, labels.get(page)))
   return (
     <div className="space-y-6 p-4">
       <div>
@@ -126,7 +172,7 @@ function InsightsBody({ insights, onOpenPage, onAsk, askBusy }: { insights: Docu
                 <span className="mt-2 size-1 shrink-0 rounded-full bg-zinc-400" aria-hidden />
                 <span>
                   {kp.point}
-                  <PageLink page={kp.page} onOpen={() => kp.page != null && onOpenPage(kp.page)} />
+                  <PageLink page={kp.page} label={pageLabel(kp.page)} onOpen={() => kp.page != null && onOpenPage(kp.page)} />
                 </span>
               </li>
             ))}
@@ -142,7 +188,7 @@ function InsightsBody({ insights, onOpenPage, onAsk, askBusy }: { insights: Docu
                 <div className="flex flex-wrap items-center gap-2">
                   <Badge tone={SEVERITY_TONE[flag.severity]}>{humanize(flag.severity)}</Badge>
                   <span className="text-sm font-medium text-zinc-900">{flag.type}</span>
-                  <PageLink page={flag.page} onOpen={() => flag.page != null && onOpenPage(flag.page, flag.quote)} />
+                  <PageLink page={flag.page} label={pageLabel(flag.page)} onOpen={() => flag.page != null && onOpenPage(flag.page, flag.quote)} />
                 </div>
                 <blockquote className="mt-2 border-l-2 border-zinc-200 pl-3 text-sm text-zinc-600 italic">“{flag.quote}”</blockquote>
               </li>
