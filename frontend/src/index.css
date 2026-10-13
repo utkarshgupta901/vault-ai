@@ -1,111 +1,106 @@
-:root {
-  --text: #6b6375;
-  --text-h: #08060d;
-  --bg: #fff;
-  --border: #e5e4e7;
-  --code-bg: #f4f3ec;
-  --accent: #aa3bff;
-  --accent-bg: rgba(170, 59, 255, 0.1);
-  --accent-border: rgba(170, 59, 255, 0.5);
-  --social-bg: rgba(244, 243, 236, 0.5);
-  --shadow:
-    rgba(0, 0, 0, 0.1) 0 10px 15px -3px, rgba(0, 0, 0, 0.05) 0 4px 6px -2px;
+@import 'tailwindcss';
 
-  --sans: system-ui, 'Segoe UI', Roboto, sans-serif;
-  --heading: system-ui, 'Segoe UI', Roboto, sans-serif;
-  --mono: ui-monospace, Consolas, monospace;
+/* Design tokens. Neutral UI in Tailwind's zinc scale plus one accent (blue). Chart colours follow a validated
+   single-hue palette: one series = one colour, values are always printed as text next to the mark. */
+@theme {
+  --font-sans: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --font-mono: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
 
-  font: 18px/145% var(--sans);
-  letter-spacing: 0.18px;
-  color-scheme: light dark;
-  color: var(--text);
-  background: var(--bg);
-  font-synthesis: none;
-  text-rendering: optimizeLegibility;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
+  --color-accent-50: #eff5fd;
+  --color-accent-100: #dbe8fa;
+  --color-accent-500: #2a78d6;
+  --color-accent-600: #256abf;
+  --color-accent-700: #1c5cab;
 
-  @media (max-width: 1024px) {
-    font-size: 16px;
+  --color-chart-1: #2a78d6;
+  --color-chart-track: #eef0f3;
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    @apply bg-zinc-50 text-zinc-900 antialiased;
+  }
+
+  /* One visible, consistent focus ring for keyboard users everywhere. */
+  :focus-visible {
+    outline: 2px solid var(--color-accent-500);
+    outline-offset: 2px;
+  }
+
+  dialog::backdrop {
+    background: rgb(24 24 27 / 0.45);
   }
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --text: #9ca3af;
-    --text-h: #f3f4f6;
-    --bg: #16171d;
-    --border: #2e303a;
-    --code-bg: #1f2028;
-    --accent: #c084fc;
-    --accent-bg: rgba(192, 132, 252, 0.15);
-    --accent-border: rgba(192, 132, 252, 0.5);
-    --social-bg: rgba(47, 48, 58, 0.5);
-    --shadow:
-      rgba(0, 0, 0, 0.4) 0 10px 15px -3px, rgba(0, 0, 0, 0.25) 0 4px 6px -2px;
+/* Rendered answers / summaries (react-markdown output). Hand-written instead of a typography plugin: the answers use
+   only paragraphs, lists, emphasis, code and the occasional comparison table. */
+.prose-answer {
+  @apply text-[0.9375rem] leading-relaxed text-zinc-800;
+}
+.prose-answer > * + * {
+  @apply mt-3;
+}
+.prose-answer ul {
+  @apply list-disc space-y-1 pl-5;
+}
+.prose-answer ol {
+  @apply list-decimal space-y-1 pl-5;
+}
+.prose-answer strong {
+  @apply font-semibold text-zinc-900;
+}
+.prose-answer h1,
+.prose-answer h2,
+.prose-answer h3 {
+  @apply font-semibold text-zinc-900;
+}
+.prose-answer code {
+  @apply rounded bg-zinc-100 px-1 py-0.5 font-mono text-[0.85em];
+}
+.prose-answer pre {
+  @apply overflow-x-auto rounded-md bg-zinc-100 p-3;
+}
+.prose-answer pre code {
+  @apply bg-transparent p-0;
+}
+.prose-answer blockquote {
+  @apply border-l-2 border-zinc-300 pl-3 text-zinc-600;
+}
+.prose-answer table {
+  @apply w-full border-collapse text-sm;
+}
+.prose-answer th,
+.prose-answer td {
+  @apply border border-zinc-200 px-2 py-1 text-left align-top;
+}
+.prose-answer th {
+  @apply bg-zinc-50 font-medium;
+}
+.prose-answer a {
+  @apply text-accent-600 underline underline-offset-2;
+}
+
+/* Blinking caret at the end of a streaming answer, attached to the last rendered block so it sits on the text line. */
+.is-streaming .prose-answer > :last-child::after {
+  content: '';
+  display: inline-block;
+  width: 0.45em;
+  height: 1em;
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  border-radius: 1px;
+  background: var(--color-zinc-400);
+  animation: caret-blink 1s steps(2, start) infinite;
+}
+
+@keyframes caret-blink {
+  to {
+    visibility: hidden;
   }
-
-  #social .button-icon {
-    filter: invert(1) brightness(2);
-  }
-}
-
-#root {
-  width: 1126px;
-  max-width: 100%;
-  margin: 0 auto;
-  text-align: center;
-  border-inline: 1px solid var(--border);
-  min-height: 100svh;
-  display: flex;
-  flex-direction: column;
-  box-sizing: border-box;
-}
-
-body {
-  margin: 0;
-}
-
-h1,
-h2 {
-  font-family: var(--heading);
-  font-weight: 500;
-  color: var(--text-h);
-}
-
-h1 {
-  font-size: 56px;
-  letter-spacing: -1.68px;
-  margin: 32px 0;
-  @media (max-width: 1024px) {
-    font-size: 36px;
-    margin: 20px 0;
-  }
-}
-h2 {
-  font-size: 24px;
-  line-height: 118%;
-  letter-spacing: -0.24px;
-  margin: 0 0 8px;
-  @media (max-width: 1024px) {
-    font-size: 20px;
-  }
-}
-p {
-  margin: 0;
-}
-
-code,
-.counter {
-  font-family: var(--mono);
-  display: inline-flex;
-  border-radius: 4px;
-  color: var(--text-h);
-}
-
-code {
-  font-size: 15px;
-  line-height: 135%;
-  padding: 4px 8px;
-  background: var(--code-bg);
 }
