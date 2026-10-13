@@ -76,7 +76,8 @@ def _build_input(filename: str, pages: list[DocPage], req: SummaryRequest, focus
 async def record_failed_call(*, operation: str, usage: Usage, prompt_version: str, owner_id: uuid.UUID,
                              document_id: uuid.UUID | None, error_code: ErrorCode) -> None:
     """A failed call still belongs in the ledger (success=false), so error rates per operation are visible.
-    When the call raised, tokens are unknown and recorded as zero (Usage(model=...))."""
+    Tokens are recorded when the provider reported them (ProviderError.usage: the reply was billed but unusable);
+    when the request itself failed they are unknown and recorded as zero (Usage(model=...))."""
     async with async_session() as db:
         db.add(usage_row(operation=operation, usage=usage, owner_id=owner_id, prompt_version=prompt_version,
                          document_id=document_id, success=False, error_code=error_code))
@@ -97,7 +98,9 @@ async def _generate(prompt_input: str, *, owner_id: uuid.UUID, document_id: uuid
         await record_failed_call(usage=Usage(model=model), error_code=ErrorCode.UPSTREAM_TIMEOUT, **failed)
         raise AppError(ErrorCode.UPSTREAM_TIMEOUT, 504, "The summary took too long; please try again.") from exc
     except ProviderError as exc:
-        await record_failed_call(usage=Usage(model=model), error_code=ErrorCode.UPSTREAM_AI_ERROR, **failed)
+        # exc.usage: a truncated/refused/unparsable reply was still billed, so record its real tokens.
+        await record_failed_call(usage=exc.usage or Usage(model=model), error_code=ErrorCode.UPSTREAM_AI_ERROR,
+                                 **failed)
         raise AppError(ErrorCode.UPSTREAM_AI_ERROR, 502, "The AI provider could not produce a summary.",
                        {"kind": exc.kind}) from exc
     if not content.strip():

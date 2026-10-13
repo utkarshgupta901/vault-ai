@@ -2,10 +2,12 @@
 
 Called by the Celery task `vault.generate_insights` (WP2a), which owns claiming, processing_runs and retries:
 
-    run_insights(document_id, run_id, *, task_id, request_id) -> {"load": ms, "llm": ms, "verify": ms, "write": ms}
+    run_insights(document_id, run_id, *, task_id, request_id)
+        -> InsightsResult(timings={"load": ms, "llm": ms, "verify": ms, "write": ms}, written=True|False)
 
-Raises ProviderError(kind="transient") for the task to retry, and PermanentError(INSIGHTS_*) for failures that a
-retry cannot fix. The steps:
+written=False means a reprocess or delete superseded the run, so nothing was stored (the task records the attempt
+as SUPERSEDED, not succeeded). Raises ProviderError(kind="transient") for the task to retry, and
+PermanentError(INSIGHTS_*) for failures that a retry cannot fix. The steps:
   1. load    short DB session: document + pages (skip everything if the run is already superseded)
   2. llm     page-marked prompt (sampled if the document is too long) -> DocumentInsights (structured output)
   3. verify  pure functions: risk-flag quotes must really be in the document, key-point pages must match the text,
@@ -83,6 +85,22 @@ _STOPWORDS = frozenset(
 )
 _WORD = re.compile(r"[^\W_]+")
 _PUNCT = re.compile(r"[^\w]+")
+
+
+@dataclass(frozen=True)
+class InsightsResult:
+    timings: dict[str, int]
+    written: bool       # False: superseded (new run_id) or deleted, so nothing was stored
+
+
+@dataclass(frozen=True)
+class _Ledger:
+    """The ids every ai_usage row of this run carries (rule 7: every model call is in the cost ledger)."""
+
+    owner_id: uuid.UUID
+    document_id: uuid.UUID
+    task_id: str | None
+    request_id: str | None
 
 
 # --- Loading ------------------------------------------------------------------------------------------------------
@@ -174,7 +192,29 @@ def build_prompt_pages(pages: Sequence[DocPage], budget: int | None = None) -> t
 
 
 # --- The model call ------------------------------------------------------------------------------------------------
-def _call_model(prompt_input: str) -> tuple[DocumentInsights, Usage]:
+def _failure_code(exc: ProviderError) -> ErrorCode:
+    """The stable code for a non-transient failure (stored as insights_error_code and ai_usage.error_code)."""
+    if exc.kind == "refusal":
+        return ErrorCode.INSIGHTS_REFUSED
+    if exc.kind == "bad_request" and exc.status_code is not None:
+        return ErrorCode.PROVIDER_BAD_REQUEST     # the API rejected the request itself (HTTP 4xx)
+    return ErrorCode.INSIGHTS_TRUNCATED if exc.kind == "incomplete" else ErrorCode.INSIGHTS_PARSE_FAILED
+
+
+def _record_failed_call(exc: ProviderError, code: ErrorCode, ledger: _Ledger) -> None:
+    """A reply that was billed but is unusable (truncated, refused, unparsable) still gets its ai_usage row, with
+    success=false, in its own short transaction. Otherwise the most expensive failure, a truncation (the whole output
+    budget, reasoning included, twice), would be invisible in /metrics and in the daily quota. When the request
+    itself failed (HTTP error, timeout) the provider reports no usage and there is nothing to record."""
+    if exc.usage is None:
+        return
+    with sync_session() as s:
+        s.add(usage_row(operation="insights", usage=exc.usage, owner_id=ledger.owner_id,
+                        prompt_version=prompt.VERSION, document_id=ledger.document_id, success=False,
+                        error_code=code, task_id=ledger.task_id, request_id=ledger.request_id))
+
+
+def _call_model(prompt_input: str, ledger: _Ledger) -> tuple[DocumentInsights, Usage]:
     """One call, at most one retry. Transient errors go up to Celery (backoff lives there, not here)."""
     provider = get_provider(for_worker=True)
     budget = MAX_OUTPUT_TOKENS
@@ -187,13 +227,11 @@ def _call_model(prompt_input: str) -> tuple[DocumentInsights, Usage]:
         except ProviderError as exc:
             if exc.kind == "transient":
                 raise
-            if exc.kind == "refusal":
-                raise PermanentError(ErrorCode.INSIGHTS_REFUSED, exc.message) from exc
-            if exc.kind == "bad_request" and exc.status_code is not None:
-                # The API rejected the request itself (HTTP 4xx): the same request will be rejected again.
-                raise PermanentError(ErrorCode.PROVIDER_BAD_REQUEST, exc.message) from exc
-            code = ErrorCode.INSIGHTS_TRUNCATED if exc.kind == "incomplete" else ErrorCode.INSIGHTS_PARSE_FAILED
-            if attempt == 2:
+            code = _failure_code(exc)
+            _record_failed_call(exc, code, ledger)
+            # A refusal or a rejected request would get the same answer again; truncated/unparsable output gets
+            # exactly one more try (with a bigger output budget when it was truncated).
+            if code in (ErrorCode.INSIGHTS_REFUSED, ErrorCode.PROVIDER_BAD_REQUEST) or attempt == 2:
                 raise PermanentError(code, exc.message) from exc
             if exc.kind == "incomplete":
                 budget = RETRY_OUTPUT_TOKENS
@@ -453,21 +491,22 @@ def _ms(started: float) -> int:
 
 
 def run_insights(document_id: uuid.UUID, run_id: uuid.UUID, *, task_id: str | None,
-                 request_id: str | None) -> dict[str, int]:
+                 request_id: str | None) -> InsightsResult:
     timings: dict[str, int] = {}
     started = time.perf_counter()
     loaded = _load(document_id, run_id)
     timings["load"] = _ms(started)
     if loaded is None:
         log.info("insights_superseded", stage="load")
-        return timings
+        return InsightsResult(timings, written=False)
     if not loaded.pages:
         raise PermanentError(ErrorCode.NO_EXTRACTABLE_TEXT, "The document has no extracted pages.")
 
     started = time.perf_counter()
     prompt_pages, coverage = build_prompt_pages(loaded.pages)
+    ledger = _Ledger(loaded.owner_id, document_id, task_id, request_id)
     insights, usage = _call_model(prompt.render(loaded.filename, prompt_pages, coverage,
-                                                page_count=len(loaded.pages)))
+                                                page_count=len(loaded.pages)), ledger)
     timings["llm"] = _ms(started)
 
     started = time.perf_counter()
@@ -481,4 +520,4 @@ def run_insights(document_id: uuid.UUID, run_id: uuid.UUID, *, task_id: str | No
     log.info("insights_done" if written else "insights_superseded", coverage=coverage,
              pages_sent=len(prompt_pages), risk_flags_kept=len(verified.row["risk_flags"]),
              risk_flags_dropped=verified.risk_flags_dropped, **timings)
-    return timings
+    return InsightsResult(timings, written=written)

@@ -51,7 +51,10 @@ class ProviderError(Exception):
     transient   -> retry (429 / 5xx / timeout / connection), honouring retry_after when given
     refusal     -> the model declined (do not retry)
     incomplete  -> output hit max_output_tokens (retry once with a bigger budget)
-    bad_request -> our request was invalid (do not retry; it's a bug or a bad input)
+    bad_request -> our request was invalid, or the reply could not be parsed (status_code is None then)
+
+    `usage` is set when the model DID answer (and was billed) but the answer is unusable: truncated, refused or not
+    parsable. The caller still owes the cost ledger a row for it (success=false), or the daily quota under-counts.
     """
 
     def __init__(
@@ -60,12 +63,14 @@ class ProviderError(Exception):
         message: str,
         retry_after: float | None = None,
         status_code: int | None = None,
+        usage: Usage | None = None,
     ):
         super().__init__(message)
         self.kind = kind
         self.message = message
         self.retry_after = retry_after
         self.status_code = status_code
+        self.usage = usage
 
 
 class LLMProvider(Protocol):

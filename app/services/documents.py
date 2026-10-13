@@ -18,10 +18,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.core.errors import AppError, ErrorCode, not_found
-from app.core.pagination import decode_cursor, encode_cursor
+from app.core.pagination import decode_keyset, encode_cursor
 from app.core.redis import get_sync_broker
 from app.core.request_context import get_request_id
 from app.ingestion.sniff import sniff
+from app.ingestion.titles import filename_title
 from app.models import Document, DocumentPage
 from app.schemas.documents import DocumentError, DocumentOut
 from app.services import state, storage
@@ -49,10 +50,6 @@ def to_out(doc: Document) -> DocumentOut:
     out.error = error
     out.stale = state.is_stale(doc.status, doc.updated_at, now, settings.STALE_PROCESSING_MIN)
     return out
-
-
-def _title_from_filename(filename: str) -> str:
-    return PurePath(filename).stem.replace("_", " ").replace("-", " ").strip() or filename
 
 
 def _hash_and_size(f: IO[bytes]) -> tuple[str, int]:
@@ -111,7 +108,7 @@ async def upload(db: AsyncSession, owner_id: uuid.UUID, file: UploadFile) -> Upl
     await anyio.to_thread.run_sync(storage.put_file, key, f, sniffed.mime_type)
 
     doc = Document(
-        id=document_id, owner_id=owner_id, filename=filename, title=_title_from_filename(filename),
+        id=document_id, owner_id=owner_id, filename=filename, title=filename_title(filename),
         mime_type=sniffed.mime_type, size_bytes=size, sha256=sha256, storage_key=key,
         status="queued", current_run_id=run_id,
     )
@@ -169,9 +166,9 @@ async def list_documents(
     if q:
         like = f"%{q}%"
         stmt = stmt.where(or_(Document.filename.ilike(like), Document.title.ilike(like)))
-    c = decode_cursor(cursor)
-    if c:
-        ts, last_id = datetime.fromisoformat(c["created_at"]), uuid.UUID(c["id"])
+    after = decode_keyset(cursor, created_at=datetime.fromisoformat, id=uuid.UUID)  # tampered -> 400, not 500
+    if after:
+        ts, last_id = after
         stmt = stmt.where(or_(Document.created_at < ts, and_(Document.created_at == ts, Document.id < last_id)))
     rows = list(await db.scalars(stmt.order_by(Document.created_at.desc(), Document.id.desc()).limit(limit + 1)))
     next_cursor = None
@@ -192,26 +189,52 @@ async def get_page(db: AsyncSession, owner_id: uuid.UUID, document_id: uuid.UUID
     return page
 
 
-async def reprocess(db: AsyncSession, owner_id: uuid.UUID, document_id: uuid.UUID, scope: str) -> tuple[Document, uuid.UUID]:
-    doc = await get_owned(db, owner_id, document_id)
-    stale = state.is_stale(doc.status, doc.updated_at, datetime.now(UTC), settings.STALE_PROCESSING_MIN)
+def _check_reprocess_allowed(doc: Document, scope: str) -> None:
+    """The friendly, specific 409s. The same rules are enforced again atomically by state.reprocess_stmt, which is
+    what actually protects against two requests racing; this read only chooses the message."""
+    now, stale_min = datetime.now(UTC), settings.STALE_PROCESSING_MIN
     if scope == "insights":
         if doc.status != "ready":
             raise AppError(ErrorCode.DOCUMENT_NOT_READY, 409, "Insights can only be regenerated for ready documents.")
-        if doc.insights_status in ("pending", "processing") and not stale:
-            raise AppError(ErrorCode.ALREADY_PROCESSING, 409, "Insights are already being generated.")
-    elif doc.status in ("queued", "processing") and not stale:
+        # Insights have their own staleness: the document is 'ready' (never stale) while its insights task may
+        # have been lost. Without this, a stuck 'processing' would answer 409 forever.
+        if (doc.insights_status in state.INSIGHTS_IN_FLIGHT
+                and not state.is_insights_stale(doc.insights_status, doc.updated_at, now, stale_min)):
+            raise AppError(ErrorCode.ALREADY_PROCESSING, 409, "Insights are already being generated.",
+                           {"insights_status": doc.insights_status})
+    elif doc.status in state.IN_FLIGHT and not state.is_stale(doc.status, doc.updated_at, now, stale_min):
         raise AppError(ErrorCode.ALREADY_PROCESSING, 409, "Document is already being processed.",
                        {"status": doc.status, "stage": doc.stage})
+
+
+async def _enqueue_insights_or_fail(db: AsyncSession, doc: Document, run_id: uuid.UUID) -> None:
+    """Like _enqueue_or_fail, for an insights-only run. Without marking the run failed, insights would stay
+    'pending' under a run that no task will ever claim, and every retry would be refused as already in progress."""
+    try:
+        await aenqueue_insights(doc.id, run_id, get_request_id())
+    except QueueUnavailable as exc:
+        log.error("insights_enqueue_failed", document_id=str(doc.id), error=str(exc))
+        await db.execute(state.insights_fail_stmt(doc.id, run_id, ErrorCode.QUEUE_UNAVAILABLE))
+        await db.commit()
+        raise AppError(ErrorCode.QUEUE_UNAVAILABLE, 503, "Processing queue unavailable; insights can be regenerated "
+                       "again once it is back.", {"document_id": str(doc.id)},
+                       headers={"Retry-After": "10"}) from exc
+
+
+async def reprocess(db: AsyncSession, owner_id: uuid.UUID, document_id: uuid.UUID, scope: str) -> tuple[Document, uuid.UUID]:
+    doc = await get_owned(db, owner_id, document_id)
+    _check_reprocess_allowed(doc, scope)
     run_id = uuid.uuid4()
-    await db.execute(state.requeue_stmt(doc.id, run_id, scope=scope))
+    requeued = await db.execute(state.reprocess_stmt(doc.id, run_id, scope=scope,
+                                                     stale_minutes=settings.STALE_PROCESSING_MIN))
+    if requeued.first() is None:  # a concurrent reprocess committed between our read and this UPDATE
+        await db.rollback()
+        raise AppError(ErrorCode.ALREADY_PROCESSING, 409, "Another request has just started processing this "
+                       "document.")
     await db.commit()
     await db.refresh(doc)
     if scope == "insights":
-        try:
-            await aenqueue_insights(doc.id, run_id, get_request_id())
-        except QueueUnavailable as exc:
-            raise AppError(ErrorCode.QUEUE_UNAVAILABLE, 503, "Processing queue unavailable.") from exc
+        await _enqueue_insights_or_fail(db, doc, run_id)
     else:
         await _enqueue_or_fail(db, doc, run_id)
     return doc, run_id

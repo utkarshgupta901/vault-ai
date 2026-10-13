@@ -9,7 +9,8 @@ Trade-off (said out loud in the demo): a fixed window allows a burst of up to 2x
 GCRA / a sliding window would fix that and is deferred.
 
 Redis is an optional dependency: if it is down or slower than REDIS_TIMEOUT_S (200 ms) we log a warning and let the
-request through (fail open). Money is still protected by the daily quota, which is read from Postgres.
+request through (fail open). Money is still protected by the daily quota, which is read from Postgres and guards
+every route that starts paid model work: chat, summaries, compare, upload (embeddings + insights) and reprocess.
 
 Quota: sum(ai_usage.cost_usd) since UTC midnight >= users.daily_cost_limit_usd -> 429 QUOTA_EXCEEDED until midnight.
 It is SOFT (check-then-act): N requests arriving together can all pass the check before any of them records its cost,
@@ -133,4 +134,7 @@ async def enforce_daily_quota(user: Annotated[CurrentUser, Depends(get_current_u
 # Ready-made guard lists for the routers (attach with `dependencies=...`):
 CHAT_GUARDS = [Depends(rate_limit("chat")), Depends(enforce_daily_quota)]   # ask / stream (LLM calls)
 AI_GUARDS = [Depends(rate_limit("ai")), Depends(enforce_daily_quota)]       # summaries, compare (LLM calls)
-UPLOAD_GUARDS = [Depends(rate_limit("upload"))]                             # uploads: half the per-minute limit
+# Uploads: half the per-minute limit, plus the quota (each new file is paid embeddings + an insights call; without
+# it a user over budget could keep spending by uploading). Duplicates of an existing file cost nothing but are
+# still refused once over budget: the check runs before the body is read, which is the point.
+UPLOAD_GUARDS = [Depends(rate_limit("upload")), Depends(enforce_daily_quota)]

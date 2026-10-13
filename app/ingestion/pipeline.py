@@ -3,7 +3,8 @@
 The database is the checkpoint, so any stage can be re-run safely after a crash, a retry or a duplicate delivery:
   - extract and chunk are delete-then-insert (re-running them gives the same rows, never duplicates);
   - chunking first copies vectors that this owner already paid for (same embed_hash), so a re-run re-embeds nothing
-    that was already embedded;
+    that was already embedded (headers use the filename-derived title, which insights never change, so the hashes
+    of an unchanged file stay the same across reprocesses);
   - embedding only touches chunks WHERE embedding IS NULL, one committed batch at a time.
 
 Every write transaction starts with a run_id-fenced UPDATE of the document row (state.progress_stmt/ready_stmt).
@@ -30,6 +31,7 @@ from app.core.db import sync_session
 from app.core.errors import ErrorCode, PermanentError
 from app.ingestion.chunking import ChunkDraft, chunk_pages, count_tokens, embed_text
 from app.ingestion.extract import ExtractedDoc, PageText, extract
+from app.ingestion.titles import filename_title
 from app.models import Chunk, Document, DocumentPage
 from app.services import state, storage
 from app.worker.attempt import Attempt, RunSuperseded
@@ -45,7 +47,7 @@ CHUNK_DONE_PCT = 30
 class _Source:
     storage_key: str
     mime_type: str
-    title: str
+    header_title: str   # from the filename, NOT documents.title (insights rewrite it; see titles.py)
 
 
 @dataclass(frozen=True)
@@ -63,7 +65,7 @@ def run_ingest(attempt: Attempt) -> None:
     with attempt.timed("extract"):
         _save_pages(attempt, extracted.pages)
     with attempt.timed("chunk"):
-        chunk_count = _save_chunks(attempt, extracted.pages, source.title)
+        chunk_count = _save_chunks(attempt, extracted.pages, source.header_title)
     with attempt.timed("embed"):
         _embed_pending(attempt)
     _mark_ready(attempt, extracted, chunk_count)
@@ -81,7 +83,8 @@ def _load_source(attempt: Attempt) -> _Source:
         doc = s.get(Document, attempt.document_id)
         if doc is None:
             raise RunSuperseded()  # deleted after the claim
-        return _Source(storage_key=doc.storage_key, mime_type=doc.mime_type, title=doc.title or doc.filename)
+        return _Source(storage_key=doc.storage_key, mime_type=doc.mime_type,
+                       header_title=filename_title(doc.filename))
 
 
 # --- Download + extract ---------------------------------------------------------------------------------------------
@@ -125,7 +128,8 @@ def _save_pages(attempt: Attempt, pages: list[PageText]) -> None:
 
 def _save_chunks(attempt: Attempt, pages: list[PageText], title: str) -> int:
     """ONE transaction: copy reusable vectors, delete this document's old chunks, insert the new ones.
-    Reading the old vectors before the delete is what makes a reprocess after a failed embed cost nothing extra."""
+    Reading the old vectors before the delete is what makes a reprocess (after a failed embed, or of a ready
+    document) cost nothing extra."""
     drafts = chunk_pages(pages, title=title, model=settings.EMBED_MODEL, dims=settings.EMBED_DIMS)
     if not drafts:
         raise PermanentError(ErrorCode.NO_EXTRACTABLE_TEXT, "The document contains no extractable text.")

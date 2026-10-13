@@ -6,8 +6,8 @@ import pytest
 
 from app.config import settings
 from app.core.errors import ErrorCode, PermanentError
-from app.ingestion.chunking import MIN_TAIL_TOKENS, count_tokens
-from app.ingestion.extract import SECTION_TOKENS, extract
+from app.ingestion.chunking import MAX_HEADER_TOKENS, MIN_TAIL_TOKENS, chunk_pages, count_tokens, embed_text
+from app.ingestion.extract import MAX_HEADING_TOKENS, SECTION_TOKENS, extract
 from app.ingestion.sniff import DOCX, MD, PDF, TXT
 from tests.ingestion.helpers import (
     PAGE_TEXTS,
@@ -182,3 +182,38 @@ def test_whitespace_only_text_is_no_extractable_text(tmp_path: Path) -> None:
 def test_special_token_text_does_not_crash_the_tokenizer(tmp_path: Path) -> None:
     doc = extract(_file(tmp_path, "a.txt", "Prompt marker <|endoftext|> appears in this log."), TXT)
     assert "<|endoftext|>" in doc.pages[0].text
+
+
+# --- Over-long "headings" ---------------------------------------------------------------------------------------------
+
+
+def _docx_with_heading_styled_paragraph(words: int) -> bytes:
+    """A real-world Word quirk: a whole paragraph of body text formatted with the 'Heading 1' style."""
+    import io
+
+    import docx
+
+    d = docx.Document()
+    d.add_heading("Terms", level=1)
+    d.add_paragraph("Short intro.")
+    d.add_heading(" ".join(f"Clause{i} applies to every supplier." for i in range(words)), level=1)
+    d.add_paragraph("Closing paragraph.")
+    buf = io.BytesIO()
+    d.save(buf)
+    return buf.getvalue()
+
+
+def test_paragraph_styled_as_heading_is_body_text_so_embedding_inputs_stay_small(tmp_path: Path) -> None:
+    doc = extract(_file(tmp_path, "a.docx", _docx_with_heading_styled_paragraph(1500)), DOCX)
+    assert all(p.heading_path in (None, "Terms") for p in doc.pages)             # not a breadcrumb
+    assert "Clause1499 applies" in "\n".join(p.text for p in doc.pages)           # ...but its text is kept
+    drafts = chunk_pages(doc.pages, title="contract", model="m", dims=8)
+    longest = max(count_tokens(embed_text(d.header, d.content)) for d in drafts)
+    assert longest <= settings.CHUNK_TOKENS + MIN_TAIL_TOKENS + MAX_HEADER_TOKENS   # far below the 8,192 limit
+
+
+def test_markdown_heading_line_over_the_limit_is_body_text(tmp_path: Path) -> None:
+    long_line = " ".join(f"word{i}" for i in range(MAX_HEADING_TOKENS * 2))
+    doc = extract(_file(tmp_path, "a.md", f"# Setup\n\nInstall it.\n\n## {long_line}\n\nMore text.\n"), MD)
+    assert [p.heading_path for p in doc.pages] == ["Setup"]
+    assert long_line in doc.pages[0].text

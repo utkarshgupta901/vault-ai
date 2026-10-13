@@ -14,6 +14,7 @@ from celery.exceptions import SoftTimeLimitExceeded
 from httpx import AsyncClient
 
 from app.ai.fake_provider import FakeProvider
+from app.ai.insights import InsightsResult
 from app.ai.provider import ProviderError
 from app.core.errors import ErrorCode, PermanentError
 from app.worker import attempt as attempt_module
@@ -251,7 +252,7 @@ async def test_insights_timings_are_recorded_on_the_attempt(
 
         with sync_session() as s:
             s.execute(state.insights_ready_stmt(document_id, run_id))
-        return {"load": 3, "llm": 120, "verify": 2}
+        return InsightsResult({"load": 3, "llm": 120, "verify": 2}, written=True)
 
     monkeypatch.setitem(sys.modules, "app.ai.insights", _fake_insights_module(run_insights))
     doc_id = await _ready_doc(client)

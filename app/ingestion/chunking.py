@@ -6,7 +6,10 @@ Rules (design §6 "Chunking"):
     badly and wastes one of the 8 source slots in a prompt.
   - header = "{title} > {heading_path} ({label})", with missing parts left out (never the text "None"). The header is
     embedded and indexed together with the content, so a chunk that only says "The fee is $60k" can still be found
-    by its document and section name.
+    by its document and section name. The title is derived from the FILENAME (titles.filename_title), never from
+    documents.title, which insights overwrite: otherwise every reprocess would change every header, every
+    embed_hash, and pay to re-embed the whole document. The header is capped at MAX_HEADER_TOKENS, because it is
+    repeated in every chunk's embedding input and a single input may not exceed 8,192 tokens.
   - embed_hash = sha256(model|dims|header\\ncontent): the exact input to the exact model. Equal hash => the stored
     vector can be reused instead of paying for the same embedding twice (resume after a crash, reprocess).
 
@@ -29,6 +32,8 @@ if TYPE_CHECKING:  # import only for type hints: extract.py imports this module 
 
 ENCODING = "cl100k_base"
 MIN_TAIL_TOKENS = 50
+MAX_HEADER_TOKENS = 200     # whole header; a real breadcrumb is ~10-40 tokens
+MAX_LABEL_TOKENS = 40       # "(p. iv)", "(§ Termination (part 2))": the part kept when the breadcrumb is cut
 
 
 @dataclass(frozen=True)
@@ -103,10 +108,24 @@ def split_by_tokens(text: str, max_tokens: int, overlap: int = 0) -> list[str]:
 # --- Header + hash ------------------------------------------------------------------------------------------------
 
 
+def truncate_tokens(text: str, max_tokens: int) -> str:
+    """At most max_tokens tokens of `text`, ending in '…' when cut. Cutting a token list can split a multi-byte
+    character; tiktoken decodes that as U+FFFD, which is stripped."""
+    tokens = _encoding().encode_ordinary(text)
+    if len(tokens) <= max_tokens:
+        return text
+    return _encoding().decode(tokens[: max(0, max_tokens - 1)]).rstrip("\ufffd").rstrip() + "…"
+
+
 def build_header(title: str | None, heading_path: str | None, label: str | None) -> str:
-    """'Handbook > Leave > PTO (§ PTO)', 'Handbook (p. 4)' or '(p. 4)': missing parts are omitted, never 'None'."""
+    """'Handbook > Leave > PTO (§ PTO)', 'Handbook (p. 4)' or '(p. 4)': missing parts are omitted, never 'None'.
+
+    Capped at about MAX_HEADER_TOKENS: the breadcrumb is cut first so the location ("p. 4") survives. Extraction
+    already treats over-long "headings" as body text; this cap is the guarantee for whatever still gets through
+    (six levels of long headings, a PDF page label that is really a sentence)."""
     crumbs = " > ".join(part.strip() for part in (title, heading_path) if part and part.strip())
-    location = f"({label.strip()})" if label and label.strip() else ""
+    location = f"({truncate_tokens(label.strip(), MAX_LABEL_TOKENS)})" if label and label.strip() else ""
+    crumbs = truncate_tokens(crumbs, MAX_HEADER_TOKENS - count_tokens(location))
     return " ".join(part for part in (crumbs, location) if part)
 
 
