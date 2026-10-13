@@ -1,0 +1,18 @@
+Vendor call notes — CoreLink Systems
+Date: 2026-09-14
+Attendees: Dana Whitfield (COO, Larkspur), Priya Raman (Head of Data, Larkspur), Tomás Ibarra (Account Director, CoreLink)
+
+Summary
+- CoreLink walked through its proposal dated 2026-08-27: implementation $380,000 and subscription $95,000 per year.
+- Discount: CoreLink offered 5% off the annual subscription fee if the contract is signed before 2026-10-31.
+- CoreLink confirmed that the 99.9% uptime commitment applies from go-live, not from contract signature.
+- Reference customers: two mid-market retailers; calls to be scheduled by CoreLink.
+
+Risks raised by Larkspur
+- Migration of historical data before 2021 is not yet scoped.
+- CoreLink's on-site workshops would be billed separately at cost.
+
+Action items
+- Priya to compare CoreLink and BrightPath three-year costs by 2026-09-30.
+- Dana to ask Legal whether the CoreLink terms can reuse the Brightline MSA template.
+- Tomás to send the security questionnaire answers by 2026-09-21.
