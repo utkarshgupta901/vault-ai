@@ -37,7 +37,7 @@ class Settings(BaseSettings):
     LLM_PROVIDER: Literal["openai", "fake"] = "openai"
     OPENAI_API_KEY: str | None = None
     ANSWER_MODEL: str = "gpt-6.1-sol"              # grounded answers (streamed)
-    ANSWER_EFFORT: str = "low"                     # Sol supports low..max; low keeps first-token latency ~1.8 s
+    ANSWER_EFFORT: str = "low"                     # Sol supports low..max; low: eval TTFT p50 1.4-2.7 s (DECISIONS D-01)
     FAST_MODEL: str = "gpt-6-luna"                 # condense, follow-ups, fallback answers
     FAST_EFFORT: str = "none"
     INSIGHTS_MODEL: str = "gpt-6-luna"             # document insights + custom summaries

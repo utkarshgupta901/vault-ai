@@ -1,5 +1,7 @@
 # Vault AI: AI-Powered Document Vault (case-study build plan)
 
+> The original plan from 2026-10-13. Where it differs, the code, README and docs/DECISIONS.md are current.
+
 ## Context
 **The case study:** build "ChatGPT for your documents".
 - Upload PDF, DOCX, TXT or MD files.
@@ -20,7 +22,7 @@
 - A judge scored and merged them.
 - Two adversarial "interviewer" agents cross-examined the result, which produced 31 fixes.
 - A separate agent verified the Render facts.
-- Raw outputs: `scratchpad/panel/{final_full,synthesis,stack,rag}.md`. At M0 they get copied into the repo (see "Panel artifacts" below).
+- Raw outputs: docs/ai-usage/design-review/.
 
 ## Locked decisions
 | Area | Decision | Why (panel line) |
@@ -31,8 +33,8 @@
 | Queue | Celery 5.6 + Redis-compatible broker; queues `ingest` and `ai` | The industry standard the panel expects; acks/retries/routing are explainable |
 | DB | Postgres 17 + pgvector (HNSW index) + full-text search (GIN). psycopg3: async in the API, sync with NullPool in the worker. Alembic migrations | One system of record. Transactional deletes, no dual writes. PG17 matches Render |
 | Frontend | Vite + React + TS + Tailwind, **built into the API image and served by FastAPI** (one origin: no CORS, no build-time API URL) | Visual streaming chat with citations; still one deployable unit |
-| State | **All new**: project-owned containers and named volumes. Postgres :5433, Valkey :6380, MinIO :9000/:9001, API :8000. Homebrew PG/Redis are never touched | User requirement |
-| Storage | S3 API everywhere: MinIO locally, Cloudflare R2 (or S3) in the cloud | The API and worker never share a disk, locally or in the cloud, so the same code path works in both |
+| State | **All new**: project-owned containers and named volumes. Postgres :5433, Valkey :6380, RustFS (S3) :9200, API :8000. Homebrew PG/Redis are never touched | User requirement |
+| Storage | S3 API everywhere: RustFS locally (MinIO's free images were withdrawn), Cloudflare R2 (or S3) in the cloud | The API and worker never share a disk, locally or in the cloud, so the same code path works in both |
 | Auth | `X-API-Key` per user (sha256-hashed), every query owner-scoped, 404 on another owner's resources. Seeded users `demo`, `other`, `eval` | Real multi-tenancy story, cheap to build |
 | Cloud | Render Blueprint (`render.yaml`): web service (API+SPA), worker, Postgres 17, Key Value (`noeviction`), R2. About $20/month; a free fallback is documented | User choice; facts verified |
 | Repo | `/Users/puru/personal-repos/vault-ai`, private GitHub repo `utkarshgupta901/vault-ai`, push at each milestone. Work packages merge locally from worktree branches, **no GitHub PRs** | User choice |
@@ -44,7 +46,7 @@
 React SPA ─┐                         ┌─► Postgres17+pgvector (system of record: docs, pages, chunks+vectors+tsvector,
 Swagger ───┼─► FastAPI (async) ──────┤                         insights, chats, processing_runs, ai_usage, request_logs)
 curl ──────┘   │  SSE (chat, status) ├─► Valkey db0 = Celery broker (AOF, noeviction) · db1 = cache + rate limits
-               │                     ├─► MinIO/S3 (original files: uploads/{owner}/{doc_id}.{ext})
+               │                     ├─► RustFS/S3 (original files: uploads/{owner}/{doc_id}.{ext})
                └─► OpenAI (condense, query embed, streamed answer, follow-ups, summaries)
 Valkey ─► worker-ingest (extract→chunk→embed) ─► enqueue ─► worker-ai (insights)   [both: sync SQL, S3, OpenAI]
 ```
@@ -69,7 +71,7 @@ Valkey ─► worker-ingest (extract→chunk→embed) ─► enqueue ─► work
 
 **Flow (c): multi-turn.** The last 3 turns (ordered by `seq`) are condensed into a standalone query. Retrieval uses the standalone query. The UI shows "Interpreted as …".
 
-## Data model (12 tables; full DDL in panel `final_full.md` §3)
+## Data model (12 tables; full DDL in docs/ai-usage/design-review/03-final-design-after-cross-exam.md §3)
 - **`users`**: key hash, daily cost limit, rate limit.
 - **`documents`**: metadata, status/stage/progress, `current_run_id`, error code/retryable, category/tags, `document_date`, `UNIQUE(owner_id, sha256)`.
 - **`document_pages`**: page text and label, used for citation click-through.
@@ -106,7 +108,7 @@ How this maps to the case study's "Data Storage" bullets:
   - `GET /chat/sessions/{id}/messages`.
   - `POST /chat/sessions/{id}/messages` (JSON) and `POST .../messages/stream` (SSE events: `meta`, `token`, `citations`, `followups`, `done`, `error`).
 - **Metrics:** `GET /metrics/documents`, `/metrics/processing`, `/metrics/ai-usage` (cost by operation/model/day), `/metrics/chat`, `/metrics/system`.
-- **Health:** `GET /health/live`, `GET /health/ready`. DB, pgvector and Alembic head are hard checks (503). Redis, workers and the OpenAI key report `degraded` (still 200).
+- **Health:** `GET /health/live`, `GET /health/ready`. DB, pgvector and Alembic head are hard checks (503). Redis, workers, object storage and the OpenAI key report `degraded` (still 200).
 
 ## Reliability core (what to build vs only explain)
 **Build:**
@@ -122,14 +124,14 @@ How this maps to the case study's "Data Storage" bullets:
 
 ## Scope tiers (build top-down; never cut what the demo uses)
 **P0, must work:**
-- Foundation (Compose: pg17, Valkey, MinIO + bucket init, migrate one-shot, api, worker-ingest, worker-ai; settings; 12 ORM models + Alembic 0001; schemas; error registry; auth; LLMProvider OpenAI+Fake; pricing/usage ledger; S3 storage).
+- Foundation (Compose: pg17, Valkey, RustFS + bucket init, migrate one-shot, api, worker-ingest, worker-ai; settings; 12 ORM models + Alembic 0001; schemas; error registry; auth; LLMProvider OpenAI+Fake; pricing/usage ledger; S3 storage).
 - Documents API (sniffing, dedup, S3, CRUD, reprocess, status SSE).
 - Ingestion (pypdf with page labels, python-docx sections, TXT/MD; chunker 400/60 page-aware with breadcrumb header; batched embeddings with per-owner hash reuse; `processing_runs`).
 - Insights (`responses.parse` → `DocumentInsights`; quotes verified against the text; pages checked).
 - RAG chat (query terms, hybrid SQL, gate, condense, `answer.v1`/`v2`, both message endpoints, citation and grounding checks, confidence, persist-then-follow-ups, per-step timeouts plus a pre-first-token fallback to the fast model).
 - Metrics: documents, processing, ai-usage. Health live/ready.
 - React UI (Documents with drag-and-drop and live status chips; Document detail with insights, summary options and page viewer; Chat with scope picker, streaming, citation chips → page popover, "Interpreted as", follow-up chips, retrieval debug drawer; Metrics cards and charts).
-- Corpus generator + seed + golden set (about 30–40 cases) + `make eval` (hit@k, MRR, refusal precision/recall, citation validity, demo cases 3/3).
+- Corpus generator + seed + golden set (43 cases) + `make eval` (hit@k, MRR, refusal precision/recall, citation validity, demo cases 3/3).
 - Tests (Fake provider against real Postgres; cross-tenant route walker; SSE contract).
 - Docs + `render.yaml` + multi-stage Dockerfile.
 
@@ -153,7 +155,7 @@ How this maps to the case study's "Data Storage" bullets:
 ```
 vault-ai/
   CLAUDE.md README.md AI_USAGE.md render.yaml Dockerfile compose.yaml compose.override.yaml Makefile pyproject.toml uv.lock .env.example alembic.ini
-  docs/{DESIGN,DECISIONS,PROMPTS,EVAL,DEPLOY_RENDER}.md  docs/ai-usage/{log.md,design-review/}
+  docs/{DECISIONS,PROMPTS,EVAL,DEPLOY_RENDER,BUILD_PLAN}.md  docs/ai-usage/{log.md,design-review/}
   migrations/                 app/main.py app/config.py                                  [WP0]
   app/core/{db,redis,errors,logging,auth,pagination,textnorm}.py app/models/* app/schemas/* [WP0]
   app/ai/{provider,openai_provider,fake_provider,pricing,usage}.py app/ai/prompts/common.py [WP0]
@@ -162,7 +164,7 @@ vault-ai/
   app/ingestion/{extract,chunking,pipeline}.py app/worker/{tasks,attempt}.py app/ai/{insights,summaries}.py [WP2]
   app/rag/{query_terms,retrieval,prompting,citations,condense,followups,confidence}.py app/services/chat.py app/api/{chat,search}.py [WP3]
   app/core/{middleware,ratelimit}.py app/services/metrics.py app/api/{metrics,health}.py   [WP4]
-  scripts/{make_demo_docs,seed_demo,snapshot_demo,restore_demo,doctor,smoke_llm}.py evals/  [WP5]
+  scripts/{make_demo_docs,seed_demo,doctor,smoke_llm}.py scripts/{snapshot_demo,restore_demo}.sh evals/  [WP5]
   frontend/ (Vite React TS)                                                                [WP6]
   tests/{documents,ingestion,chat,observability,security}/                                 [per WP]
   prep/  (gitignored: interview Q&A bank, demo checklist; never submitted)
@@ -174,13 +176,13 @@ Each wave runs as a **Workflow**. Every agent works in its own git worktree on i
 | Time | Work | Milestone | Teach |
 |---|---|---|---|
 | 0:00–0:30 | Start OrbStack. `git init`, private GitHub repo, CLAUDE.md (rules: openai imported only in the provider; every service takes `owner_id`; no DB session across an LLM await; no blocking calls in async routes; escape all prompt text; git-safety rules). Copy the panel docs in. The user gets the OpenAI key (hard cap of about $30) and drops their real document into `demo_docs/` | – | Tour of the plan |
-| 0:30–2:00 | **WP0** foundation + walking skeleton on Fake (upload TXT → ready → chat streams `[S1]` → metrics non-zero). `smoke_llm.py` checks every (model, effort) pair and measures TTFT over 20 runs | **M0** | **CP1:** Docker/Compose, data model and indexes (HNSW vs GIN), why S3/MinIO, the Celery mental model. **Publish study page v1** |
+| 0:30–2:00 | **WP0** foundation + walking skeleton on Fake (upload TXT → ready → chat streams `[S1]` → metrics non-zero). `smoke_llm.py` checks every (model, effort) pair and measures TTFT over 20 runs | **M0** | **CP1:** Docker/Compose, data model and indexes (HNSW vs GIN), why S3 (RustFS locally), the Celery mental model. **Publish study page v1** |
 | 2:00–4:00 | **Wave 1** (parallel): WP1 documents API · WP2 ingestion · WP3 RAG on Fake · Lead: corpus generator + golden set (including 3 Q&As on the user's document) | **M1:** corpus ingested with real embeddings | **CP2:** async pipeline: commit-then-enqueue, acks_late, run_id fencing, retries; live `kill -9` of a worker mid-embed |
 | 4:00–5:45 | **Wave 2** (parallel): WP6 React UI · WP2b insights + summaries · WP3 on real data + follow-ups · WP4 metrics/health · Lead: `run_eval.py` | **M2:** real chat end to end in the UI | **CP3, the RAG deep dive:** embeddings and cosine similarity, chunking, hybrid search + RRF arithmetic, the gate, prompt design, citation checks. Psql `EXPLAIN` |
 | 5:45–6:45 | Eval baseline v1 vs v2. Calibrate the gate τ, `TAU_HIGH`, `LEXICAL_WEIGHT` and the per-document cap. Fix failures | Eval report | **CP4:** hit@k, MRR, refusal precision/recall, why 3/3 |
 | 6:45–7:45 | P1 list down to the cut line. **Review workflow** (correctness + security lenses, adversarial verify), `/code-review`, `/security-review`, fault-injection check | **M3 freeze** | **CP5:** cost maths from `ai_usage`, caching, rate limiting, scaling to 1000s and 1M documents |
 | 7:45–8:30 | WP7 docs: README (setup, mermaid, API, assumptions, scale table, cuts), AI_USAGE (the real log), PROMPTS (with the measured v1→v2 delta), EVAL, DECISIONS, DEPLOY_RENDER. Prod-image test: single image, Render-like env | Docs done | – |
-| 8:30–9:15 | Clean clone → `make reset seed` → `make eval-demo` → rehearsal 1 → `make snapshot-demo` → backup screen recording → tag `demo-v1` → push | **M4** | – |
+| 8:30–9:15 | Clean clone → `make reset seed` → `make eval-demo` → rehearsal 1 → `make pre-demo` (review the plan, then apply it) → `make snapshot-demo` (only after the cleanup) → backup screen recording → tag `demo-v1` → push | **M4** | – |
 | 9:15–11:00 | **Deep session** (1.5–2 h, the whole system end to end) + **full study page** (diagrams, concept cards, the 45-question flashcard bank, demo script) + mock panel + rehearsal 2 | Ready | **CP6** |
 
 **Checkpoint format:** a 5–10 minute walkthrough of what was built and why, the cross-questions it invites, and 3 quiz questions. The candidate explains the topic back. The study-page artifact is republished at each checkpoint.
@@ -189,18 +191,18 @@ Each wave runs as a **Workflow**. Every agent works in its own git worktree on i
 - **Dockerfile:** multi-stage. A node stage builds the SPA; `python:3.13-slim` + uv puts the venv at `/opt/venv`. One image serves as API or worker depending on the command.
 - **Configuration:** env-only. `DATABASE_URL` is normalized from `postgres://` to `postgresql+psycopg://` in both settings and alembic `env.py`. Also `BROKER_URL`, `CACHE_URL`, `S3_*`, `OPENAI_API_KEY`.
 - **`render.yaml`** (from the verified research):
-  - **Web:** Docker, `sh -c "uvicorn … --port ${PORT:-10000}"`, `preDeployCommand: alembic upgrade head`, health check `/health/live`.
+  - **Web:** Docker; the image CMD runs `sh -c "uvicorn … --port ${PORT:-8000}"`, `preDeployCommand: python -m app.cli bootstrap` (Alembic upgrade + bucket + seed users), health check `/health/live`.
   - **Worker:** same image, `celery … -Q ingest,ai -c 2 --max-memory-per-child`.
   - **Postgres:** `postgresMajorVersion: "17"`.
   - **Key Value:** `maxmemoryPolicy: noeviction`, `ipAllowList: []`.
   - **Secrets:** `sync: false`.
-- **R2 settings:** boto3 with `region_name="auto"` and `request_checksum_calculation="when_required"`. MinIO uses path-style addressing.
+- **R2 settings:** boto3 with `region_name="auto"` and `request_checksum_calculation="when_required"`. RustFS uses path-style addressing.
 - **Free fallback:** an all-in-one start script (uvicorn + celery solo in one container, migrations run at start). Documented in `docs/DEPLOY_RENDER.md`.
 
 ## Panel artifacts (where the detail lives)
 - `docs/ai-usage/design-review/`: synthesis + scorecard and the final design (Part 1, Part 2). This is evidence of AI-driven design review, so it belongs in the repo.
 - `prep/` (gitignored): the 45-question interview bank, learning path, demo-day checklist and 6-minute script (Parts 3–5), plus the RAG research notes.
-- The implementation follows the panel's §3 DDL, §4 SSE contract, §5 Celery config and attempt rules, §6 prompts/SQL/chunking/citation rules and the WP0 contracts. Where the panel's text conflicts with this plan, this plan wins: React instead of static HTML, S3/MinIO instead of a local volume, pg17 instead of pg18, Valkey to match Render.
+- The implementation follows the panel's §3 DDL, §4 SSE contract, §5 Celery config and attempt rules, §6 prompts/SQL/chunking/citation rules and the WP0 contracts. Where the panel's text conflicts with this plan, this plan wins: React instead of static HTML, S3 (RustFS) instead of a local volume, pg17 instead of pg18, Valkey to match Render.
 
 ## Verification
 1. **`make smoke`:** health ready; upload → ready; duplicate → 200; no key + large Content-Length → 401 with no temp file; stream event order `meta → token* → citations → followups → done`; messages returned in `seq` order; metrics non-zero.

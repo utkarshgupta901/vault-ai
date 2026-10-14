@@ -39,11 +39,12 @@ The nine rules and the failure each prevents:
 
 **Checks after generation** (`app/rag/citations.py`, deterministic): citation ids must be ones we provided; every
 number/code in a cited sentence must appear in that sentence's cited chunks (results of shown calculations are
-derived, not looked up); sentences with facts and no citation are counted; the confidence badge is computed from
+derived, not looked up; a date the prompt showed counts right after its cue, "dated" or "today" / "as of", see
+DECISIONS D-06); sentences with facts and no citation are counted; the confidence badge is computed from
 these signals plus retrieval similarity — never self-reported by the model.
 
 **v1 → v2.** v1 (kept, `ANSWER_PROMPT_VERSION=v1`) lacks rules 2, 5's date clause, and 7. The measured difference on
-the golden set: both pass 43/43, but v1 grounds 41/43 vs v2's 43/43 — v1 states computed totals without showing the arithmetic, so code can't verify them ([EVAL.md](EVAL.md#prompt-v1-vs-v2-same-43-cases-same-model)).
+the golden set (2026-10-13): both pass 43/43, but v1 grounds 41/43 vs v2's 43/43 — v1 states computed totals without showing the arithmetic, so code can't verify them ([EVAL.md](EVAL.md#prompt-v1-vs-v2-same-43-cases-same-model)).
 
 ## condense.v1: follow-up → standalone search query
 

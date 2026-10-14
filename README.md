@@ -8,17 +8,21 @@ and API latency.
 
 ![Chat with streamed, cited answer](docs/screenshots/chat.png)
 
-| Measured on the 43-case golden set (`make eval`) | Result |
+| Final run on the 43-case golden set (`make eval`, 2026-10-14) | Result |
 |---|---|
 | Answers passing all expectations | **43/43** (incl. 10 demo questions, multi-doc arithmetic, multi-turn, injection probes) |
+| Grounded answers (every number in a cited sentence is in its cited source, a shown calculation, or a date the prompt showed) | **43/43** |
 | Refusals when the answer isn't in the documents | **15/15**, zero false refusals |
 | Citations pointing at a source actually provided / at the right document | **100% / 100%** |
+| Confidence badge high / medium / low | 21 / 7 / 15 (low = the 15 refusals); every answer passed, so each bucket is 100% accurate and the badge's calibration is untested |
 | Hybrid retrieval hit@8 / MRR | **100% / 0.958** (vector-only 0.907, keyword-only 0.915) |
-| Time to first token p50 / p95 (gpt-6.1-sol, model-generated answers) | 2.6 s / 4.7 s (final run; Sol's tail varies run to run) |
-| Cost per answer / per ingested document | ~$0.0014 / ~$0.001 |
+| Time to first token p50 / p95 (gpt-6.1-sol, 34 model-generated answers) | 1.4 s / 3.2 s (all 43 answers: 1.4 s / 2.7 s); Sol's latency varies by day; on 2026-10-13: 2.6–2.7 s / 4.7–6.9 s (20261013T165934Z, 20261013T155343Z) |
+| Cost per answer / per ingested document | $0.0042 with a cold prompt cache, averaged over all 43 incl. 9 gate refusals ($0.0053 per model answer; $0.0014 on 20261013T155343Z, a rerun with 86% of answer input cached) / ~$0.001 |
+| AI spend for the whole 43-case run | $0.21 |
 
-Numbers come from `evals/reports/` (see [docs/EVAL.md](docs/EVAL.md)); decisions they drove are in
-[docs/DECISIONS.md](docs/DECISIONS.md).
+Numbers come from `evals/reports/20261014T105823Z` (see [docs/EVAL.md](docs/EVAL.md)); cost per document from
+`/metrics/ai-usage` (docs/screenshots/metrics.png); decisions they drove are in
+[docs/DECISIONS.md](docs/DECISIONS.md). The demo questions pass 3/3 in `make eval-demo` (`20261014T110107Z`).
 
 ---
 
@@ -28,8 +32,10 @@ Prerequisites: Docker (OrbStack or Docker Desktop), [uv](https://docs.astral.sh/
 frontend development). All state lives in this project's own containers and volumes.
 
 ```bash
-cp .env.example .env            # put your OPENAI_API_KEY in .env (or set LLM_PROVIDER=fake to run fully offline)
+cp .env.example .env            # put your OPENAI_API_KEY in .env (or set LLM_PROVIDER=fake: no key needed, see below)
 make demo                       # build + start: Postgres+pgvector, Valkey, S3 (RustFS), API, 2 workers, migrations
+# optional, for the 3 public-document eval cases (43 instead of 40):
+mkdir -p demo_docs/user && curl -fL --retry 3 -o demo_docs/user/NIST.AI.100-1.pdf https://nvlpubs.nist.gov/nistpubs/ai/NIST.AI.100-1.pdf   # sha256 7576edb531d9848825814ee88e28b1795d3a84b435b4b797d3670eafdc4a89f1
 make seed                       # generate the demo corpus and upload it as the demo user
 open http://localhost:8000      # dashboard (API key: vault-demo-key) · API docs at /docs
 ```
@@ -40,18 +46,28 @@ open http://localhost:8000      # dashboard (API key: vault-demo-key) · API doc
 | `make up` | dev stack with bind mounts + auto-reload; dashboard also on :8000 (`make web-dev` adds hot reload on :5173) |
 | `make demo-luna` | switch only the API's answer model to `gpt-6-luna` (fallback if the network is slow); `make demo` switches back |
 | `make raise-quota` | raise the demo user's daily AI budget (default $100) |
-| `make test` | ~490 tests (pytest, FakeProvider, real Postgres/Valkey/S3 from the stack) |
+| `make test` | ~615 tests (pytest, FakeProvider, real Postgres/Valkey/S3 from the stack) |
 | `make smoke` / `make smoke-llm` | end-to-end smoke against the running API / verify every configured model + TTFT |
 | `make eval` / `make eval-demo` / `make eval-retrieval` | golden-set evaluation (answers, refusals, citations, latency, cost) / demo cases 3× / retrieval only |
 | `make doctor` | pre-demo checklist (health, workers, seeded docs, demo library holds only the corpus, today's spend) |
-| `make pre-demo` | dry-run plan of the pre-snapshot cleanup (non-corpus documents, pre-loaded live uploads, chats that use or mention them, test chats), ending with the exact command to apply it: `APPLY=1 EXPECT_DOCS=n EXPECT_SESSIONS=m EXPECT_PLAN=id` runs that plan through the API and verifies (refused if anything it deletes changed, even with equal counts); `BACKUPS=1` makes the three Backup sessions pass their golden cases; terms no chat may mention go in the gitignored `demo_docs/user/.deny_terms` |
-| `make snapshot-demo` / `make restore-demo` | freeze / restore the exact demo database + files (the snapshot refuses while `pre-demo --check` fails, unchecked users exist, or a document's S3 object is missing; objects no document points at are left out and named) |
+| `make pre-demo` | dry-run plan of the pre-snapshot cleanup (non-corpus documents, pre-loaded live uploads, chats that use or mention them, test chats), ending with the exact command to apply it: `APPLY=1 EXPECT_DOCS=n EXPECT_SESSIONS=m EXPECT_PLAN=id` runs that plan through the API and verifies (refused if anything it deletes changed, even with equal counts); `BACKUPS=1` makes the three Backup sessions pass their golden cases; terms no chat may mention go in the gitignored `demo_docs/user/.deny_terms`; with nothing in `demo_docs/user/` add `NO_USER_DOCS=1` |
+| `make snapshot-demo` / `make restore-demo` | freeze / restore the exact demo database + files; snapshot only after `make pre-demo` has been applied (the snapshot refuses while `pre-demo --check` fails, unchecked users exist, or a document's S3 object is missing; objects no document points at are left out and named) |
 | `make reset` | delete this project's volumes |
+
+Before a demo: `make doctor`, then `make pre-demo` (review the plan, then run the apply command it prints), and only
+then `make snapshot-demo`, so a later `make restore-demo` brings back the cleaned library.
 
 Local ports (chosen to avoid other services): API 8000, Postgres 5433, Valkey 6380, S3 9200. If one is taken,
 export `API_PORT` / `PG_PORT` / `VALKEY_PORT` / `S3_PORT` before `make` (compose, make and the tests all follow
-them; see `.env.example`). That moves the `vault-ai` stack itself; a second, separate stack also needs
-`COMPOSE_PROJECT_NAME=<other>`.
+them; see `.env.example`). That moves the `vault-ai` stack itself, because compose.yaml pins the project name; a
+second, separate stack also needs `COMPOSE_PROJECT_NAME=<other>`.
+
+**Without an OpenAI key** (`LLM_PROVIDER=fake` in `.env`): the upload → extract → chunk → embed pipeline and its
+queues, hybrid retrieval and the gate, citations and page links, and the metrics are real. The model's words are
+not: answers and insights are placeholders (answers cite `[S1]`; insight fields read "fake summary", "fake
+title"), and embeddings are a hashed bag-of-words, so the vector leg matches shared words, not meaning. Use it to
+check the plumbing, not answer quality. It is not fully offline: `/docs` loads Swagger UI from a CDN, and the first
+image build downloads packages.
 
 ---
 
@@ -107,7 +123,7 @@ rule-based confidence badge → persist message + costs in one short transaction
 Retrieval units live in `chunks` (`vector(1536)` + HNSW, generated `tsvector` + GIN, denormalized `owner_id`).
 See `migrations/versions/0001_initial.py`.
 
-## API (`/api/v1`, header `X-API-Key`, OpenAPI at `/docs`)
+## API (`/api/v1` except health; header `X-API-Key`; OpenAPI at `/docs`)
 
 | Area | Endpoints |
 |---|---|
@@ -116,7 +132,7 @@ See `migrations/versions/0001_initial.py`.
 | Chat | `POST/GET /chat/sessions` · `GET/DELETE /chat/sessions/{id}` · `GET /chat/sessions/{id}/messages` · `POST /chat/sessions/{id}/messages` (JSON) · `POST /chat/sessions/{id}/messages/stream` (SSE) |
 | Retrieval debug | `GET /search?q=&mode=hybrid\|vector\|keyword` (no LLM call; shows ranks and the RRF arithmetic inputs) |
 | Metrics | `GET /metrics/documents` · `/metrics/processing` · `/metrics/ai-usage` · `/metrics/chat` · `/metrics/system` |
-| Health | `GET /health/live` · `GET /health/ready` (503 only for hard dependencies; Redis/workers/storage/AI report `degraded`) |
+| Health (root path, no key) | `GET /health/live` · `GET /health/ready` (503 only for hard dependencies; Redis/workers/storage/AI report `degraded`) |
 
 Every error uses one envelope: `{"error": {"code", "message", "details", "request_id"}}`. Another owner's id is a 404
 (never 403). Idempotency: uploads by content hash, questions by `client_message_id`.
@@ -132,8 +148,8 @@ Every error uses one envelope: `{"error": {"code", "message", "details", "reques
   ("LRK-4471", "§ 9.2"). An exact identifier match also counts as a top semantic hit; the eval found that without
   this, exact clause references were buried (DECISIONS D-02).
 - **Grounding by construction and by checking**: numbered `<source>` tags, nine explicit rules (answer.v2), the
-  question last; then code verifies every cited id and every number against the cited text. The confidence badge is
-  rule-based, never self-reported by the model.
+  question last; then code verifies every cited id and every number against the cited text (or the dates the
+  prompt showed, D-06). The confidence badge is rule-based, never self-reported by the model.
 - **Prompt injection**: document text is escaped inside tags and declared untrusted; no tools or secrets in reach;
   insights flag injected instructions; two golden probes ("reply APPROVED") must pass. Model output is rendered
   without HTML or remote images.
@@ -190,17 +206,18 @@ and the scaling path.
 
 ## AI-assisted development
 
-Built in one day with Claude Code: a 9-agent design panel with adversarial "interviewer" reviewers, parallel
-implementation by agents in isolated git worktrees against frozen contracts, an evaluation harness that caught two
-real bugs, and a 4-lens adversarial code review before the demo. What the AI did, what I decided and verified, and
-what went wrong: [AI_USAGE.md](AI_USAGE.md).
+Built in one day with Claude Code (plus a pre-demo pass the next day): a 9-agent design panel with adversarial
+"interviewer" reviewers, parallel implementation by agents in isolated git worktrees against frozen contracts, an
+evaluation harness whose reports exposed three real bugs (the third found by an audit reading them), a 4-lens
+adversarial code review, and a pre-demo sweep (confidentiality, clean clone, docs accuracy). What the AI did, what I
+decided and verified, and what went wrong: [AI_USAGE.md](AI_USAGE.md).
 
 ## Repository layout
 
 ```
 app/
   api/          routes: documents, insights, chat, search, metrics, health
-  core/         config, db, auth, errors, request ids, upload guard, rate limits, logging
+  core/         db, auth, errors, request ids, upload guard, rate limits, request logs, logging (config: app/config.py)
   ingestion/    sniffing, extraction, chunking, pipeline
   rag/          query terms, retrieval SQL, prompting, citations/grounding, confidence, history, condense, follow-ups
   ai/           provider seam (OpenAI + offline Fake), prompts, insights, summaries, compare, pricing, usage ledger
@@ -210,6 +227,6 @@ migrations/     hand-written SQL schema
 frontend/       React dashboard (Vite, TypeScript, Tailwind)
 evals/          golden set (43 cases), runner, scoring, reports
 scripts/        demo corpus generator, seeding, smoke, doctor, snapshots, Render all-in-one start
-tests/          ~490 tests
+tests/          ~615 tests
 docs/           decisions, prompts, eval, deployment, design review, AI usage log
 ```

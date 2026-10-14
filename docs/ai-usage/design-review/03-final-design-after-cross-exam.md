@@ -1,6 +1,6 @@
 # Vault AI: final demo-ready package
 
-> **Legend.** **[XF]** marks a change made after cross-examination. CE1 is the AI/RAG review and CE2 is the systems/product review; "Q7" means question 7 of that review. Model IDs, prices and library pins come from the 2026-10-13 research. Anything marked UNVERIFIED is checked at M0 by `scripts/smoke_llm.py`.
+> **Legend.** **[XF]** marks a change made after cross-examination. CE1 is the AI/RAG review and CE2 is the systems/product review; "Q7" means question 7 of that review. Model IDs, prices and library pins come from the 2026-10-13 research. Anything marked UNVERIFIED is checked at M0 by `scripts/smoke_llm.py`. Panel output, kept as written: `make eval-judge` and `make fault-check` were not built (the judge is `evals/judge.py`, run offline).
 
 ---
 

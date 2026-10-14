@@ -2,8 +2,9 @@
 
 ## What this is
 FastAPI + Celery + Postgres/pgvector + Valkey + S3 (RustFS locally) document-chat (RAG) backend with a React dashboard.
-Design: docs/BUILD_PLAN.md (authoritative) and docs/ai-usage/design-review/03-final-design-after-cross-exam.md (detail:
-§3 DDL, §4 SSE contract, §5 pipeline rules, §6 prompts/SQL/citations). Where they conflict, BUILD_PLAN.md wins.
+Design history: docs/BUILD_PLAN.md (the original plan; where it differs, the code, README and docs/DECISIONS.md are
+current) and docs/ai-usage/design-review/03-final-design-after-cross-exam.md (detail: §3 DDL, §4 SSE contract, §5
+pipeline rules, §6 prompts/SQL/citations).
 
 ## Local stack (all project-owned; never touch other Postgres/Redis on this machine)
 - Postgres 17 + pgvector: localhost:5433 (vault/vault/vault) · Valkey: localhost:6380 (db0 broker, db1 cache)

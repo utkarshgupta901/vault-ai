@@ -1,8 +1,9 @@
 # How AI coding tools were used to build Vault AI
 
 **Tool:** Claude Code (Opus 5.5) in the terminal: plan mode, multi-agent workflows, subagents working in isolated
-git worktrees, and the evaluation harness as the arbiter. **Time:** one day. **Result:** ~8.3k lines of Python,
-~5.3k lines of TypeScript, ~490 tests, a 43-case evaluation, deployment config.
+git worktrees, and the evaluation harness as the arbiter. **Time:** one day, plus a pre-demo pass the next day.
+**Result:** ~9.3k lines of Python in app/ (plus ~8.3k in tests), ~5.5k lines of TypeScript, ~615 tests, a 43-case
+evaluation, deployment config.
 
 The short version: I used AI to **explore, build in parallel, and attack its own work**, and kept the decisions,
 contracts and verification with me. The chronological log with timestamps is in
@@ -55,16 +56,17 @@ AI knowledge goes stale, so every external fact the design depended on was probe
 
 A golden set of 43 cases with known answers (single facts, a table-only figure, multi-document arithmetic,
 multi-turn follow-ups, 15 must-refuse questions, prompt-injection probes, Word sections, a public NIST document)
-runs against the live API. It found two real bugs that every unit test had passed:
+runs against the live API. Its reports exposed three real bugs that every unit test had passed:
 
 | Bug | How the eval showed it | Fix and effect |
 |---|---|---|
 | Rank-fusion flaw: a chunk found only by an exact identifier ("section 9.2") scored 1/61 and lost to chunks merely okay on both legs | hybrid retrieval was *worse* than either leg alone (MRR 0.891 vs 0.907 / 0.915) | identifier boost + structural phrases; hybrid MRR **0.958**, hit@8 100% |
 | Grounding checker false positives on derived numbers ("18 + 2 = 20") and refusals | 3 correct answers flagged "ungrounded", dragging demo answers to "low confidence" | derived values inherit grounding from their calculation; refusals not fact-checked |
+| Grounding checker ignored the dates the prompt shows (document dates, today's date), which rule 5 asks the model to use | the correct stipend demo answer had 1–3 "ungrounded" dates and showed Low confidence in 3/3 runs; the pass/fail line stayed green, and a docs-accuracy audit found it in the eval-demo JSON | a shown date counts only right after its cue ("dated", "today" / "as of"); Medium in 3/3 runs after the fix (D-06) |
 
-The same harness chose the answer model: Sol and Luna both passed 43/43; Sol grounded every answer and produced more
-high-confidence answers, Luna was 2× faster and 7× cheaper → Sol for answers, Luna for everything else and as the
-automatic fallback ([docs/DECISIONS.md](docs/DECISIONS.md)).
+The same harness chose the answer model: Sol and Luna both passed 43/43; Sol grounded every answer in the comparison
+run and produced more high-confidence answers, Luna was 2× faster at p50 and ~20× cheaper with a cold prompt cache →
+Sol for answers, Luna for everything else and as the automatic fallback ([docs/DECISIONS.md](docs/DECISIONS.md)).
 
 ## 5. Adversarial review before the demo
 
@@ -82,13 +84,28 @@ areas, each adding regression tests.
 - **Frozen contracts + file ownership**: agents could not drift from the schema, SSE contract or each other.
 - **CLAUDE.md hard rules**, checked again by reviewers (e.g. a DB session held across a streaming LLM call, unescaped
   document text in a prompt, a status write not fenced by `run_id`).
-- **Offline FakeProvider**: ~490 tests run in ~50 s with real Postgres/pgvector and zero API cost.
+- **Offline FakeProvider**: ~615 tests run against real Postgres/pgvector with zero API cost.
 - **Measure, don't assume**: model latency (TTFT p50/p95), retrieval ranks per case, cost per answer, all from real
-  runs; README numbers are copied from reports.
+  runs; README numbers are copied from reports, with the report id and the prompt-cache state.
 - **Honest log**: what went wrong is recorded (usage limit, withdrawn MinIO images, the bugs above), because that is
   where the engineering judgement shows.
 
-## 7. What I did myself
+## 7. Pre-demo hygiene
+
+Before sharing the repo, a 7-agent workflow checked it, read-only against the live stack:
+
+| Check | Agents | Found | Now |
+|---|---|---|---|
+| Confidentiality sweep | 2: git history; by location (files, screenshots, eval reports, the live DB) | agents had copied details from my personal configuration into the design-review notes, and an AI-written regression fixture paraphrased the long real-world document (~49k words, not part of the repo) I had tested with | both replaced with neutral text |
+| Clean clone | 1, in an isolated compose project | `make seed` ignored `API=`; host ports were hard-coded | ports overridable (`API_PORT`, `PG_PORT`, `VALKEY_PORT`, `S3_PORT`); seed honours `API` |
+| Docs accuracy | 2: auditor + skeptic verifier | the README's cost per answer came from a warm prompt-cache rerun; TTFT included gate refusals (~10 ms, no model call); the date-grounding bug above | numbers carry report ids and cache state; TTFT over model answers; D-06 |
+| Pre-demo cleanup | 2: builder + adversarial reviewer | the first draft's tests used real file names from the live library, and its apply guard could be bypassed | neutral test names; `make pre-demo` applies only the reviewed plan (plan id + counts); `make snapshot-demo` refuses until it passes |
+
+The fixes went through the usual loop (3 builders, 3 adversarial reviewers, 3 fixers) and were squash-merged, so no
+branch history carries what review removed. The lesson: AI copies whatever context it sees into artifacts, as the
+cleanup tool's first draft showed again. So I sweep artifacts, not only code, before sharing.
+
+## 8. What I did myself
 
 Chose the product and stack trade-offs; wrote and reviewed the contracts; read the core modules (insights
 verification, retrieval SQL, rate limiting, the worker attempt logic) and the review findings; ran the end-to-end

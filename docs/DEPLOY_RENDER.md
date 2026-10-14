@@ -25,8 +25,10 @@ Nothing is written to local disk except temp files during extraction.
    worker.
 4. Deploy. The pre-deploy step migrates and seeds; when `vault-api` is live, open its URL: the dashboard loads from
    the same origin. Put the demo API key in the dashboard's Settings.
-5. Check `GET /health/ready`: `status: ok` means DB + pgvector + schema head are good and the worker is consuming
-   both queues; `degraded` names the soft dependency that is missing.
+5. Check `GET /health/ready`: `status: ok` means the hard checks pass (DB reachable, pgvector installed, schema at
+   Alembic head; otherwise 503 `unavailable`) and Redis, a consumer on both worker queues, the storage bucket and the
+   AI provider (key set, recent calls not failing) are healthy; `degraded` (still 200) means a soft check failed: look
+   for the `checks.<name>` with `ok: false` (most include an `error`).
 
 ## Cloud-specific details handled in code
 
@@ -47,7 +49,8 @@ Nothing is written to local disk except temp files during extraction.
 | Free fallback: one free web service running `scripts/start_all_in_one.sh` + free Postgres + free Key Value | $0 | spins down after 15 min idle (~1 min cold start), worker shares the web instance, free Postgres expires after 30 days |
 
 To use the free fallback, change `vault-api` to `plan: free`, remove `preDeployCommand` and the `vault-worker` service,
-and set `dockerCommand: sh scripts/start_all_in_one.sh`.
+set `dockerCommand: sh scripts/start_all_in_one.sh` (it runs the bootstrap at start), and change `vault-db` to
+`plan: free` (expires after 30 days).
 
 ## Scaling path (what changes with load)
 
