@@ -20,7 +20,7 @@ QUOTA_USER ?= demo
 QUOTA_USD ?= 100
 
 .DEFAULT_GOAL := help
-.PHONY: help up demo demo-luna raise-quota down reset logs ps migrate seed test test-fast lint fmt smoke smoke-llm eval eval-demo eval-retrieval doctor workers web-dev web-build psql redis-cli snapshot-demo restore-demo freeze-starters
+.PHONY: help up demo demo-luna raise-quota down reset logs ps migrate seed test test-fast lint fmt smoke smoke-llm eval eval-demo eval-retrieval doctor pre-demo workers web-dev web-build psql redis-cli snapshot-demo restore-demo freeze-starters
 
 help: ## Show targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
@@ -105,7 +105,18 @@ eval-retrieval: ## Retrieval-only metrics (hit@k, MRR per mode), no LLM answers
 freeze-starters: ## Freeze the demo docs' suggested questions into evals/golden_starters.yaml
 	uv run python scripts/freeze_starters.py --api $(API) --key $(KEY)
 
-snapshot-demo: ## Save the demo DB + S3 objects to demo_snapshot/
+# Dry run by default: prints one line per document/session it would delete or keep, then the exact apply command.
+# APPLY=1 needs the delete counts and the plan id the dry run printed (EXPECT_DOCS=, EXPECT_SESSIONS=, EXPECT_PLAN=)
+# and refuses when anything the plan deletes changed since. BACKUPS=1 (with APPLY=1) replaces failing PTO / stipend /
+# proposals Backup sessions and asks the missing ones (one answer call each). NO_USER_DOCS=1 states that
+# demo_docs/user/ holds no real document here.
+pre-demo: ## Pre-snapshot cleanup, dry run (APPLY=1 EXPECT_DOCS=n EXPECT_SESSIONS=m EXPECT_PLAN=id executes it; BACKUPS=1)
+	uv run python scripts/pre_demo.py --api $(API) --key $(KEY) $(if $(filter 1,$(APPLY)),--apply) \
+		$(if $(EXPECT_DOCS),--expect-docs $(EXPECT_DOCS)) $(if $(EXPECT_SESSIONS),--expect-sessions $(EXPECT_SESSIONS)) \
+		$(if $(EXPECT_PLAN),--expect-plan $(EXPECT_PLAN)) \
+		$(if $(filter 1,$(BACKUPS)),--create-backups) $(if $(filter 1,$(NO_USER_DOCS)),--no-user-docs)
+
+snapshot-demo: ## Save the demo DB + S3 objects to demo_snapshot/ (refuses unless pre-demo --check passes and every document's object is in S3)
 	bash scripts/snapshot_demo.sh
 
 restore-demo: ## Restore the demo DB + S3 objects from demo_snapshot/ (overwrites current data)

@@ -8,6 +8,9 @@ Checks, in the order they matter on demo day:
   - the API key works;
   - the demo corpus (plus any real document in demo_docs/user/) is present, ready and has insights (pre-seeded by
     scripts/seed_demo.py);
+  - the demo library holds ONLY the demo corpus: no other document, no pre-loaded live upload, and nothing that is
+    only trusted because a file of that name sits in demo_docs/ (same rules as make pre-demo, which deletes the
+    first two);
   - today's AI spend for this key is well under its daily quota (/metrics/ai-usage, when deployed);
   - the keyword leg ranks the LRK-4471 board-update chunk first (/search, when deployed);
   - which models the server is configured to use.
@@ -25,7 +28,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import httpx  # noqa: E402
 
 from evals.api_client import API_PREFIX, ApiError, VaultClient  # noqa: E402
-from evals.corpus import BOARD_UPDATE, SEED_FILES, user_files  # noqa: E402
+from evals.corpus import BOARD_UPDATE, DEMO_DOCS, SEED_FILES, user_files  # noqa: E402
+from evals.demo_library import (  # noqa: E402
+    DEMO_USER,
+    KnownFile,
+    known_files,
+    plan_documents,
+    user_docs_warning,
+)
 
 SPEND_WARN_USD = 1.0          # the demo checklist wants the demo user under $1 before going live
 HARD_DEPENDENCIES = {"database"}
@@ -81,6 +91,25 @@ def assess_documents(docs: list[dict[str, Any]], expected: tuple[str, ...] = SEE
     return checks
 
 
+def assess_library(docs: list[dict[str, Any]], known: list[KnownFile], hint: str | None = None) -> Check:
+    """The demo library holds only the demo corpus: the same rules as make pre-demo (evals/demo_library.py), so a
+    FAIL here is exactly what `make pre-demo APPLY=1` would delete. hint: why the plan may be off (no user/ dir)."""
+    decisions, warnings = plan_documents(DEMO_USER, docs, known, demo=True)
+    unexpected = [d.filename for d in decisions if d.delete and d.role is None]
+    live = [d.filename for d in decisions if d.delete and d.role is not None]
+    untrusted = [d.filename for d in decisions if not d.delete and d.role == "extra"]
+    if unexpected or live or untrusted:
+        parts = ([f"unexpected documents: {', '.join(unexpected)}"] if unexpected else []) \
+            + ([f"live uploads pre-loaded: {', '.join(live)}"] if live else []) \
+            + ([f"only matched by a file in demo_docs/ that evals/corpus.py does not name: {', '.join(untrusted)}"]
+               if untrusted else [])
+        return Check("FAIL", "demo library", "; ".join(parts) + " -> make pre-demo"
+                     + (f" ({hint})" if hint and unexpected else ""))
+    if warnings:
+        return Check("WARN", "demo library", "; ".join(w.removeprefix(f"{DEMO_USER}: ") for w in warnings))
+    return Check("PASS", "demo library", f"only the demo corpus ({len(docs)} documents)")
+
+
 def assess_spend(usage: dict[str, Any]) -> Check:
     spend, limit = float(usage.get("today_spend_usd") or 0), float(usage.get("daily_limit_usd") or 0)
     level = "FAIL" if limit and spend >= limit else ("WARN" if spend >= SPEND_WARN_USD else "PASS")
@@ -120,6 +149,7 @@ def gather(client: VaultClient) -> list[Check]:
         return checks + [Check("FAIL", "API key", str(exc))]
     checks.append(Check("PASS", "API key", "accepted"))
     checks += assess_documents(docs, SEED_FILES + tuple(p.name for p in user_files()))
+    checks.append(assess_library(docs, known_files(), user_docs_warning(DEMO_DOCS)))
     if client.has_route(f"{API_PREFIX}/metrics/ai-usage"):
         checks.append(assess_spend(client.get_json(f"{API_PREFIX}/metrics/ai-usage", {"window": "24h"})))
     else:

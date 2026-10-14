@@ -2,7 +2,10 @@
 
 It lets the eval runner and the ops scripts be tested end to end (HTTP shapes, polling, sessions, SSE parsing,
 report writing) without the compose stack and without any model. It implements only what those clients call, with
-the response shapes of app/schemas/*. Answers and search hits come from functions the test supplies."""
+the response shapes of app/schemas/*. Answers and search hits come from functions the test supplies.
+Lists page like the real API (limit 1..100, an opaque next_cursor; messages: newest page first, each page oldest
+first), so a client that ignores the cursor loses items here too.
+One instance is one user's vault; users_transport() puts several behind one server, keyed by API key."""
 
 import hashlib
 import json
@@ -25,6 +28,32 @@ def envelope(status: int, code: str, message: str = "") -> httpx.Response:
                                                   "request_id": None}})
 
 
+def page_params(request: httpx.Request) -> tuple[int, int | None] | httpx.Response:
+    """(limit, cursor position) of a list request, or the 422/400 the real API answers. Cursors here are positions
+    in the list, which is enough for tests that never change a list while paging it."""
+    params = request.url.params
+    try:
+        limit = int(params.get("limit", 20))
+        cursor = int(params["cursor"]) if params.get("cursor") else None
+    except ValueError:
+        return envelope(400, "INVALID_CURSOR")
+    if not 1 <= limit <= 100:
+        return envelope(422, "VALIDATION_ERROR")
+    return limit, cursor
+
+
+def newest_first_page(request: httpx.Request, items: list[dict[str, Any]]) -> httpx.Response:
+    """Documents and sessions: newest first, next_cursor = where the next page starts."""
+    parsed = page_params(request)
+    if isinstance(parsed, httpx.Response):
+        return parsed
+    limit, start = parsed[0], parsed[1] or 0
+    newest = list(reversed(items))
+    end = start + limit
+    return httpx.Response(200, json={"items": newest[start:end],
+                                     "next_cursor": str(end) if end < len(newest) else None})
+
+
 class FakeVaultApi:
     def __init__(self, *, answer_fn: AnswerFn | None = None, search_fn: SearchFn | None = None,
                  routes: set[str] | None = None, polls_until_ready: int = 1,
@@ -40,8 +69,34 @@ class FakeVaultApi:
         self.polls: dict[str, int] = {}
         self.sessions: dict[str, dict[str, Any]] = {}
         self.questions: dict[str, list[str]] = {}
+        self.history: dict[str, list[dict[str, Any]]] = {}              # session id -> stored messages
         self.spend = 0.0
         self.calls: list[str] = []
+
+    # --- test setup: state a script would find on a used stack ------------------------------------------------------
+    def add_document(self, filename: str, data: bytes | None = None, **fields: Any) -> dict[str, Any]:
+        """A ready document with insights, as if uploaded and processed long ago."""
+        data = data if data is not None else f"content of {filename}".encode()
+        doc_id = str(uuid.uuid4())
+        self.docs[doc_id] = {"id": doc_id, "filename": filename, "sha256": hashlib.sha256(data).hexdigest(),
+                             "status": "ready", "stage": None, "insights_status": "ready", "upload_count": 1,
+                             "page_count": 1, "chunk_count": 1, "category": "other", "document_date": None,
+                             "error": None, **fields}
+        self.contents[doc_id] = data
+        self.polls[doc_id] = 0
+        return self.docs[doc_id]
+
+    def add_session(self, title: str | None, document_ids: list[str] | None = None,
+                    messages: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        """document_ids=None: an all-documents session. messages: assistant/user rows (seq and ids are filled in)."""
+        sid = str(uuid.uuid4())
+        self.sessions[sid] = {"id": sid, "title": title, "all_documents": document_ids is None,
+                              "document_ids": list(document_ids or []), "created_at": "2026-10-13T10:00:00Z",
+                              "last_message_at": None, "starter_questions": [], "warnings": []}
+        self.questions[sid] = []
+        self.history[sid] = [self._message(sid, m.get("role", "assistant"), seq, m)
+                             for seq, m in enumerate(messages or [], start=1)]
+        return self.sessions[sid]
 
     # --- dispatch -------------------------------------------------------------------------------------------------
     def __call__(self, request: httpx.Request) -> httpx.Response:
@@ -60,6 +115,9 @@ class FakeVaultApi:
             ("GET", r"/api/v1/documents/(?P<doc_id>[^/]+)/insights", self.insights),
             ("GET", r"/api/v1/search", self.search),
             ("POST", r"/api/v1/chat/sessions", self.create_session),
+            ("GET", r"/api/v1/chat/sessions", self.list_sessions),
+            ("GET", r"/api/v1/chat/sessions/(?P<sid>[^/]+)", self.get_session),
+            ("DELETE", r"/api/v1/chat/sessions/(?P<sid>[^/]+)", self.delete_session),
             ("POST", r"/api/v1/chat/sessions/(?P<sid>[^/]+)/messages", self.ask),
             ("POST", r"/api/v1/chat/sessions/(?P<sid>[^/]+)/messages/stream", self.stream),
             ("GET", r"/api/v1/chat/sessions/(?P<sid>[^/]+)/messages", self.messages),
@@ -104,8 +162,8 @@ class FakeVaultApi:
         self.polls[doc_id] = 0
         return httpx.Response(202, json={"document": self.docs[doc_id], "duplicate": False, "requeued": False})
 
-    def list_documents(self, _: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"items": list(reversed(self.docs.values())), "next_cursor": None})
+    def list_documents(self, request: httpx.Request) -> httpx.Response:
+        return newest_first_page(request, list(self.docs.values()))
 
     def get_document(self, _: httpx.Request, doc_id: str) -> httpx.Response:
         doc = self.docs.get(doc_id)
@@ -117,7 +175,17 @@ class FakeVaultApi:
         return httpx.Response(200, json=doc)
 
     def delete_document(self, _: httpx.Request, doc_id: str) -> httpx.Response:
-        return httpx.Response(204) if self.docs.pop(doc_id, None) else envelope(404, "DOCUMENT_NOT_FOUND")
+        """Like the real delete: scope rows cascade away, and cited snippets of the file are redacted (the citation
+        itself, with its filename, stays)."""
+        if not self.docs.pop(doc_id, None):
+            return envelope(404, "DOCUMENT_NOT_FOUND")
+        for session in self.sessions.values():
+            session["document_ids"] = [d for d in session["document_ids"] if d != doc_id]
+        for messages in self.history.values():
+            for m in messages:
+                m["citations"] = [{**{k: v for k, v in c.items() if k != "snippet"}, "source_deleted": True}
+                                  if c.get("document_id") == doc_id else c for c in m["citations"]]
+        return httpx.Response(204)
 
     def insights(self, _: httpx.Request, doc_id: str) -> httpx.Response:
         name = self.docs[doc_id]["filename"]
@@ -138,15 +206,34 @@ class FakeVaultApi:
     # --- chat -----------------------------------------------------------------------------------------------------
     def create_session(self, request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
-        sid = str(uuid.uuid4())
-        self.sessions[sid] = {"id": sid, "all_documents": body.get("all_documents", False),
-                              "document_ids": body.get("document_ids", []), "starter_questions": []}
-        self.questions[sid] = []
-        return httpx.Response(201, json=self.sessions[sid])
+        session = self.add_session(body.get("title"),
+                                   None if body.get("all_documents") else body.get("document_ids", []))
+        return httpx.Response(201, json=session)
+
+    def list_sessions(self, request: httpx.Request) -> httpx.Response:
+        return newest_first_page(request, list(self.sessions.values()))
+
+    def get_session(self, _: httpx.Request, sid: str) -> httpx.Response:
+        session = self.sessions.get(sid)
+        return httpx.Response(200, json=session) if session else envelope(404, "SESSION_NOT_FOUND")
+
+    def delete_session(self, _: httpx.Request, sid: str) -> httpx.Response:
+        if not self.sessions.pop(sid, None):
+            return envelope(404, "SESSION_NOT_FOUND")
+        self.history.pop(sid, None)
+        return httpx.Response(204)
 
     def _message(self, sid: str, role: str, seq: int, extra: dict[str, Any]) -> dict[str, Any]:
         return {"id": str(uuid.uuid4()), "seq": seq, "session_id": sid, "role": role, "status": "complete",
-                "citations": [], "signals": {}, **extra}
+                "content": "", "citations": [], "signals": {}, "retrieval": None, **extra}
+
+    def _append(self, sid: str, question: str, answer: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+        n = len(self.history[sid])
+        user_message = self._message(sid, "user", n + 1, {"content": question})
+        pair = (user_message, self._message(sid, "assistant", n + 2, {"reply_to_id": user_message["id"], **answer}))
+        self.history[sid] += pair
+        self.sessions[sid]["last_message_at"] = "2026-10-13T12:00:00Z"
+        return pair
 
     def ask(self, request: httpx.Request, sid: str) -> httpx.Response:
         question = json.loads(request.content)["content"]
@@ -156,22 +243,28 @@ class FakeVaultApi:
                   "ttft_ms": 100, "latency_ms": 900, "cost_usd": "0.010000",
                   **self.answer_fn(question, prior, self.sessions[sid]["document_ids"])}
         self.spend += float(answer.get("cost_usd") or 0)
-        n = len(self.questions[sid]) * 2
-        return httpx.Response(200, json={"user_message": self._message(sid, "user", n - 1, {"content": question}),
-                                         "answer": self._message(sid, "assistant", n, answer)})
+        user_message, answer_message = self._append(sid, question, answer)
+        return httpx.Response(200, json={"user_message": user_message, "answer": answer_message})
 
     def stream(self, request: httpx.Request, sid: str) -> httpx.Response:
-        self.questions[sid].append(json.loads(request.content)["content"])
+        question = json.loads(request.content)["content"]
+        self.questions[sid].append(question)
+        self._append(sid, question, {"content": "ok"})
         body = "".join(f"event: {e}\ndata: {json.dumps({'delta': 'x'} if e == 'token' else {})}\n\n"
                        for e in self.events)
         return httpx.Response(200, content=body.encode(), headers={"content-type": "text/event-stream"})
 
-    def messages(self, _: httpx.Request, sid: str) -> httpx.Response:
-        items = []
-        for i, q in enumerate(self.questions[sid]):
-            items += [self._message(sid, "user", 2 * i + 1, {"content": q}),
-                      self._message(sid, "assistant", 2 * i + 2, {"content": "ok"})]
-        return httpx.Response(200, json={"items": items, "next_cursor": None})
+    def messages(self, request: httpx.Request, sid: str) -> httpx.Response:
+        """Like the real API: the newest `limit` messages, oldest first within the page; next_cursor = older ones."""
+        if sid not in self.sessions:
+            return envelope(404, "SESSION_NOT_FOUND")
+        parsed = page_params(request)
+        if isinstance(parsed, httpx.Response):
+            return parsed
+        history = self.history[sid]
+        limit, end = parsed[0], len(history) if parsed[1] is None else parsed[1]
+        start = max(0, end - limit)
+        return httpx.Response(200, json={"items": history[start:end], "next_cursor": str(start) if start else None})
 
     # --- metrics --------------------------------------------------------------------------------------------------
     def ai_usage(self, _: httpx.Request) -> httpx.Response:
@@ -184,3 +277,16 @@ class FakeVaultApi:
 
 def transport(api: FakeVaultApi) -> httpx.MockTransport:
     return httpx.MockTransport(api)
+
+
+def users_transport(apis: dict[str, FakeVaultApi]) -> httpx.MockTransport:
+    """Several users behind one server: each API key has its own vault, and an unknown key gets 401 (like the real
+    API). Unauthenticated routes (/health, /openapi.json) go to the first user's fake."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        api = apis.get(request.headers.get("x-api-key") or "")
+        if api is None:
+            if request.url.path.startswith("/api/"):
+                return envelope(401, "UNAUTHENTICATED")
+            api = next(iter(apis.values()))
+        return api(request)
+    return httpx.MockTransport(handler)

@@ -43,8 +43,9 @@ open http://localhost:8000      # dashboard (API key: vault-demo-key) · API doc
 | `make test` | ~490 tests (pytest, FakeProvider, real Postgres/Valkey/S3 from the stack) |
 | `make smoke` / `make smoke-llm` | end-to-end smoke against the running API / verify every configured model + TTFT |
 | `make eval` / `make eval-demo` / `make eval-retrieval` | golden-set evaluation (answers, refusals, citations, latency, cost) / demo cases 3× / retrieval only |
-| `make doctor` | pre-demo checklist (health, workers, seeded docs, today's spend) |
-| `make snapshot-demo` / `make restore-demo` | freeze / restore the exact demo database + files |
+| `make doctor` | pre-demo checklist (health, workers, seeded docs, demo library holds only the corpus, today's spend) |
+| `make pre-demo` | dry-run plan of the pre-snapshot cleanup (non-corpus documents, pre-loaded live uploads, chats that use or mention them, test chats), ending with the exact command to apply it: `APPLY=1 EXPECT_DOCS=n EXPECT_SESSIONS=m EXPECT_PLAN=id` runs that plan through the API and verifies (refused if anything it deletes changed, even with equal counts); `BACKUPS=1` makes the three Backup sessions pass their golden cases; terms no chat may mention go in the gitignored `demo_docs/user/.deny_terms` |
+| `make snapshot-demo` / `make restore-demo` | freeze / restore the exact demo database + files (the snapshot refuses while `pre-demo --check` fails, unchecked users exist, or a document's S3 object is missing; objects no document points at are left out and named) |
 | `make reset` | delete this project's volumes |
 
 Local ports (chosen to avoid other services): API 8000, Postgres 5433, Valkey 6380, S3 9200. If one is taken,

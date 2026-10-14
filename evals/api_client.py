@@ -1,5 +1,5 @@
 """A small synchronous client for the Vault HTTP API, shared by the eval runner and the ops scripts
-(seed_demo, smoke, doctor, freeze_starters).
+(seed_demo, smoke, doctor, freeze_starters, pre_demo).
 
 Why HTTP and not app code: these tools must behave exactly like an external client (X-API-Key header, JSON with
 Content-Type, multipart uploads, SSE), so a passing smoke/eval run proves the API works, not just the services. Sync
@@ -123,6 +123,11 @@ class VaultClient:
     def get_document(self, document_id: str) -> dict[str, Any]:
         return self.get_json(f"{API_PREFIX}/documents/{document_id}")
 
+    def delete_document(self, document_id: str) -> bool:
+        """The normal delete (S3 object, pages, chunks, insights; cited snippets in chats are redacted).
+        Returns False when the document was already gone."""
+        return self.request("DELETE", f"{API_PREFIX}/documents/{document_id}", ok=(204, 404)).status_code == 204
+
     def upload(self, path: Path) -> tuple[int, dict[str, Any]]:
         """POST the file as multipart. Returns (status, body): 202 = new, 200 = duplicate of an existing document."""
         return self.upload_bytes(path.name, path.read_bytes())
@@ -193,9 +198,31 @@ class VaultClient:
                 raise ApiError.from_response(r)
             yield from parse_sse(r.iter_lines())
 
-    def messages(self, session_id: str) -> list[dict[str, Any]]:
-        body = self.get_json(f"{API_PREFIX}/chat/sessions/{session_id}/messages")
-        return body["items"] if isinstance(body, dict) else body
+    def list_sessions(self, page_size: int = 100) -> list[dict[str, Any]]:
+        sessions, cursor = [], None
+        while True:
+            params = {"limit": page_size, **({"cursor": cursor} if cursor else {})}
+            page = self.get_json(f"{API_PREFIX}/chat/sessions", params)
+            sessions += page["items"]
+            cursor = page.get("next_cursor")
+            if not cursor:
+                return sessions
+
+    def delete_session(self, session_id: str) -> bool:
+        """Deletes the session and its messages. Returns False when it was already gone."""
+        return self.request("DELETE", f"{API_PREFIX}/chat/sessions/{session_id}", ok=(204, 404)).status_code == 204
+
+    def messages(self, session_id: str, page_size: int = 100) -> list[dict[str, Any]]:
+        """The whole history, oldest first. The API pages backwards (newest page first, next_cursor = older)."""
+        pages: list[list[dict[str, Any]]] = []
+        cursor = None
+        while True:
+            params = {"limit": page_size, **({"cursor": cursor} if cursor else {})}
+            body = self.get_json(f"{API_PREFIX}/chat/sessions/{session_id}/messages", params)
+            pages.append(body["items"])
+            cursor = body.get("next_cursor")
+            if not cursor:
+                return [m for page in reversed(pages) for m in page]
 
     # --- search --------------------------------------------------------------------------------------------------
     def search(self, q: str, *, document_ids: list[str] | None, mode: str, k: int) -> dict[str, Any]:

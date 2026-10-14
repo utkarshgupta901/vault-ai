@@ -27,6 +27,11 @@ ALL_FILES = SEED_FILES + LIVE_UPLOADS + (STRESS_MANUAL,)
 
 SUPPORTED_SUFFIXES = {".pdf", ".docx", ".txt", ".md"}
 
+# The real public document approved for the demo (NIST AI 100-1, the AI Risk Management Framework), pinned by name AND
+# bytes. It is dropped into demo_docs/user/ by hand (gitignored), but the cleanup must recognise it even where that
+# folder is missing or empty (a fresh clone, a worktree): an empty user/ must never turn it into "unknown, delete".
+PUBLIC_DOCS = {"NIST.AI.100-1.pdf": "7576edb531d9848825814ee88e28b1795d3a84b435b4b797d3670eafdc4a89f1"}
+
 
 def user_files(docs_dir: Path = DEMO_DOCS) -> list[Path]:
     """Real documents the user dropped into <docs_dir>/user/ (sorted, so seeding order is stable)."""
