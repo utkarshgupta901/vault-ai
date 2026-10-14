@@ -1,7 +1,8 @@
 """Test harness.
 
 - Runs against the REAL compose services (Postgres :5433 in a separate `vault_test` database, Valkey db 14/15,
-  a `vault-test` S3 bucket) so SQL, pgvector and constraints are exercised for real.
+  a `vault-test` S3 bucket) so SQL, pgvector and constraints are exercised for real. The ports follow the
+  PG_PORT / VALKEY_PORT / S3_PORT that compose.yaml publishes on.
 - The LLM is always FakeProvider (deterministic, offline, free). No test talks to OpenAI.
 - Celery runs eagerly (tasks execute inline when published).
 - Tests that need services are auto-marked `integration`; `make test-fast` runs only pure unit tests.
@@ -13,14 +14,22 @@ import os
 TEST_DB = os.environ.get("TEST_DB_NAME", "vault_test")
 TEST_CACHE_DB = os.environ.get("TEST_CACHE_DB", "14")
 
+# The same host ports compose.yaml publishes on (empty or unset = its defaults, as with ${PG_PORT:-5433}), so
+# `export PG_PORT=...; make up; make test` tests the stack it started. A separate TEST_* name could be forgotten or
+# misspelled and silently fall back to the default ports, i.e. FLUSHDB whatever Redis holds 6380. Deliberately NOT
+# read from DATABASE_URL & co. in .env: those may point at a real deployment, and these tests TRUNCATE every table.
+TEST_PG = f"localhost:{os.environ.get('PG_PORT') or '5433'}"
+TEST_REDIS = f"localhost:{os.environ.get('VALKEY_PORT') or '6380'}"
+TEST_S3 = f"localhost:{os.environ.get('S3_PORT') or '9200'}"
+
 os.environ.update({
     "APP_ENV": "test",
     "LLM_PROVIDER": "fake",
     "OPENAI_API_KEY": "",
-    "DATABASE_URL": f"postgresql+psycopg://vault:vault@localhost:5433/{TEST_DB}",
-    "BROKER_URL": "redis://localhost:6380/15",
-    "CACHE_URL": f"redis://localhost:6380/{TEST_CACHE_DB}",
-    "S3_ENDPOINT_URL": "http://localhost:9200",
+    "DATABASE_URL": f"postgresql+psycopg://vault:vault@{TEST_PG}/{TEST_DB}",
+    "BROKER_URL": f"redis://{TEST_REDIS}/15",
+    "CACHE_URL": f"redis://{TEST_REDIS}/{TEST_CACHE_DB}",
+    "S3_ENDPOINT_URL": f"http://{TEST_S3}",
     "S3_BUCKET": "vault-test",
     "LOG_LEVEL": "WARNING",
 })
@@ -58,7 +67,7 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
 @pytest.fixture(scope="session")
 def _services() -> Iterator[None]:
     """Create + migrate the test database, ensure the bucket, seed users. Runs once per session."""
-    admin = "postgresql://vault:vault@localhost:5433/vault"
+    admin = f"postgresql://vault:vault@{TEST_PG}/vault"
     with psycopg.connect(admin, autocommit=True) as conn:
         if not conn.execute("SELECT 1 FROM pg_database WHERE datname = %s", (TEST_DB,)).fetchone():
             conn.execute(f'CREATE DATABASE "{TEST_DB}"')

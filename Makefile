@@ -1,6 +1,20 @@
 SHELL := /bin/bash
 COMPOSE := docker compose
-API := http://localhost:8000
+# Host port compose.yaml publishes the API on ("${API_PORT:-8000}:8000"). make reads it from the shell or the command
+# line, not from .env, so export it (compose reads the shell too). Empty counts as unset, as with compose's ":-".
+API_PORT := $(or $(API_PORT),8000)
+# URL of the client targets (seed, smoke, doctor, eval*, freeze-starters, web-dev). `make ... API=` points them at
+# another stack or a deploy; a plain `=` means a stray API variable in the shell cannot. API= never moves the port a
+# stack publishes on, so up/demo/demo-luna refuse it rather than start on API_PORT and then wait 2 min on API.
+API = http://localhost:$(API_PORT)
+ifneq ($(filter up demo demo-luna,$(MAKECMDGOALS)),)
+ifeq ($(origin API),command line)
+$(error API= does not move the port the stack publishes on: use API_PORT=<port> with up/demo/demo-luna)
+endif
+endif
+# Files for the presentation stack: compose.yaml alone, so the dev override (bind mounts + reload) can never apply.
+# Add your own on top with e.g. DEMO_FILES="-f compose.yaml -f compose.local.yaml".
+DEMO_FILES ?= -f compose.yaml
 KEY ?= vault-demo-key
 QUOTA_USER ?= demo
 QUOTA_USD ?= 100
@@ -16,21 +30,31 @@ up: ## Dev stack (bind mounts + auto-reload: a file save restarts the API/worker
 	@$(MAKE) --no-print-directory wait
 
 demo: ## PRESENTATION MODE: built image only, no reload, no bind mounts (also switches back from demo-luna)
-	$(COMPOSE) -f compose.yaml up -d --build
+	$(COMPOSE) $(DEMO_FILES) up -d --build
 	@$(MAKE) --no-print-directory wait
 
 # Only the api container is recreated (--no-deps): workers, data and queues are untouched. Run it after `make demo`
 # (it reuses the image that built); `make demo` again returns the API to the default answer model.
 demo-luna: ## Demo stack with answers on gpt-6-luna (effort low): faster first token if Sol is slow today
-	ANSWER_MODEL=gpt-6-luna ANSWER_EFFORT=low $(COMPOSE) -f compose.yaml up -d --no-deps --force-recreate api
+	ANSWER_MODEL=gpt-6-luna ANSWER_EFFORT=low $(COMPOSE) $(DEMO_FILES) up -d --no-deps --force-recreate api
 	@$(MAKE) --no-print-directory wait
 
 raise-quota: ## Raise a user's daily AI spend limit (default: demo -> 100 USD; QUOTA_USER=, QUOTA_USD=)
 	$(COMPOSE) exec -T postgres psql -U vault -d vault -v ON_ERROR_STOP=1 \
 		-c "UPDATE users SET daily_cost_limit_usd = $(QUOTA_USD) WHERE name = '$(QUOTA_USER)' RETURNING name, daily_cost_limit_usd"
 
+# Live first (the process is up), then ready until both worker pools answer: right after a start /health/ready says
+# 200 "degraded" for ~10 s while the workers register, and an upload made then just sits in the queue.
+# grep matches the API's compact JSON ({"workers":{"ok":true,...}); no jq or Python needed on the host.
+# --max-time on every curl: a process that accepts the connection and never answers would otherwise block the loop
+# forever (/health/ready itself caps its checks at ~2 s).
 wait:
-	@echo -n "waiting for API"; for i in $$(seq 1 60); do curl -sf $(API)/health/live >/dev/null && echo " ok" && exit 0; echo -n "."; sleep 2; done; echo " timeout"; exit 1
+	@echo -n "waiting for API"; for i in $$(seq 1 60); do curl -sf --max-time 5 $(API)/health/live >/dev/null && break; \
+		echo -n "."; sleep 2; done; curl -sf --max-time 5 $(API)/health/live >/dev/null || { echo " timeout"; exit 1; }; \
+		echo " ok"
+	@echo -n "waiting for workers"; for i in $$(seq 1 30); do curl -s --max-time 5 $(API)/health/ready \
+		| grep -q '"workers":{"ok":true' && echo " ok" && exit 0; echo -n "."; sleep 2; done; \
+		echo " timeout: see make logs S=worker-ingest / S=worker-ai"; exit 1
 
 down: ## Stop the stack (keeps data)
 	$(COMPOSE) down
@@ -49,7 +73,7 @@ migrate: ## Alembic upgrade head (inside the stack)
 
 seed: ## Generate the demo corpus and upload it as the demo user
 	uv run python scripts/make_demo_docs.py
-	uv run python scripts/seed_demo.py --key $(KEY)
+	uv run python scripts/seed_demo.py --api $(API) --key $(KEY)
 
 test: ## Full test suite (Fake LLM provider, real Postgres/Valkey/S3 from the stack)
 	uv run pytest -q
@@ -87,14 +111,14 @@ snapshot-demo: ## Save the demo DB + S3 objects to demo_snapshot/
 restore-demo: ## Restore the demo DB + S3 objects from demo_snapshot/ (overwrites current data)
 	bash scripts/restore_demo.sh
 
-doctor: ## Pre-demo checks: ports, health, workers, spend
+doctor: ## Pre-demo checks: health, workers, API key, seeded docs + insights, spend, retrieval
 	uv run python scripts/doctor.py --api $(API) --key $(KEY)
 
 workers: ## Which workers consume which queues
 	$(COMPOSE) exec worker-ingest celery -A app.worker.celery_app inspect active_queues
 
-web-dev: ## React dev server on :5173 (proxies /api to :8000)
-	cd frontend && pnpm dev
+web-dev: ## React dev server on :5173 (proxies /api to API=, default localhost:8000)
+	cd frontend && VAULT_API=$(API) pnpm dev
 
 web-build:
 	cd frontend && pnpm build

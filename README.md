@@ -47,7 +47,10 @@ open http://localhost:8000      # dashboard (API key: vault-demo-key) · API doc
 | `make snapshot-demo` / `make restore-demo` | freeze / restore the exact demo database + files |
 | `make reset` | delete this project's volumes |
 
-Local ports (chosen to avoid other services): API 8000, Postgres 5433, Valkey 6380, S3 9200.
+Local ports (chosen to avoid other services): API 8000, Postgres 5433, Valkey 6380, S3 9200. If one is taken,
+export `API_PORT` / `PG_PORT` / `VALKEY_PORT` / `S3_PORT` before `make` (compose, make and the tests all follow
+them; see `.env.example`). That moves the `vault-ai` stack itself; a second, separate stack also needs
+`COMPOSE_PROJECT_NAME=<other>`.
 
 ---
 

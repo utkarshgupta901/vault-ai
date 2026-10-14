@@ -5,7 +5,9 @@ import { defineConfig } from 'vite'
 // In production FastAPI serves the built SPA, so the API is same-origin and the client uses relative URLs ('').
 // In dev, Vite proxies the same paths to the API container, which keeps that "single origin" property: no CORS and
 // no build-time API URL. SSE responses stream through the proxy unchanged.
-const API = 'http://localhost:8000'
+// VAULT_API points the proxy at an API on another port (`make web-dev` passes its API=); it is read here, in Node, and
+// never reaches the browser bundle.
+const API = process.env.VAULT_API || 'http://localhost:8000'
 
 export default defineConfig({
   plugins: [react(), tailwindcss()],

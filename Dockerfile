@@ -15,9 +15,11 @@ RUN pnpm build
 FROM python:3.13-slim AS app
 COPY --from=ghcr.io/astral-sh/uv:0.8.22 /uv /uvx /bin/
 # The venv lives outside /srv so a dev bind-mount of ./app can never shadow it.
+# UV_HTTP_TIMEOUT: with uv's default (30 s) a cold build failed twice on a slow link while downloading packages.
 ENV UV_PROJECT_ENVIRONMENT=/opt/venv \
     UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
+    UV_HTTP_TIMEOUT=120 \
     PYTHONUNBUFFERED=1 \
     PATH="/opt/venv/bin:$PATH"
 WORKDIR /srv

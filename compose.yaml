@@ -3,6 +3,14 @@
 #
 #   docker compose up -d --build        # dev: compose.override.yaml is merged automatically (bind mounts + reload)
 #   docker compose -f compose.yaml up -d # demo: the built image only, no reload, no bind mounts
+#
+# Host ports: API_PORT, PG_PORT, VALKEY_PORT, S3_PORT move a published port when the default is taken on this machine
+# (unset, they resolve to exactly the ports below). Only the host side changes: containers still reach each other on
+# the service ports. Host-side tools (make, pytest, scripts) must follow; .env.example says how.
+# They move THIS stack: the project name is pinned below, so `make up` with other ports, from any checkout, recreates
+# the running vault-ai containers on them (the taken port is often vault-ai's own). A second, separate stack also needs
+# COMPOSE_PROJECT_NAME=<other> (its own containers and volumes). It still shares the vault-ai:latest image tag: a build
+# there retags the image that a later `make demo-luna` (no --build) here would start.
 name: vault-ai
 
 x-app: &app
@@ -33,7 +41,7 @@ services:
     image: pgvector/pgvector:pg17          # Postgres 17 + pgvector, same major version as Render
     environment: { POSTGRES_USER: vault, POSTGRES_PASSWORD: vault, POSTGRES_DB: vault }
     command: ["postgres", "-c", "shared_buffers=256MB", "-c", "max_connections=100"]
-    ports: ["5433:5432"]
+    ports: ["${PG_PORT:-5433}:5432"]
     volumes: [pgdata:/var/lib/postgresql/data]
     healthcheck: { test: ["CMD-SHELL", "pg_isready -U vault -d vault"], interval: 3s, timeout: 3s, retries: 30 }
     restart: unless-stopped
@@ -43,7 +51,7 @@ services:
     # db0 = Celery broker, db1 = cache + rate-limit counters.
     # AOF keeps queued tasks across restarts; noeviction (with maxmemory) means broker keys are never evicted.
     command: ["valkey-server", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "noeviction"]
-    ports: ["6380:6379"]
+    ports: ["${VALKEY_PORT:-6380}:6379"]
     volumes: [valkeydata:/data]
     healthcheck: { test: ["CMD", "valkey-cli", "ping"], interval: 3s, timeout: 3s, retries: 30 }
     restart: unless-stopped
@@ -51,7 +59,7 @@ services:
   s3:
     image: rustfs/rustfs:1.0.1             # S3-compatible object store (Cloudflare R2 / AWS S3 in the cloud)
     environment: { RUSTFS_ACCESS_KEY: vaultlocal, RUSTFS_SECRET_KEY: vaultlocalsecret }
-    ports: ["9200:9000"]
+    ports: ["${S3_PORT:-9200}:9000"]
     volumes: [s3data:/data]
     healthcheck: { test: ["CMD-SHELL", "nc -z localhost 9000 || exit 1"], interval: 3s, timeout: 3s, retries: 30 }
     restart: unless-stopped
@@ -71,7 +79,7 @@ services:
       ANSWER_MODEL: ${ANSWER_MODEL:-gpt-6.1-sol}
       ANSWER_EFFORT: ${ANSWER_EFFORT:-low}
     command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips=*"]
-    ports: ["8000:8000"]
+    ports: ["${API_PORT:-8000}:8000"]
     depends_on:
       <<: *depends
       migrate: { condition: service_completed_successfully }

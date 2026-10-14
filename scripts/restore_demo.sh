@@ -7,8 +7,9 @@
 #    restored or nothing changes (a half-restored demo database is worse than the old one).
 # 2. Re-uploads every snapshot object to the bucket (the files that the restored rows point at).
 # Asks for confirmation unless --yes (or YES=1) is given. Run `make doctor` afterwards.
-# The compose project name comes from the checkout's folder name (compose.yaml has no `name:`), so run this from
-# the main checkout, or set COMPOSE_PROJECT_NAME=vault-ai when running it from a git worktree.
+# compose.yaml pins the project name (`name: vault-ai`), so step 1 restores into the vault-ai stack from any checkout
+# or git worktree (COMPOSE_PROJECT_NAME selects another stack). Step 2 uploads to S3_ENDPOINT_URL (.env, default
+# localhost:9200), so for a stack published on other ports point both at it.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

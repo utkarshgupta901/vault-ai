@@ -5,7 +5,7 @@ their AI insights, chat with them with page-level citations, and watch cost and 
 
 ```bash
 pnpm install
-pnpm dev        # http://localhost:5173; /api, /health, /docs are proxied to the API on :8000
+pnpm dev        # http://localhost:5173; /api, /health, /docs are proxied to the API on :8000 (VAULT_API= overrides)
 pnpm build      # type-check (tsc -b) + production bundle in dist/
 pnpm lint       # oxlint
 pnpm test       # node --test: SSE parser, citation streaming, answer helpers, markdown safety, readiness timeout
