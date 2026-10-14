@@ -78,6 +78,12 @@ def test_refusal_path_distinguishes_gate_from_model() -> None:
     assert scoring.refusal_path(_answer("x")) is None
 
 
+def test_only_gate_refusals_are_not_model_generated() -> None:
+    assert not scoring.model_generated(_answer("x", answer_type="not_found", gate=True))
+    assert scoring.model_generated(_answer("x", answer_type="not_found", gate=False))     # the model refused
+    assert scoring.model_generated(_answer("x"))
+
+
 def test_score_answer_passes_a_correct_cited_answer() -> None:
     expect = {"any_of": ["18 days"], "must_cite": "H.pdf", "gold_chunk": ["unused"]}
     result = scoring.score_answer(expect, _answer("You get 18 days [S1]."))

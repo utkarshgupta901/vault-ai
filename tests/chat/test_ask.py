@@ -3,8 +3,10 @@ idempotency, SESSION_BUSY, fallback model, time budgets and client disconnects."
 
 import asyncio
 import base64
+import re
 import uuid
 from collections.abc import AsyncIterator
+from datetime import date
 from typing import Any
 
 import pytest
@@ -15,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.ai import set_provider
 from app.ai.fake_provider import FakeProvider
 from app.ai.provider import ProviderError, StreamEnd, Usage
-from app.config import settings
+from app.config import Settings, settings
 from app.core.pagination import encode_cursor
 from app.schemas.chat import MessageCreate, TokenEvent
 from app.services import chat as svc
@@ -127,6 +129,47 @@ async def test_identifier_hit_bypasses_the_gate(
     signals = events[_names(events).index("citations")][1]["signals"]
     assert signals["id_hit"] is True and signals["gate"] is False
     assert [c for c in fake.calls if c["op"] == "stream"]
+
+
+async def test_dates_shown_in_the_prompt_are_grounded(
+    client: AsyncClient, db: AsyncSession, fake: FakeProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: an answer quoting its source's document date and "today" (as answer.v2 rule 5 asks) had those
+    dates flagged as ungrounded. The checker must ground exactly what the prompt showed, so the clock here moves to
+    the next day after the prompt is built (a turn straddling midnight): checking against a fresh date.today() would
+    flag the answer again."""
+    monkeypatch.setattr(settings, "GATE_MIN_SIMILARITY", 0.1)
+    days = iter([date(2026, 10, 13), date(2026, 10, 14), date(2026, 10, 15)])
+    monkeypatch.setattr(Settings, "today", lambda self: next(days))
+    doc_id = await upload_ready(client, "handbook.txt", HANDBOOK)
+    await db.execute(text("UPDATE documents SET document_date = '2026-01-15' WHERE id = :id"), {"id": doc_id})
+    await db.commit()
+
+    def answer(prompt: str) -> str:
+        shown_today = re.search(r"Today's date: (\S+)", prompt).group(1)          # type: ignore[union-attr]
+        doc_date = re.search(r'<source id="S1"[^>]* date="([^"]+)"', prompt).group(1)  # type: ignore[union-attr]
+        return (f"The handbook dated {doc_date} gives Larkspur employees 18 PTO days per year, "
+                f"as of today, {shown_today} [S1].")
+
+    fake.answer_override = answer
+    body = (await ask_json(client, (await new_session(client))["id"], QUESTION)).json()["answer"]
+    assert body["content"].startswith("The handbook dated 2026-01-15 ") and "today, 2026-10-13 [S1]" in body["content"]
+    assert body["signals"]["ungrounded_facts"] == 0 and body["signals"]["uncited_claims"] == 0
+    assert body["citations"][0]["weak_support"] is False
+
+
+async def test_an_odd_month_spelling_does_not_fail_the_turn(
+    client: AsyncClient, session_id: str, fake: FakeProvider
+) -> None:
+    """Regression: "Auguſt" (long s, U+017F) matched the checker's case-insensitive month pattern but not its month
+    table; the KeyError failed the turn after the whole answer had streamed (status 'failed', INTERNAL). Such text can
+    come from a document (the corpus has injection probes) or from a user asking the model to echo it."""
+    fake.answer_override = lambda _: "Larkspur employees receive 18 PTO days per year, as of Auguſt 2026 [S1]."
+    r = await ask_json(client, session_id, QUESTION)
+    assert r.status_code == 200, r.text
+    answer = r.json()["answer"]
+    assert answer["status"] == "complete" and answer["answer_type"] == "answered"
+    assert answer["signals"]["ungrounded_facts"] == 1                 # 2026 is checked as a number; the handbook has none
 
 
 async def test_model_refusal_is_not_found(client: AsyncClient, session_id: str, fake: FakeProvider) -> None:

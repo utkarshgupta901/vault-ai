@@ -4,10 +4,10 @@ Each entry: the decision, the alternatives, and what we measured. Numbers come f
 2026-10-13 (43-case golden set: 28 answerable incl. multi-doc / multi-turn / tables / injection probes, 15 unanswerable).
 
 ## D-01 Answer model: gpt-6.1-sol (effort low), with gpt-6-luna as automatic fallback
-| answer model | passed | grounded | high-confidence | TTFT p50 / p95 | cost / answer |
+| answer model | passed | grounded | high-confidence | TTFT p50 / p95 (34 model answers) | cost / answer |
 |---|---|---|---|---|---|
-| gpt-6.1-sol (low) | 43/43 | **43/43** | **21** | 2.5 s / 6.6 s | $0.0014 |
-| gpt-6-luna (low)  | 43/43 | 42/43 | 16 | **1.2 s / 3.1 s** | **$0.0002** |
+| gpt-6.1-sol (low) | 43/43 | **43/43** | **21** | 2.7 s / 6.9 s | $0.0014 |
+| gpt-6-luna (low)  | 43/43 | 42/43 | 16 | **1.3 s / 4.8 s** | **$0.0002** |
 
 Both pass every case, so this is a quality-vs-latency call. Grounded, well-cited answers are the product, so Sol
 answers; if Sol's first token takes > `ANSWER_TTFT_TIMEOUT_S` (10 s) or it errors before the first token, the same
@@ -28,6 +28,10 @@ before its calculation ("20 days: 18 + 2 = 20"), totals reused in a later calcul
 refusal naming the thing it did not find ("no 401(k) match"). Now: a value shown as a calculation result anywhere in
 the answer is derived (its inputs are checked instead), and refusals are not fact-checked. Inputs that are neither in
 the sources nor derived are still caught (unit-tested).
+Later (demo eval, m-stipend-conflict "low" in 3/3 runs): correct answers quoted the dates the prompt shows ("the handbook
+dated 2026-01-15", "as of today, 2026-10-13"), which no chunk contains. Such a date now counts as grounded, but only
+right after its cue ("dated" for a cited source's document date, "today" / "as of" for today's): the same date stated
+as when something happened ("took effect on 2026-10-02") is still checked, since that mix-up is what the case probes.
 
 ## D-04 Readiness checks must be bounded and single-flight (incident found by adversarial review)
 `/health/ready` used to run a Celery `inspect` broadcast on every request. Celery's broadcast holds a connection from

@@ -481,7 +481,7 @@ async def _pipeline(run: _Run, provider: LLMProvider) -> AsyncIterator[ChatEvent
             return
 
     run.latency_ms = _ms(turn.started)
-    check = check_answer(run.content, run.numbered)
+    check = check_answer(run.content, run.numbered, today=run.prompt.today if run.prompt else None)
     citations_event = _citations_event(run, check)
     yield citations_event
     await _save(run, "complete", citations_event=citations_event)

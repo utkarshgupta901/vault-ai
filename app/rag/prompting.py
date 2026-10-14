@@ -6,6 +6,7 @@ event, for checking the model's citations and for the citation snapshot, so [S3]
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import date
 from typing import Literal
 
 from app.ai.prompts import answer as answer_prompt
@@ -19,6 +20,7 @@ class AnswerPrompt:
     prompt_version: str         # "answer.v2"
     instructions: str
     input: list[Msg]
+    today: date | None = None   # what the "Today's date" line said (None: no such line); the answer check grounds it
 
     def text(self) -> str:
         """Everything sent to the model, for local token estimation when the stream is abandoned."""
@@ -46,8 +48,12 @@ def build_answer_prompt(
     numbered: dict[str, RetrievedChunk],
     version: Literal["v1", "v2"] | None = None,
 ) -> AnswerPrompt:
+    version = version or settings.ANSWER_PROMPT_VERSION
+    # Read the clock ONCE. The answer check must ground the date the model was shown, and asking again after a
+    # 10-second stream could land on the next day (date.today() is the process's local date: UTC in the container).
+    today = settings.today()
     prompt_version, instructions, messages = answer_prompt.render(
-        version=version or settings.ANSWER_PROMPT_VERSION, history=history, question=question,
-        standalone=standalone, sources=to_prompt_sources(numbered), today=settings.today(),
+        version=version, history=history, question=question, standalone=standalone,
+        sources=to_prompt_sources(numbered), today=today,
     )
-    return AnswerPrompt(prompt_version, instructions, messages)
+    return AnswerPrompt(prompt_version, instructions, messages, today=answer_prompt.shown_today(version, today))

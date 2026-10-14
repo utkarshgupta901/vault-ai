@@ -44,6 +44,7 @@ FALLBACK_K = 8
 SEARCH_ROUTE = f"{API_PREFIX}/search"
 CHAT_ROUTE = f"{API_PREFIX}/chat/sessions"
 USAGE_ROUTE = f"{API_PREFIX}/metrics/ai-usage"
+REPORTS_DIR = Path("evals") / "reports"         # relative to ROOT
 
 
 class SetupError(Exception):
@@ -124,12 +125,26 @@ def today_spend(client: VaultClient) -> float | None:
         return None
 
 
-def git_sha() -> str | None:
+def _git(*args: str) -> str | None:
     try:
-        return subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=ROOT, capture_output=True, text=True,
-                              check=True).stdout.strip()
+        return subprocess.run(["git", *args], cwd=ROOT, capture_output=True, text=True, check=True).stdout.strip()
     except (OSError, subprocess.CalledProcessError):
         return None
+
+
+def git_sha() -> str | None:
+    return _git("rev-parse", "--short", "HEAD")
+
+
+def git_dirty() -> bool | None:
+    """True when the checkout has uncommitted or untracked changes: then the sha alone doesn't say what code produced
+    the numbers. None when git isn't available. The reports the eval itself writes don't count: they are committed
+    next to the code, so the previous run's files would otherwise mark every following run dirty.
+
+    Both describe the eval CLIENT's checkout. The API answers with whatever its container was built from: after
+    merging, rebuild it (`make demo`) before quoting a report as that commit's numbers."""
+    status = _git("status", "--porcelain", "--", ".", f":(exclude){REPORTS_DIR.as_posix()}")
+    return None if status is None else bool(status)
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -254,7 +269,9 @@ def summarize_answers(cases: list[Case], results: dict[str, list[dict[str, Any]]
                  "path": scoring.refusal_path(r["answer"]),
                  "expected_path": EXPECTED_REFUSAL_PATH.get(by_id[cid].category)} for cid, r in answered.items()]
     all_runs = [run for runs in results.values() for run in runs if run["answer"] is not None]
+    model_runs = [run for run in all_runs if scoring.model_generated(run["answer"])]
     costs = [run["answer"]["cost_usd"] for run in all_runs if run["answer"]["cost_usd"] is not None]
+    ttft_all = scoring.latency_summary([run["answer"]["ttft_ms"] for run in all_runs])
     return {
         "cases": len(first),
         "passed": _rate([r["passed"] for r in first.values()]),
@@ -267,7 +284,10 @@ def summarize_answers(cases: list[Case], results: dict[str, list[dict[str, Any]]
         "demo": [{"id": c.id, **scoring.stability([run["passed"] for run in results[c.id]])}
                  for c in cases if c.is_demo and results.get(c.id)],
         "latency_ms": {
-            "ttft": scoring.latency_summary([run["answer"]["ttft_ms"] for run in all_runs]),
+            # Gate refusals reply in ~10 ms without a model call, so TTFT over all answers flatters the model.
+            "ttft_model": scoring.latency_summary([run["answer"]["ttft_ms"] for run in model_runs]),
+            "ttft_all": ttft_all,
+            "ttft": ttft_all,           # = ttft_all, under the name reports before 2026-10-14 used
             "server_total": scoring.latency_summary([run["answer"]["latency_ms"] for run in all_runs]),
             "client_total": scoring.latency_summary([run.get("client_ms") for run in all_runs]),
         },
@@ -327,7 +347,8 @@ def evaluate(client: VaultClient, golden: Golden, opts: Options) -> dict[str, An
         "meta": {
             "started_at": started.isoformat(timespec="seconds"),
             "finished_at": datetime.now(UTC).isoformat(timespec="seconds"),
-            "api": client.api, "git_sha": git_sha(), "tags": opts.tags, "case_ids": opts.case_ids,
+            "api": client.api, "git_sha": git_sha(), "git_dirty": git_dirty(), "tags": opts.tags,
+            "case_ids": opts.case_ids,
             "repeat": opts.repeat, "modes": opts.modes, "retrieval_only": opts.retrieval_only,
             "cases": len(cases), "skipped_cases": skipped, "health": health, "corpus": doc_ids,
             "spend_usd": {"before": spend_before, "after": spend_after,
@@ -355,7 +376,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument("--retrieval-only", action="store_true", help="only /search metrics (no answer-model spend)")
     p.add_argument("--modes", default=",".join(DEFAULT_MODES), help="retrieval modes for /search metrics")
     p.add_argument("--k", type=int, default=40, help="hits requested per search (hit@k up to this)")
-    p.add_argument("--out", type=Path, default=ROOT / "evals" / "reports")
+    p.add_argument("--out", type=Path, default=ROOT / REPORTS_DIR)
     p.add_argument("--golden", type=Path, default=golden_mod.GOLDEN_PATH)
     p.add_argument("--no-starters", action="store_true", help="ignore evals/golden_starters.yaml")
     p.add_argument("--docs-dir", type=Path, default=DEMO_DOCS)

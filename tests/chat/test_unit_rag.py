@@ -335,8 +335,15 @@ def test_refusals_are_not_grounding_checked() -> None:
 def test_support_is_measured_against_the_whole_cited_chunk() -> None:
     """Regression (found on a long real-world document): several bullets citing one chunk pooled more words than any
     single sentence of it holds, so well-supported citations were flagged weak and the badge showed 'low'."""
-    from app.rag.citations import (WEAK_OVERLAP, Source, best_sentence, check_answer, content_tokens,
-                                   split_sentences, strip_citations)
+    from app.rag.citations import (
+        WEAK_OVERLAP,
+        Source,
+        best_sentence,
+        check_answer,
+        content_tokens,
+        split_sentences,
+        strip_citations,
+    )
     chunk = ("New hires receive a laptop, monitor and desk chair shipped before their first day. "
              "Internet costs are reimbursed monthly under the REMOTE_STIPEND policy. "
              "Ergonomic assessments are booked through the People team. "

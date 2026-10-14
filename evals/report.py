@@ -50,8 +50,9 @@ def render_meta(report: dict[str, Any]) -> list[str]:
     meta = report["meta"]
     models = (meta.get("health") or {}).get("models") or {}
     spend = meta.get("spend_usd") or {}
+    dirty = " (dirty: uncommitted changes)" if meta.get("git_dirty") else ""
     lines = [f"# Vault eval report ({meta['started_at']})", "",
-             f"- API: `{meta['api']}` | git `{meta.get('git_sha') or 'unknown'}` | cases: {meta['cases']}"
+             f"- API: `{meta['api']}` | git `{meta.get('git_sha') or 'unknown'}`{dirty} | cases: {meta['cases']}"
              f" | tags: {', '.join(meta['tags']) or 'all'} | demo repeat: {meta['repeat']}",
              f"- Server models (health): {', '.join(f'{k}={v}' for k, v in models.items()) or 'n/a'}"]
     server = (report.get("answers") or {}).get("server")
@@ -135,10 +136,14 @@ def render_reliability(rows: list[dict[str, Any]]) -> list[str]:
 
 
 def render_latency_cost(answers: dict[str, Any]) -> list[str]:
+    """TTFT is shown twice: over the answers the model generated (the number to quote) and over all answers, where
+    gate refusals (~10 ms, no model call) pull the percentiles down. Older reports only have `ttft` (= all)."""
     lat, cost = answers["latency_ms"], answers["cost_usd"]
+    ttft = [("TTFT (server, all answers incl. gate refusals)", lat.get("ttft_all", lat["ttft"]))]
+    if "ttft_model" in lat:
+        ttft.insert(0, ("TTFT (server, model-generated answers only)", lat["ttft_model"]))
     rows = [[name, str(s["n"]), ms(s["p50"]), ms(s["p95"])] for name, s in
-            (("TTFT (server)", lat["ttft"]), ("total (server)", lat["server_total"]),
-             ("total (client)", lat["client_total"]))]
+            (*ttft, ("total (server)", lat["server_total"]), ("total (client)", lat["client_total"]))]
     per = "n/a" if cost["per_answer"] is None else f"${cost['per_answer']:.4f}"
     return ["### Latency and cost", "", *_table(["ms", "n", "p50", "p95"], rows), "",
             f"Answer-call cost: ${cost['total']:.4f} over {cost['answers']} answers ({per} per answer).", ""]

@@ -91,6 +91,11 @@ def _signal(answer: dict[str, Any], name: str, default: Any = 0) -> Any:
     return (answer.get("signals") or {}).get(name, default)
 
 
+def model_generated(answer: dict[str, Any]) -> bool:
+    """False for a gate refusal: the server replied without calling the answer model (signals.gate)."""
+    return not _signal(answer, "gate", False)
+
+
 def refusal_path(answer: dict[str, Any]) -> str | None:
     """Which layer refused: 'gate' (no LLM call: low similarity, no identifier hit) or 'model' (the LLM said
     'I couldn't find this...'). None when the answer is not a refusal."""

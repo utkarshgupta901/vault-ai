@@ -8,13 +8,23 @@ true?") is left to the offline LLM judge.
 
 Facts are the things a model gets subtly wrong: amounts, percentages, codes (LRK-4471), clause numbers (9.2) and
 numbers >= 10. Units are normalized before comparing, so "$60k", "$60,000" and "60000" are the same fact.
+
+Dates the model was SHOWN outside the chunk text are grounded too: each source's document date (the `date` attribute
+of its <source> tag) and today's date (the "Today's date" line). answer.v2 rule 5 asks the model to use both, so an
+answer that says "the handbook dated 2026-01-15 [S1]" or "effective as of today, 2026-10-13" is doing its job; the
+chunk text alone can't vouch for those dates, which used to flag them and drag a correct answer to a low badge.
+Such a date is excused only where it is presented AS that date (right after "dated", or "today" / "as of"): the same
+date stated as when something happened ("took effect on 2026-10-02") is still checked as numbers. Known limits: after
+its cue a date is excused whatever the sentence claims about it, and only the forms in _DATE_RES are recognised (a
+year-less "October 13", "2026/10/02", "Jan. 15, 2026" or "10/13/2026" is checked as plain numbers).
 """
 
 import html
 import re
 import unicodedata
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from datetime import date
 from decimal import Decimal, InvalidOperation
 from typing import Protocol
 
@@ -43,6 +53,30 @@ _PERCENT_RE = re.compile(r"(?<![\w.])" + _NUM + r"\s?(?:%|percent\b)", re.IGNORE
 _DOTTED_RE = re.compile(r"(?<![\w.])\d+(?:\.\d+)+(?!\w)")
 _NUMBER_RE = re.compile(r"(?<![\w.])" + _NUM + _SUFFIX, re.IGNORECASE)
 _WORD_RE = re.compile(r"[a-z0-9]+")
+
+# Dates as the model writes them. Day precision first, so "15 January 2026" is one date, not "January 2026" + "15".
+# Abbreviations are matched without a period: split_sentences already cuts "Jan. 15" after "Jan.", so such a date
+# never reaches these patterns whole (it is checked as numbers, as before).
+_MONTHS = {"january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6, "july": 7, "august": 8,
+           "september": 9, "october": 10, "november": 11, "december": 12,
+           "jan": 1, "feb": 2, "mar": 3, "apr": 4, "jun": 6, "jul": 7, "aug": 8, "sep": 9, "sept": 9, "oct": 10,
+           "nov": 11, "dec": 12}
+_MONTH = r"(?P<month>" + "|".join(sorted(_MONTHS, key=len, reverse=True)) + r")\b"
+_DAY = r"(?P<day>\d{1,2})(?:st|nd|rd|th)?"
+_YEAR = r"(?P<year>\d{4})\b"
+_DASH = "[-‐-–]"     # models sometimes write ISO dates with a non-breaking hyphen (U+2011)
+_DATE_RES = (
+    re.compile(rf"\b(?P<year>\d{{4}}){_DASH}(?P<month>\d{{2}}){_DASH}(?P<day>\d{{2}})\b"),   # 2026-01-15
+    re.compile(rf"\b{_MONTH}\s+{_DAY},?\s+{_YEAR}", re.IGNORECASE),             # January 15, 2026 / Jan 15th 2026
+    re.compile(rf"\b{_DAY}\s+{_MONTH},?\s+{_YEAR}", re.IGNORECASE),             # 15 January 2026
+    re.compile(rf"\b{_MONTH},?\s+{_YEAR}", re.IGNORECASE),                       # January 2026 (month precision)
+)
+# What presents a shown date as itself. A document date follows "dated" (it is the <source>'s date attribute); today's
+# date follows "today", "today is", "today's date" or "as of" ("as of" also introduces effective dates, so it does
+# not excuse a document date). Markdown emphasis and punctuation may sit in between: "dated **2026-01-15**".
+_CUE_GAP = r"[\s,:(*_]*$"
+_DATED_CUE_RE = re.compile(r"\bdated" + _CUE_GAP, re.IGNORECASE)
+_TODAY_CUE_RE = re.compile(r"\b(?:today(?:['’]s\s+date)?(?:\s+is)?|as\s+of)" + _CUE_GAP, re.IGNORECASE)
 
 
 # --- Citation parsing ------------------------------------------------------------------------------------------
@@ -135,6 +169,69 @@ def derived_facts(answer: str) -> set[str]:
     return derived
 
 
+@dataclass(frozen=True)
+class DateMention:
+    start: int
+    end: int
+    day: date               # for a month-precision mention ("January 2026"), the 1st of that month
+    month_only: bool
+
+
+def _date_mention(m: re.Match[str], month_only: bool) -> DateMention | None:
+    month = m.group("month")
+    # .get, not []: re.IGNORECASE folds Unicode, so "Auguſt" (long s) and "Aprıl" (dotless i) match the pattern but
+    # aren't keys. Not a month we know: no date, and its digits are checked as numbers. A KeyError here would fail the
+    # whole turn after the answer had streamed.
+    month_no = int(month) if month.isdigit() else _MONTHS.get(month.lower())
+    if month_no is None:
+        return None
+    try:
+        day = date(int(m.group("year")), month_no, 1 if month_only else int(m.group("day")))
+    except ValueError:              # 2026-02-30 is not a date: leave it to the number check
+        return None
+    return DateMention(m.start(), m.end(), day, month_only)
+
+
+def date_mentions(text: str) -> list[DateMention]:
+    """Every date written in one of the forms in _DATE_RES, in order, without overlaps."""
+    found: list[DateMention] = []
+    for pattern in _DATE_RES:
+        month_only = "day" not in pattern.groupindex
+        for m in pattern.finditer(text):
+            if any(m.start() < f.end and f.start < m.end() for f in found):
+                continue
+            mention = _date_mention(m, month_only)
+            if mention is not None:
+                found.append(mention)
+    return sorted(found, key=lambda f: f.start)
+
+
+def _is_one_of(mention: DateMention, days: set[date]) -> bool:
+    """A month-precision mention ("January 2026") is one of `days` when one of them falls in that month."""
+    if mention.month_only:
+        return any((d.year, d.month) == (mention.day.year, mention.day.month) for d in days)
+    return mention.day in days
+
+
+def without_shown_dates(text: str, *, document_dates: Iterable[date] = (), today: date | None = None) -> str:
+    """`text` with every shown date that is presented as such blanked out, so its digits aren't checked as numbers.
+
+    Presented as such = right after its cue (see _DATED_CUE_RE / _TODAY_CUE_RE): "the handbook dated 2026-01-15",
+    "as of today, 2026-10-13". The same date stated as when something happened ("took effect on 2026-10-02", "paid on
+    January 15, 2026") is a claim about the documents and is left in place, checked exactly as before (its year and day
+    must appear in the cited sources): confusing the document date or today with an effective date is the mistake a
+    policy-conflict question invites. Only the date itself is removed: "$600, dated 2026-01-15" still grounds the $600."""
+    todays = {today} if today else set()
+    cued = [(cue, days) for cue, days in ((_DATED_CUE_RE, set(document_dates)), (_TODAY_CUE_RE, todays)) if days]
+    if not cued:
+        return text
+    for mention in reversed(date_mentions(text)):
+        # endpos: the cue must END where the mention starts (its pattern is anchored with $).
+        if any(_is_one_of(mention, days) and cue.search(text, 0, mention.start) for cue, days in cued):
+            text = text[:mention.start] + " " * (mention.end - mention.start) + text[mention.end:]
+    return text
+
+
 def checked_facts(sentence: str) -> set[str]:
     """Facts that must be grounded. In a shown calculation ("$420k + 3 x $60k = $600k [S2]") the result after the
     last '=' is computed, not quoted, so only the inputs before it are checked (rule 2 of answer.v2)."""
@@ -175,7 +272,10 @@ def best_sentence(answer_tokens: set[str], source_text: str) -> tuple[str | None
 
 # --- The whole check -------------------------------------------------------------------------------------------
 class SourceText(Protocol):
-    """What the model saw for one [S#]: the breadcrumb header and the chunk content (RetrievedChunk fits)."""
+    """What the model saw for one [S#]: the breadcrumb header and the chunk content (RetrievedChunk fits).
+
+    A source may also carry `document_date: date | None`, the date its <source> tag showed (RetrievedChunk does). It
+    is read with getattr, not declared here, so a source without one still fits and simply grounds no date."""
 
     header: str
     content: str
@@ -185,6 +285,11 @@ class SourceText(Protocol):
 class Source:
     header: str
     content: str
+    document_date: date | None = None
+
+
+def _document_date(src: SourceText) -> date | None:
+    return getattr(src, "document_date", None)
 
 
 @dataclass(frozen=True)
@@ -212,9 +317,17 @@ class AnswerCheck:
         return len(self.invalid_refs)
 
 
-def check_answer(answer: str, sources: Mapping[str, SourceText]) -> AnswerCheck:
-    """`sources` maps each provided ref ("S1") to the chunk the model saw for it."""
+def check_answer(answer: str, sources: Mapping[str, SourceText], *, today: date | None = None) -> AnswerCheck:
+    """`sources` maps each provided ref ("S1") to the chunk the model saw for it. `today` is the date the prompt's
+    "Today's date" line showed (AnswerPrompt.today; None when it had none), passed in rather than recomputed so a turn
+    that straddles midnight is checked against the day the model was told.
+
+    Shown dates (each only right after its cue, see without_shown_dates): a cited sentence may state its cited
+    sources' document dates and today's date. A sentence with no citation may state today's date (there is no [S#] to
+    cite for it, like a sentence with no number at all), but a document date in it still makes it an uncited claim:
+    that date is a fact about one particular document, and rule 3 asks the model to say which."""
     facts_by_ref = {ref: source_facts(f"{src.header}\n{src.content}") for ref, src in sources.items()}
+    dates_by_ref = {ref: _document_date(src) for ref, src in sources.items()}
     refusal = is_refusal(answer)
     # A refusal may name facts it did NOT find ("no 401(k) match"); grounding them against the sources is meaningless.
     derived = derived_facts(answer)
@@ -229,11 +342,13 @@ def check_answer(answer: str, sources: Mapping[str, SourceText]) -> AnswerCheck:
         valid = [r for r in dict.fromkeys(cited) if r in sources]
         invalid.extend(r for r in cited if r not in sources and r not in invalid)
         if not valid:
-            if not refusal and extract_facts(sentence) - derived:
+            if not refusal and extract_facts(without_shown_dates(sentence, today=today)) - derived:
                 uncited += 1
             continue
         allowed = set().union(*(facts_by_ref[r] for r in valid))
-        missing = set() if refusal else checked_facts(sentence) - allowed - derived
+        shown = [dates_by_ref[r] for r in valid if dates_by_ref[r]]
+        missing = set() if refusal else (
+            checked_facts(without_shown_dates(sentence, document_dates=shown, today=today)) - allowed - derived)
         ungrounded += len(missing)
         for ref in valid:
             if ref not in order:

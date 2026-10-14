@@ -33,9 +33,12 @@ demo.
 - **Pass**: all expectations met. **Refusal precision / recall**: of the refusals, how many were right / of the
   must-refuse cases, how many were refused; split by path (gate vs model).
 - **Citation validity**: no cited id that wasn't provided. **Gold citation**: cites the expected document.
-  **Grounded**: every number in a cited sentence appears in its cited chunk (or is a shown calculation result).
-- **Reliability**: accuracy per confidence badge. **Latency**: server TTFT and total, client total. **Cost**: answer
-  calls' cost from the `ai_usage` ledger.
+  **Grounded**: every number and code in a cited sentence appears in its cited chunk, is a shown calculation result,
+  or is a date the model was shown, presented as that date: a cited source's document date right after "dated", or
+  today's date right after "today" / "as of" (answer.v2 rule 5 asks for both).
+- **Reliability**: accuracy per confidence badge. **Latency**: server TTFT over model-generated answers (gate refusals
+  reply in ~10 ms without a model call and would flatter it; the report also shows TTFT over all answers), server and
+  client total. **Cost**: answer calls' cost from the `ai_usage` ledger.
 
 ## Results (2026-10-13, demo corpus of 6 documents)
 
@@ -60,28 +63,31 @@ real users paraphrase more, which is what the vector leg is for. A paraphrased r
 | Citations valid / gold document cited | 43/43 / 28/28 |
 | Grounded answers | 43/43 |
 | Confidence: high / medium / low | 20 / 7 / 16 (low = the 15 refusals + 1) — every bucket 100% accurate on this set |
-| TTFT p50 / p95 (server) | 2.4 s / 4.3 s (final run; earlier runs 2.5 s / 6.6 s — Sol's tail varies) |
+| TTFT p50 / p95 (server, 34 model-generated answers) | 2.6 s / 4.7 s (final run; earlier runs 2.7 s / 6.9 s — Sol's tail varies) |
 | Cost per answer | ~$0.0014–0.0042 (varies with answer length and reasoning tokens) |
 
 ### Answer model comparison (same 43 cases)
 
 | answer model | passed | grounded | high-confidence | TTFT p50 / p95 | cost / answer |
 |---|---|---|---|---|---|
-| gpt-6.1-sol (low) — shipped | 43/43 | 43/43 | 21 | 2.5 s / 6.6 s | $0.0014 |
-| gpt-6-luna (low) — fallback | 43/43 | 42/43 | 16 | 1.2 s / 3.1 s | $0.0002 |
+| gpt-6.1-sol (low) — shipped | 43/43 | 43/43 | 21 | 2.7 s / 6.9 s | $0.0014 |
+| gpt-6-luna (low) — fallback | 43/43 | 42/43 | 16 | 1.3 s / 4.8 s | $0.0002 |
 
 ### Prompt v1 vs v2 (same 43 cases, same model)
 
 | prompt | passed | grounded | TTFT p50 / p95 |
 |---|---|---|---|
-| answer.v1 (7 rules) | 43/43 | 41/43 | 1.9 s / 3.3 s |
-| **answer.v2 (9 rules, shipped)** | 43/43 | **43/43** | 2.4 s / 4.3 s |
+| answer.v1 (7 rules) | 43/43 | 41/43 | 2.1 s / 4.7 s |
+| **answer.v2 (9 rules, shipped)** | 43/43 | **43/43** | 2.6 s / 4.7 s |
 
 Both prompts produced correct answers. The difference is verifiability: v1 stated computed totals ("$600,000 versus
 CoreLink's $665,000, a difference of $65,000"; "20 PTO days") without showing the arithmetic, so the grounding check
 could not trace those numbers to any source. v2's rule 2 ("show the calculation and cite every input") makes the model
 write `$420,000 + 3 × $60,000 = $600,000 [S1]`, so every number is checkable in code. The cost is slightly longer
-answers and ~0.5 s more time to first token.
+answers and ~0.5 s more time to first token at p50 (the p95s are equal).
+
+TTFT in these tables is over the 34 model-generated answers of each 43-case run (re-computed from the stored reports;
+reports written before 2026-10-14 quoted it over all 43, gate refusals included, e.g. 2.4 s / 4.3 s for the final run).
 
 ## Limitations of this evaluation
 
@@ -89,3 +95,10 @@ answers and ~0.5 s more time to first token.
 - Expectations are substring-based; an answer can be right in wording we didn't anticipate (none were in these
   runs). A claim-level LLM judge (`evals/judge.py`) exists for faithfulness spot checks and is run offline.
 - Every confidence bucket is 100% accurate here, so the badge's calibration is untested on harder questions.
+- The grounding check matches digits, not meaning. A shown date after its cue is excused whatever the sentence says
+  about it ("took effect today, 2026-10-13" passes even when the change took effect earlier), and a shown date in
+  a form the checker doesn't parse (no year: "October 13"; "2026/10/02"; "Jan. 15, 2026"; "10/13/2026") is checked as
+  plain numbers, so a correct answer can be flagged. No stored answer was affected by either; both are pinned by tests
+  in `tests/chat/test_grounding_dates.py`.
+- `git_sha` / `git_dirty` in a report describe the eval client's checkout, not the code the API container runs:
+  rebuild (`make demo`) after merging before quoting a report as that commit's numbers.

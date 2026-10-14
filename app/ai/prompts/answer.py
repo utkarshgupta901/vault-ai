@@ -64,6 +64,12 @@ def instructions_for(version: Literal["v1", "v2"]) -> tuple[str, str]:
     return (VERSION_V1, INSTRUCTIONS_V1) if version == "v1" else (VERSION, INSTRUCTIONS)
 
 
+def shown_today(version: Literal["v1", "v2"], today: date) -> date | None:
+    """The date the "Today's date" line shows, or None when the version has no such line (v1's rules never mention
+    dates). render() and the answer check both go through here, so the checker grounds exactly the date the model saw."""
+    return today if version == "v2" else None
+
+
 def sources_block(sources: Sequence[PromptSource]) -> str:
     tags = [source_tag(s.ref, document=s.document, location=s.location, content=s.content,
                        date=s.document_date.isoformat() if s.document_date else None) for s in sources]
@@ -92,6 +98,5 @@ def render(
     """Build (prompt_version, instructions, input messages). History messages are already [S#]-stripped; they are
     separate messages with their own role boundaries, so there is no tag structure in them to escape."""
     prompt_version, instructions = instructions_for(version)
-    last = final_turn(question=question, standalone=standalone, sources=sources,
-                      today=today if version == "v2" else None)
+    last = final_turn(question=question, standalone=standalone, sources=sources, today=shown_today(version, today))
     return prompt_version, instructions, [*history, Msg(role="user", content=last)]
