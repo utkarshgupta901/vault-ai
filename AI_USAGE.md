@@ -96,7 +96,7 @@ Before sharing the repo, a 7-agent workflow checked it, read-only against the li
 
 | Check | Agents | Found | Now |
 |---|---|---|---|
-| Confidentiality sweep | 2: git history; by location (files, screenshots, eval reports, the live DB) | agents had copied details from my personal configuration into the design-review notes, and an AI-written regression fixture paraphrased the long real-world document (~49k words, not part of the repo) I had tested with | both replaced with neutral text |
+| Confidentiality sweep | 2: git history; by location (files, screenshots, eval reports, the live DB) | agents had copied details from my personal configuration into the design-review notes, and an AI-written regression fixture paraphrased the long real-world document (~49k words, not part of the repo) I had tested with | both replaced with neutral text, and the git history rewritten so no commit contains them |
 | Clean clone | 1, in an isolated compose project | `make seed` ignored `API=`; host ports were hard-coded | ports overridable (`API_PORT`, `PG_PORT`, `VALKEY_PORT`, `S3_PORT`); seed honours `API` |
 | Docs accuracy | 2: auditor + skeptic verifier | the README's cost per answer came from a warm prompt-cache rerun; TTFT included gate refusals (~10 ms, no model call); the date-grounding bug above | numbers carry report ids and cache state; TTFT over model answers; D-06 |
 | Pre-demo cleanup | 2: builder + adversarial reviewer | the first draft's tests used real file names from the live library, and its apply guard could be bypassed | neutral test names; `make pre-demo` applies only the reviewed plan (plan id + counts); `make snapshot-demo` refuses until it passes |

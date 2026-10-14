@@ -14,7 +14,7 @@ Sources: Sol 20261013T155343Z, Luna 20261013T154859Z (2026-10-13). The Sol run c
 run (20261013T154434Z; only the Luna run in between), so 86% of its answer-call input tokens were prompt-cache hits
 (`ai_usage.cached_input_tokens`) and it cost $0.0014 per answer; with a cold cache, as in the Luna run, Sol costs
 $0.0042 (20261013T165934Z, 20261014T105823Z), about 20× Luna. The Sol run finished 36 s before the D-03 checker fix
-was committed (84858d8), so its report header shows the previous commit (14b26de).
+was committed (2b2195e), so its report header shows the previous commit (c34dd33).
 
 Both pass every case, so this is a quality-vs-latency call. Grounded, well-cited answers are the product, so Sol
 answers; if Sol's first token takes > `ANSWER_TTFT_TIMEOUT_S` (10 s) or it errors before the first token, the same

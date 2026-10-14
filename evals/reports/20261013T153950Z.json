@@ -3,7 +3,7 @@
     "started_at": "2026-10-13T15:39:47+00:00",
     "finished_at": "2026-10-13T15:39:50+00:00",
     "api": "http://localhost:8000",
-    "git_sha": "4929e94",
+    "git_sha": "52947aa",
     "tags": [],
     "case_ids": [],
     "repeat": 1,

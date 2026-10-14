@@ -182,9 +182,9 @@ def test_reports_written_before_the_ttft_split_still_render() -> None:
     assert "ttft_model" not in old["answers"]["latency_ms"] and "git_dirty" not in old["meta"]
     md = render_markdown(old)
     assert "| TTFT (server, all answers incl. gate refusals) | 30 |" in md and "model-generated" not in md
-    assert "git `110f19a` |" in md
+    assert "git `b8985a3` |" in md
     old["meta"]["git_dirty"] = True
-    assert "git `110f19a` (dirty: uncommitted changes) |" in render_markdown(old)
+    assert "git `b8985a3` (dirty: uncommitted changes) |" in render_markdown(old)
 
 
 def test_git_dirty_flag(monkeypatch: pytest.MonkeyPatch) -> None:

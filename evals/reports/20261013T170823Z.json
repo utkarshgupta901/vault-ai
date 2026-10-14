@@ -3,7 +3,7 @@
     "started_at": "2026-10-13T17:04:31+00:00",
     "finished_at": "2026-10-13T17:08:23+00:00",
     "api": "http://localhost:8000",
-    "git_sha": "110f19a",
+    "git_sha": "b8985a3",
     "tags": [
       "demo"
     ],

@@ -43,8 +43,9 @@ demo.
 ## Results: final run (2026-10-14, demo corpus of 6 documents)
 
 `make eval` = `evals/reports/20261014T105823Z` and `make eval-demo` = `evals/reports/20261014T110107Z`, both at git
-`6e13f4d` with a clean tree, after the date-grounding fix (DECISIONS D-06). The comparison tables further down are
-from 2026-10-13 and name their own reports.
+`d51d3a2` with a clean tree, after the date-grounding fix (DECISIONS D-06). The comparison tables further down are
+from 2026-10-13 and name their own reports. Commit ids in the reports and these docs are the ids after the
+2026-10-14 history rewrite ([AI_USAGE.md](../AI_USAGE.md) §7); the code at each commit is unchanged.
 
 ### Retrieval
 
@@ -106,8 +107,8 @@ Measured on 2026-10-13: Sol 20261013T155343Z, Luna 20261013T154859Z.
 
 The Sol run came about 5 minutes after another Sol run (20261013T154434Z; only the Luna run in between), so 86% of
 its answer-call input tokens were prompt-cache hits; its cold cost is from 20261013T165934Z and 20261014T105823Z.
-Luna's run was cold (5% cached). The Sol run finished 36 s before the D-03 checker fix was committed (84858d8), so its
-report header shows the previous commit (14b26de).
+Luna's run was cold (5% cached). The Sol run finished 36 s before the D-03 checker fix was committed (2b2195e), so its
+report header shows the previous commit (c34dd33).
 
 ### Prompt v1 vs v2 (same 43 cases, same model)
 
