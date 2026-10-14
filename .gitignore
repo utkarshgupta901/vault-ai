@@ -26,3 +26,6 @@ app/static/spa/
 .DS_Store
 .idea/
 .vscode/
+
+# Claude Code harness worktrees
+.claude/
