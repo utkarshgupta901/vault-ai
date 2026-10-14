@@ -12,7 +12,7 @@
 #
 # A snapshot is what demo day restores, so whatever is in it ends up on screen. It refuses (exit 1, the previous
 # snapshot untouched) unless all of these hold; SNAPSHOT_ALLOW_UNCLEAN=1 prints the problem and snapshots anyway:
-#   - `scripts/pre_demo.py --check` exits 0 against the API on :8000: no vault holds non-corpus content (a document
+#   - `scripts/pre_demo.py --check` exits 0 against the API ($API, default http://localhost:8000): no vault holds non-corpus content (a document
 #     `make pre-demo` would delete, a document only trusted because of a stray demo_docs/ file, or a chat that uses
 #     or mentions one). Exit 2 (a vault could not be read, e.g. a rejected key) refuses too;
 #   - the users table holds only the seeded users that pre_demo.py checks (demo, eval, other);
@@ -51,11 +51,11 @@ sql() {   # one read-only query, one value per line
 
 echo "0/3 checking that the vaults hold only the demo corpus (scripts/pre_demo.py --check) ..."
 check=0
-uv run python scripts/pre_demo.py --check || check=$?
+uv run python scripts/pre_demo.py --check --api "${API:-http://localhost:8000}" || check=$?
 case "$check" in
   0) ;;
   1) unclean "the vaults still hold non-corpus documents or chats (plan above)" ;;
-  *) unclean "could not check the vaults (pre_demo.py exit $check: is the API up on :8000, is every seeded key accepted?)" ;;
+  *) unclean "could not check the vaults (pre_demo.py exit $check: is the API up at ${API:-http://localhost:8000}, is every seeded key accepted?)" ;;
 esac
 others="$(sql "SELECT name FROM users WHERE name NOT IN ($SEEDED_USERS) ORDER BY name" | paste -sd, -)"
 if [ -n "$others" ]; then

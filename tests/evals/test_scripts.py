@@ -310,7 +310,7 @@ def test_snapshot_proceeds_when_pre_demo_check_passes(tmp_path: Path) -> None:
     assert "objects: 2" in (out / "SNAPSHOT.txt").read_text() and sorted(p.name for p in out.iterdir()) == [
         "SNAPSHOT.txt", "s3", "vault.dump"]                                      # no key lists left behind
     calls = (tmp_path / "calls.log").read_text().splitlines()
-    assert calls[0] == "uv run python scripts/pre_demo.py --check"
+    assert calls[0] == "uv run python scripts/pre_demo.py --check --api http://localhost:8000"
     assert any("scripts/s3_sync.py download" in c and " --keys " in c for c in calls)   # the documents' keys only
 
 

@@ -117,7 +117,7 @@ pre-demo: ## Pre-snapshot cleanup, dry run (APPLY=1 EXPECT_DOCS=n EXPECT_SESSION
 		$(if $(filter 1,$(BACKUPS)),--create-backups) $(if $(filter 1,$(NO_USER_DOCS)),--no-user-docs)
 
 snapshot-demo: ## Save the demo DB + S3 objects to demo_snapshot/ (refuses unless pre-demo --check passes and every document's object is in S3)
-	bash scripts/snapshot_demo.sh
+	API=$(API) bash scripts/snapshot_demo.sh
 
 restore-demo: ## Restore the demo DB + S3 objects from demo_snapshot/ (overwrites current data)
 	bash scripts/restore_demo.sh
