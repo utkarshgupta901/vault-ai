@@ -4,6 +4,7 @@ Middleware order (outermost first): RequestId -> UnhandledError -> RequestLog ->
 UnhandledError sits directly inside RequestId so a 500 still carries the request id (see core/errors.py).
 Routers live under /api/v1 (health at /health). The built React dashboard is served at / (single origin in prod)."""
 
+import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -20,6 +21,7 @@ from app.core.errors import AppError, ErrorCode, UnhandledErrorMiddleware, insta
 from app.core.logging import configure_logging
 from app.core.request_context import RequestIdMiddleware
 from app.core.upload_guard import UploadGuardMiddleware
+from app.rag import tokens
 
 IMAGE_SPA_DIR = Path("/srv/spa")    # Dockerfile copies the build here: outside ./app, so the dev bind mount can't hide it
 REPO_SPA_DIR = Path(__file__).parent / "static" / "spa"
@@ -71,6 +73,7 @@ Authenticate every `/api/v1` call with the `X-API-Key` header (click **Authorize
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     configure_logging()
+    await asyncio.to_thread(tokens.warm_up)     # the first follow-up question must not load (or download) it
     yield
     await get_async_engine().dispose()
 

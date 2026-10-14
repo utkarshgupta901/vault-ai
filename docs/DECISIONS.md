@@ -70,3 +70,15 @@ Result: the stipend answer is Medium in 3/3 runs of 20261014T110107Z. Medium, no
 is 0.49 < `TAU_HIGH` 0.50; I did not lower the threshold to flatter a demo case.
 Trade-off: other date forms (no year, "2026/10/02", "Jan. 15, 2026", "10/13/2026") are checked as plain numbers, so a
 correct answer can still be flagged; a known limit, listed in [EVAL.md](EVAL.md#limitations-of-this-evaluation).
+
+## D-07 Tokenizer files are baked into the image (found by reading per-answer TTFT)
+History is capped by tokens, so the first follow-up question after an API restart was the first call to tiktoken.
+With no cache it downloaded its encoding (3.6 MB) synchronously inside the request, which blocked the event loop: in
+20261014T105823Z that answer's TTFT was 23.4 s (condense 1.7 s, the answer call 3.2 s; the rest was the download).
+The p95 (3.2 s over 34 answers) hid it; the skeptic verifier of the docs pass found it in the per-answer JSON. In a
+live demo it would have been the first "And after three years?" after `make demo`.
+Fix: the Dockerfile sets `TIKTOKEN_CACHE_DIR` and fetches both encodings at build (o200k_base for the API,
+cl100k_base for the chunker), and the API loads its encoding at startup in a thread (`tokenizer_ready`, ~0.4 s from
+the baked files). Regression tests: `tests/platform/test_tokenizer_warmup.py`.
+Result: right after a restart the same follow-up had a TTFT of 4.7 s (condense 2.2 s + Sol).
+Lesson: a p95 over a small sample says nothing about the one slow request a demo will hit; read the maximum too.

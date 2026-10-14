@@ -7,6 +7,7 @@ what we received, and mark the ai_usage row `estimated=true`).
 If the encoding can't be loaded (first run offline), we fall back to ~4 characters per token: an estimate is still
 better than recording zero cost."""
 
+import time
 from functools import cache
 from typing import Any
 
@@ -25,6 +26,14 @@ def _encoding() -> Any | None:
     except Exception as exc:  # noqa: BLE001 - offline / missing cache: use the character heuristic
         log.warning("tiktoken_unavailable", encoding=ENCODING, error=str(exc))
         return None
+
+
+def warm_up() -> None:
+    """Load the encoding before the first request needs it (the API calls this at startup, in a thread). Loading can
+    mean a download when the image has no baked cache, and inside a request that blocked the event loop."""
+    started = time.perf_counter()
+    loaded = _encoding() is not None
+    log.info("tokenizer_ready", encoding=ENCODING, loaded=loaded, ms=int((time.perf_counter() - started) * 1000))
 
 
 def count_tokens(text: str) -> int:

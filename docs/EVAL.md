@@ -68,7 +68,7 @@ real users paraphrase more, which is what the vector leg is for. A paraphrased r
 | Citations valid / gold document cited | 43/43 / 28/28 |
 | Grounded answers | 43/43 |
 | Confidence: high / medium / low | 21 / 7 / 15 (low = the 15 refusals) — every bucket 100% accurate on this set |
-| TTFT p50 / p95 (server, 34 model-generated answers) | **1.4 s / 3.2 s** (all 43 answers incl. 9 gate refusals: 1.4 s / 2.7 s) |
+| TTFT p50 / p95 (server, 34 model-generated answers) | **1.4 s / 3.2 s** (all 43 answers incl. 9 gate refusals: 1.4 s / 2.7 s); max 23.4 s: the first follow-up after a restart downloaded the tokenizer, fixed in D-07 |
 | Cost per answer | $0.0042 with a cold prompt cache (averaged over all 43 incl. the 9 gate refusals at $0; ~$0.0053 per model-generated answer) |
 | AI spend for the whole run | $0.21 (answers plus condense, follow-ups and query embeddings) |
 

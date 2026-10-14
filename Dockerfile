@@ -28,6 +28,12 @@ WORKDIR /srv
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project
 
+# Tokenizer files baked in. Without them tiktoken downloads one (3.6 MB) on first use: in the API that was the first
+# follow-up question after a restart, and the synchronous download blocked the event loop (TTFT 23 s, DECISIONS D-07).
+# Encodings: app/rag/tokens.py (API) and app/ingestion/chunking.py (worker).
+ENV TIKTOKEN_CACHE_DIR=/opt/tiktoken
+RUN python -c "import tiktoken; [tiktoken.get_encoding(e) for e in ('o200k_base', 'cl100k_base')]"
+
 COPY alembic.ini ./
 COPY migrations ./migrations
 COPY app ./app
