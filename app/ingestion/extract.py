@@ -6,21 +6,27 @@
   TXT   -> ~1,500-token pseudo-pages ("part 1", "part 2", ...) cut on paragraph boundaries
 
 Failures that no retry can fix raise PermanentError with a stable code (ENCRYPTED_PDF, CORRUPT_FILE,
-NO_EXTRACTABLE_TEXT, TOO_MANY_PAGES); the worker fails the document with that code and does not retry.
+NO_EXTRACTABLE_TEXT, TOO_MANY_PAGES for a PDF over MAX_PAGES, TOO_MUCH_TEXT for a TXT/MD/DOCX over MAX_PAGES pages'
+worth of text, UNSAFE_ARCHIVE for a DOCX whose XML is too big to parse safely); the worker fails the document with that
+code and does not retry.
 A valid document never yields an empty page list: "nothing to index" is NO_EXTRACTABLE_TEXT.
 """
 
 import re
 import zipfile
+import zlib
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import docx
 import structlog
+from docx.enum.style import WD_STYLE_TYPE
 from docx.opc.exceptions import PackageNotFoundError
+from docx.oxml.ns import qn
 from docx.table import Table
 from docx.text.paragraph import Paragraph
+from lxml import etree
 from pypdf import PdfReader
 from pypdf.errors import DependencyError, PyPdfError
 
@@ -33,14 +39,39 @@ log = structlog.get_logger(__name__)
 
 SECTION_TOKENS = 1500       # max size of a DOCX/MD section page or a TXT pseudo-page
 MAX_HEADING_TOKENS = 64     # a longer "heading" is a body paragraph that was styled as one (see _sections)
-MIN_PAGE_CHARS = 20         # a PDF page with less text than this has no usable text layer (scan, figure, blank)
+MIN_PAGE_CHARS = 20         # next to fuller pages, a PDF page with less text is a scan, figure or blank (warned about)
 LABEL_HEADING_CHARS = 60
+# Only PDFs have a page count to cap (settings.MAX_PAGES), so a TXT, MD or DOCX gets the same budget as text: MAX_PAGES
+# pages of 5,000 characters AND 1,250 tokens, a dense small-print page (a typical page holds 2,000-3,000 characters).
+# Tokens are what the limit protects: chunks, embedding calls and the worker's time limit all grow with them. English
+# runs ~4 characters per token, so there the two limits agree (500 pages: 2.5M characters, ~625k tokens, ~2,000
+# chunks). Chinese runs 1.3-2.4 tokens per character and emoji ~3, so 2.5M characters of those were up to 6-7M tokens
+# and ~20k chunks, more than one worker run can embed inside its time limit. Characters are checked first because that
+# is free and caps the work of counting tokens.
+MAX_CHARS_PER_PAGE = 5_000
+MAX_TOKENS_PER_PAGE = 1_250
+# tiktoken builds the whole list of tokens before it can be counted (~36 bytes a token as Python ints): in one call,
+# 2.5M emoji under the character limit held ~5M tokens, +500 MB, just to refuse the file. So tokens are counted this
+# many characters at a time (measured 8-13 MB a slice in the densest scripts), stopping as soon as the total is over
+# the limit. A cut can split a word into one extra token per slice, which does not matter to a limit.
+TOKEN_COUNT_SLICE_CHARS = 64_000
+# python-docx parses every XML part of a .docx into an lxml tree as soon as it opens the file, and that tree costs
+# ~100-200 bytes per element or attribute however few bytes each took in the file (measured: 10 MB of '<w:p/>' became
+# +200 MB, attribute-dense XML 30x its size). The upload's byte limits (sniff.py) cannot bound that, so the structure
+# is counted before python-docx opens anything. A paragraph of Word prose with its properties and a few formatted runs
+# is ~50-100 elements and attributes, ~1,000 a page, so 500k is ~500 pages of prose; documents built to sit just under
+# it peaked at +65-100 MB and took under 4 s, which a 512 MB worker can afford. Table-dense pages hold several times
+# more, so a long all-table document reaches the limit sooner.
+MAX_XML_NODES = 500_000
 
 # pypdf is lenient, but a malformed file can still surface as a plain Python error from deep inside the parser.
 # Listed explicitly (not `except Exception`) so Celery's SoftTimeLimitExceeded is never mistaken for a corrupt file.
 _PDF_PARSE_ERRORS = (PyPdfError, ValueError, KeyError, TypeError, AttributeError, IndexError, RecursionError)
 # python-docx: not a package / missing part / broken XML (lxml's XMLSyntaxError is a SyntaxError).
 _DOCX_PARSE_ERRORS = (PackageNotFoundError, zipfile.BadZipFile, KeyError, ValueError, SyntaxError)
+# zipfile, for an entry it cannot read: a compression method it does not support, a bad CRC, broken or truncated
+# deflate data. (An encrypted entry was refused at upload, see sniff.py.)
+_ZIP_READ_ERRORS = (NotImplementedError, zipfile.BadZipFile, zlib.error, EOFError)
 
 _NO_TEXT = "The document contains no extractable text."
 
@@ -82,6 +113,25 @@ def _one_line(text: str) -> str:
     return " ".join(text.split())
 
 
+def _check_text_size(text: str) -> None:
+    """TOO_MUCH_TEXT for a format without pages: the limit is MAX_PAGES pages' worth of text, in characters and in
+    tokens (see MAX_TOKENS_PER_PAGE). Checked before splitting, because chunking an oversized text is itself
+    expensive. Tokens are counted a slice at a time, and only until the total is over (see TOKEN_COUNT_SLICE_CHARS)."""
+    _check_limit(len(text), MAX_CHARS_PER_PAGE, "characters")
+    tokens = 0
+    for start in range(0, len(text), TOKEN_COUNT_SLICE_CHARS):
+        tokens += count_tokens(text[start : start + TOKEN_COUNT_SLICE_CHARS])
+        _check_limit(tokens, MAX_TOKENS_PER_PAGE, "tokens")
+
+
+def _check_limit(amount: int, per_page: int, unit: str) -> None:
+    limit = settings.MAX_PAGES * per_page
+    if amount > limit:
+        # "more than the limit", not the amount: the token count stops early, so it is only a lower bound.
+        raise PermanentError(ErrorCode.TOO_MUCH_TEXT, f"The document has more {unit} of text than the limit of "
+                             f"{limit:,} (about {settings.MAX_PAGES} pages).")
+
+
 # --- PDF ----------------------------------------------------------------------------------------------------------
 
 
@@ -99,17 +149,24 @@ def _extract_pdf(path: Path) -> ExtractedDoc:
 
     labels = _pdf_labels(reader, page_count)
     pages: list[PageText] = []
-    without_text = 0
     for index, page in enumerate(reader.pages):
         text = _clean(_pdf_page_text(page, index + 1))
-        if len(text.strip()) < MIN_PAGE_CHARS:
-            without_text += 1
         pages.append(PageText(page_no=index + 1, label=f"p. {labels[index]}", heading_path=None, text=text))
 
-    if without_text == page_count:
+    lengths = [len(p.text.strip()) for p in pages]
+    pages_with_text = sum(n > 0 for n in lengths)
+    if pages_with_text == 0 or (max(lengths) < MIN_PAGE_CHARS and pages_with_text > 1):
+        # No text on any page: there is no text layer, i.e. a scan. A few characters on each of several pages and
+        # nothing longer anywhere: page or Bates numbers stamped on a scan. Short text on ONE page (a one-line
+        # receipt "Invoice #1234 paid") is a real text layer and gets indexed. The trade-off: several pages of short
+        # text and nothing longer (a two-page receipt) look exactly like stamps on a scan, and are refused.
         raise PermanentError(ErrorCode.NO_EXTRACTABLE_TEXT,
                              "No extractable text: looks like a scanned/image-only PDF (OCR is not supported).")
-    # Some pages scanned: index the rest, and tell the user how many pages chat can't see.
+    # Some pages scanned: index the rest, and tell the user how many pages chat can't see. Next to pages of real text,
+    # a near-empty page is a scanned page or a figure with a stray label; when the only text is one short page (the
+    # receipt above), short IS the content, so only blank pages count.
+    floor = MIN_PAGE_CHARS if max(lengths) >= MIN_PAGE_CHARS else 1
+    without_text = sum(n < floor for n in lengths)
     warnings = [f"pages_without_text:{without_text}"] if without_text else []
     return ExtractedDoc(pages=pages, warnings=warnings)
 
@@ -222,32 +279,114 @@ def _pages_from_sections(sections: list[_Section]) -> ExtractedDoc:
 
 def _extract_docx(path: Path) -> ExtractedDoc:
     try:
+        _check_docx_xml(path)
         document = docx.Document(str(path))
         blocks = list(_docx_blocks(document))
     except _DOCX_PARSE_ERRORS as exc:
         raise PermanentError(ErrorCode.CORRUPT_FILE, "The Word document could not be read.") from exc
+    _check_text_size("\n\n".join(block.text for block in blocks))
     return _pages_from_sections(_sections(blocks))
+
+
+class _XmlNodeCounter:
+    """An lxml parser target: counts the nodes a tree would hold, without building one. Elements and attributes, and
+    also comments, processing instructions and namespace declarations: python-docx's parser keeps those in its tree
+    too, each costing about what an element does (29 MB of '<?a?>' in a 591 KB upload cost +809 MB). Raising here
+    stops the parse (lxml re-raises what its target raises), so an oversized part is never read to the end."""
+
+    def __init__(self) -> None:
+        self.nodes = 0
+
+    def start(self, _tag: str, attrib: dict[str, str]) -> None:
+        self._add(1 + len(attrib))
+
+    def comment(self, _text: str) -> None:
+        self._add(1)
+
+    def pi(self, _target: str, _data: str | None = None) -> None:
+        self._add(1)
+
+    def start_ns(self, _prefix: str, _uri: str) -> None:
+        self._add(1)
+
+    def _add(self, nodes: int) -> None:
+        self.nodes += nodes
+        if self.nodes > MAX_XML_NODES:
+            raise PermanentError(ErrorCode.UNSAFE_ARCHIVE, f"The Word document's XML has more than "
+                                 f"{MAX_XML_NODES:,} nodes, more than can be opened safely.")
+
+    def doctype(self, *_args: object) -> None:
+        # Word never writes a DOCTYPE, and the entities one declares would be nodes this count cannot see.
+        raise PermanentError(ErrorCode.UNSAFE_ARCHIVE,
+                             "The Word document contains a DOCTYPE declaration, which Word never writes.")
+
+    def close(self) -> None:
+        pass
+
+
+def _check_docx_xml(path: Path) -> None:
+    """UNSAFE_ARCHIVE for XML that python-docx could not parse safely (see MAX_XML_NODES), checked before it opens it.
+
+    Every entry of the archive is counted, into one total, not just word/document.xml: python-docx also parses the
+    styles, numbering, headers and footers when it opens the file and holds them all at once, and it finds the main
+    part through the package's relationships, whatever its name. Each entry goes through the same call python-docx
+    makes on a part (fromstring on its bytes, which sniff.py capped at 30 MB an entry), so encodings such as UTF-16 and
+    UTF-32 are detected exactly as python-docx will; lxml's streaming parsers miss UTF-32. An entry that is not XML
+    (an image) fails on its first bytes. An entry zipfile cannot read is skipped: python-docx reads parts with the same
+    zipfile call, so it fails on that entry too if it is a part, and never opens it if it is not."""
+    counter = _XmlNodeCounter()
+    with zipfile.ZipFile(path) as archive:
+        for info in archive.infolist():
+            try:
+                xml = archive.read(info)
+            except _ZIP_READ_ERRORS:
+                continue
+            try:
+                etree.fromstring(xml, etree.XMLParser(target=counter, resolve_entities=False))
+            except etree.XMLSyntaxError:
+                pass  # not XML (an image), or broken XML python-docx refuses too; its nodes so far are counted
 
 
 def _docx_blocks(document) -> Iterator[_Block]:
     """Body paragraphs AND tables, in document order (a table between two paragraphs stays between them).
-    Headers, footers, footnotes and text boxes are not read."""
-    for item in document.iter_inner_content():
-        if isinstance(item, Table):
-            text = _table_text(item)
+    Headers, footers, footnotes and text boxes are not read.
+
+    The body's children are visited one at a time. document.iter_inner_content() would first build a Python list of
+    every paragraph in the body: for 450k empty paragraphs that raised the peak from +66 MB to +96 MB."""
+    style_names, default_style = _paragraph_style_names(document)
+    paragraph_tag, table_tag = qn("w:p"), qn("w:tbl")
+    for element in document.element.body.iterchildren(paragraph_tag, table_tag):
+        if element.tag == table_tag:
+            text = _table_text(Table(element, document))
             if text:
                 yield _Block(level=None, text=text)
             continue
-        text = _clean(item.text).strip()
+        paragraph = Paragraph(element, document)
+        text = _clean(paragraph.text).strip()
         if not text:
             continue
-        level = _heading_level(item)
+        level = _heading_level(style_names.get(element.style, default_style))
         yield _Block(level=level, text=_one_line(text) if level is not None else text)
 
 
-def _heading_level(paragraph: Paragraph) -> int | None:
+def _paragraph_style_names(document) -> tuple[dict[str, str], str]:
+    """Style id -> name of every paragraph style, and the default paragraph style's name, read ONCE per document.
+
+    paragraph.style resolves the same name per paragraph by scanning every style in styles.xml in Python (twice for a
+    paragraph without a style of its own): with a styles.xml padded to 200k styles, well under MAX_XML_NODES, that was
+    ~0.6 s a paragraph, so a short document could hold a worker until its time limit. As in python-docx, a paragraph
+    whose style id is missing, unknown or not a paragraph style gets the default style."""
+    names: dict[str, str] = {}
+    for style in document.styles:
+        if style.style_id and style.element.type == WD_STYLE_TYPE.PARAGRAPH:
+            names.setdefault(style.style_id, style.name or "")
+    default = document.styles.default(WD_STYLE_TYPE.PARAGRAPH)
+    default_name = (default.name or "") if default is not None else ""
+    return names, default_name
+
+
+def _heading_level(name: str) -> int | None:
     """Word marks headings with paragraph styles: 'Title' -> 0, 'Heading 1' -> 1, 'Heading 2' -> 2, ..."""
-    name = (paragraph.style.name if paragraph.style is not None else "") or ""
     if name.startswith("Title"):
         return 0
     if name.startswith("Heading"):
@@ -281,6 +420,7 @@ _MD_FENCE = re.compile(r"^\s*(```|~~~)")                   # inside a code fence
 def _read_text(path: Path) -> str:
     # The upload sniffer already required strict UTF-8; "utf-8-sig" drops a BOM, "replace" is belt and braces.
     text = path.read_bytes().decode("utf-8-sig", errors="replace")
+    _check_text_size(text)
     return _clean(text.replace("\r\n", "\n").replace("\r", "\n"))
 
 

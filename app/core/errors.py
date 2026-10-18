@@ -67,6 +67,7 @@ class ErrorCode(StrEnum):
     INSIGHTS_REFUSED = "INSIGHTS_REFUSED"
     INSIGHTS_TRUNCATED = "INSIGHTS_TRUNCATED"
     INSIGHTS_PARSE_FAILED = "INSIGHTS_PARSE_FAILED"
+    TOO_MUCH_TEXT = "TOO_MUCH_TEXT"           # TXT/MD/DOCX over MAX_PAGES pages' worth of text (PDF: TOO_MANY_PAGES)
 
 
 class AppError(Exception):

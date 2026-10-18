@@ -1,14 +1,27 @@
 """Extraction per format: labels, sections, pseudo-pages and permanent failure codes. Pure unit tests (no services)."""
 
+import io
+import os
+import struct
+import time
+import zipfile
 from pathlib import Path
 
+import docx
 import pytest
 
+import app.ingestion.extract as extract_module
 from app.config import settings
 from app.core.errors import ErrorCode, PermanentError
 from app.ingestion.chunking import MAX_HEADER_TOKENS, MIN_TAIL_TOKENS, chunk_pages, count_tokens, embed_text
-from app.ingestion.extract import MAX_HEADING_TOKENS, SECTION_TOKENS, extract
-from app.ingestion.sniff import DOCX, MD, PDF, TXT
+from app.ingestion.extract import (
+    MAX_CHARS_PER_PAGE,
+    MAX_HEADING_TOKENS,
+    MAX_TOKENS_PER_PAGE,
+    SECTION_TOKENS,
+    extract,
+)
+from app.ingestion.sniff import DOCX, MD, PDF, TXT, sniff
 from tests.ingestion.helpers import (
     PAGE_TEXTS,
     encrypt_pdf,
@@ -75,6 +88,33 @@ def test_partly_scanned_pdf_is_indexed_with_a_warning(tmp_path: Path) -> None:
     assert doc.warnings == ["pages_without_text:1"]
 
 
+def test_pdf_whose_only_text_is_short_is_not_mistaken_for_a_scan(tmp_path: Path) -> None:
+    doc = extract(_file(tmp_path, "receipt.pdf", make_pdf(["Invoice #1234 paid"])), PDF)
+    assert doc.pages[0].text.strip() == "Invoice #1234 paid"
+    assert doc.warnings == []                       # its only page has text: nothing chat can't see
+
+
+def test_short_text_pdf_warns_only_about_its_blank_pages(tmp_path: Path) -> None:
+    doc = extract(_file(tmp_path, "receipt.pdf", make_pdf(["Invoice #1234 paid", ""])), PDF)
+    assert doc.warnings == ["pages_without_text:1"]
+
+
+def test_near_empty_page_among_full_pages_still_counts_as_without_text(tmp_path: Path) -> None:
+    doc = extract(_file(tmp_path, "a.pdf", make_pdf([PAGE_TEXTS[0], "Figure 3"])), PDF)
+    assert doc.warnings == ["pages_without_text:1"]   # a stray label on a scanned page is not a text layer
+
+
+@pytest.mark.parametrize("stamps", [["1", "2", "3"], ["ABC000101", "ABC000102", "ABC000103"]])
+def test_scan_whose_only_text_is_stamped_page_or_bates_numbers_is_no_extractable_text(
+    tmp_path: Path, stamps: list[str],
+) -> None:
+    """Scanned productions are often stamped with page or Bates numbers: a text layer of a few characters on every
+    page and nothing more. That is still a scan, so it fails fast with the OCR hint instead of indexing the stamps."""
+    with pytest.raises(PermanentError) as err:
+        extract(_file(tmp_path, "scan.pdf", make_pdf(stamps)), PDF)
+    assert err.value.code == ErrorCode.NO_EXTRACTABLE_TEXT
+
+
 def test_too_many_pages(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "MAX_PAGES", 2)
     with pytest.raises(PermanentError) as err:
@@ -134,6 +174,135 @@ def test_corrupt_docx(tmp_path: Path) -> None:
     assert err.value.code == ErrorCode.CORRUPT_FILE
 
 
+W_XMLNS = b'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
+
+
+def _docx_replacing(parts: dict[str, bytes]) -> bytes:
+    """make_docx() with some parts' XML swapped, plus stored random padding that keeps the archive under the upload's
+    compression-ratio limit: how a crafted upload would be built."""
+    source = zipfile.ZipFile(io.BytesIO(make_docx()))
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for info in source.infolist():
+            zf.writestr(info.filename, parts.get(info.filename) or source.read(info.filename))
+        zf.writestr("word/media/padding.bin", os.urandom(512 * 1024), compress_type=zipfile.ZIP_STORED)
+    return buf.getvalue()
+
+
+def _fail_if_parsed(*_args: object, **_kwargs: object) -> None:
+    raise AssertionError("python-docx opened an archive that should have been refused first")
+
+
+@pytest.mark.parametrize(("part", "root", "element"), [
+    ("word/document.xml", (b"<w:document %s><w:body>" % W_XMLNS, b"</w:body></w:document>"), b"<w:p/>"),
+    ("word/styles.xml", (b"<w:styles %s>" % W_XMLNS, b"</w:styles>"), b"<w:style/>"),
+])
+def test_docx_of_millions_of_tiny_elements_is_refused_before_python_docx_parses_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, part: str, root: tuple[bytes, bytes], element: bytes,
+) -> None:
+    """2M empty elements are 12-20 MB of XML, under every byte limit the upload checks, yet python-docx would turn
+    them into an lxml tree of several hundred MB. Any part counts, not just the body: python-docx parses the styles,
+    numbering, headers and footers as soon as it opens the file."""
+    data = _docx_replacing({part: root[0] + element * 2_000_000 + root[1]})
+    assert sniff(io.BytesIO(data), "bomb.docx").mime_type == DOCX          # passes every upload check
+    monkeypatch.setattr(docx, "Document", _fail_if_parsed)
+    with pytest.raises(PermanentError) as err:
+        extract(_file(tmp_path, "bomb.docx", data), DOCX)
+    assert err.value.code == ErrorCode.UNSAFE_ARCHIVE
+
+
+NAMESPACE_DENSE = b"<w:p %s/>" % b" ".join(b'xmlns:n%d="u"' % i for i in range(400))
+
+
+@pytest.mark.parametrize(("unit", "count"), [
+    (b"<!---->", 2_000_000),
+    (b"<?a?>", 2_000_000),
+    (NAMESPACE_DENSE, 2_000),       # 400 declarations on each element
+], ids=["comments", "processing-instructions", "namespace-declarations"])
+def test_docx_of_millions_of_comments_pis_or_namespace_declarations_is_refused_too(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, unit: bytes, count: int,
+) -> None:
+    """python-docx's parser keeps comments, processing instructions and namespace declarations in its tree, each
+    costing about what an element does: 29 MB of '<?a?>' in a 591 KB upload cost the worker +809 MB."""
+    body = b"<w:p><w:r><w:t>Employees receive 18 PTO days per year.</w:t></w:r></w:p>" + unit * count
+    document = b"<w:document %s><w:body>%s</w:body></w:document>" % (W_XMLNS, body)
+    data = _docx_replacing({"word/document.xml": document})
+    assert sniff(io.BytesIO(data), "bomb.docx").mime_type == DOCX          # passes every upload check
+    monkeypatch.setattr(docx, "Document", _fail_if_parsed)
+    with pytest.raises(PermanentError) as err:
+        extract(_file(tmp_path, "bomb.docx", data), DOCX)
+    assert err.value.code == ErrorCode.UNSAFE_ARCHIVE
+
+
+def _docx_with_unreadable_extra_entry(defect: str) -> bytes:
+    """make_docx() plus an entry that nothing in the package refers to and that zipfile cannot read."""
+    junk = b"JUNKDATA" * 64
+    buf = io.BytesIO(make_docx())
+    with zipfile.ZipFile(buf, "a") as zf:
+        zf.writestr("zzjunk.bin", junk, compress_type=zipfile.ZIP_STORED)
+    data = bytearray(buf.getvalue())
+    if defect == "bad CRC":
+        data[data.index(junk)] ^= 0xFF
+    else:  # compression method 9 (Deflate64), which zipfile does not support: set in the local and central headers
+        local = zipfile.ZipFile(io.BytesIO(bytes(data))).getinfo("zzjunk.bin").header_offset
+        central = data.rindex(b"zzjunk.bin") - 46
+        for offset in (local + 8, central + 10):
+            data[offset:offset + 2] = struct.pack("<H", 9)
+    return bytes(data)
+
+
+@pytest.mark.parametrize("defect", ["bad CRC", "unsupported compression"])
+def test_unreadable_entry_python_docx_never_opens_does_not_sink_the_document(tmp_path: Path, defect: str) -> None:
+    """The XML count reads every entry, but python-docx opens only the parts the package refers to. An entry outside
+    those that zipfile cannot read must not fail a document python-docx extracts fine."""
+    data = _docx_with_unreadable_extra_entry(defect)
+    assert sniff(io.BytesIO(data), "a.docx").mime_type == DOCX
+    doc = extract(_file(tmp_path, "a.docx", data), DOCX)
+    clean = extract(_file(tmp_path, "clean.docx", make_docx()), DOCX)
+    assert [p.label for p in doc.pages] == [p.label for p in clean.pages]
+
+
+def test_docx_bomb_in_utf32_is_counted_too(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """python-docx's parser reads UTF-16 and UTF-32 XML too. A count that decoded the part differently would see no
+    elements in a UTF-32 body at all, while python-docx built 1M of them."""
+    body = "<w:p/>" * 1_000_000
+    xml = f"<w:document {W_XMLNS.decode()}><w:body>{body}</w:body></w:document>".encode("utf-32")
+    data = _docx_replacing({"word/document.xml": xml})
+    assert sniff(io.BytesIO(data), "bomb.docx").mime_type == DOCX          # 24 MB: under the per-entry byte cap
+    monkeypatch.setattr(docx, "Document", _fail_if_parsed)
+    with pytest.raises(PermanentError) as err:
+        extract(_file(tmp_path, "bomb.docx", data), DOCX)
+    assert err.value.code == ErrorCode.UNSAFE_ARCHIVE
+
+
+def test_docx_part_with_a_doctype_is_refused(tmp_path: Path) -> None:
+    """Word never writes a DOCTYPE. One in a .docx can only be there to declare entities, which the counting parser
+    cannot see into, so the archive is refused rather than counted wrong."""
+    document_xml = zipfile.ZipFile(io.BytesIO(make_docx())).read("word/document.xml")
+    with_doctype = document_xml.replace(b"?>", b'?><!DOCTYPE w:document [<!ENTITY a "x">]>', 1)
+    with pytest.raises(PermanentError) as err:
+        extract(_file(tmp_path, "a.docx", _docx_replacing({"word/document.xml": with_doctype})), DOCX)
+    assert err.value.code == ErrorCode.UNSAFE_ARCHIVE
+
+
+def test_docx_style_lookups_do_not_grow_with_paragraphs_times_styles(tmp_path: Path) -> None:
+    """python-docx's paragraph.style scans every style in styles.xml, in Python, on every call. A styles.xml padded
+    with thousands of styles (well under the XML node limit) then made a short document cost minutes of worker time;
+    here 300 paragraphs x 20k styles took ~13 s."""
+    styles = (b"<w:styles %s>" % W_XMLNS
+              + b'<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/></w:style>'
+              + b'<w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/></w:style>'
+              + b'<w:style w:type="character"/>' * 20_000 + b"</w:styles>")
+    heading = b'<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>Leave Policy</w:t></w:r></w:p>'
+    body = b"<w:p><w:r><w:t>Employees receive 18 PTO days per year.</w:t></w:r></w:p>" * 300
+    document = b"<w:document %s><w:body>%s%s</w:body></w:document>" % (W_XMLNS, heading, body)
+    path = _file(tmp_path, "a.docx", _docx_replacing({"word/styles.xml": styles, "word/document.xml": document}))
+    started = time.perf_counter()
+    doc = extract(path, DOCX)
+    assert time.perf_counter() - started < 5
+    assert {p.heading_path for p in doc.pages} == {"Leave Policy"}   # 'heading 1' is still read as Heading 1
+
+
 # --- TXT / MD -------------------------------------------------------------------------------------------------------
 
 
@@ -182,6 +351,66 @@ def test_whitespace_only_text_is_no_extractable_text(tmp_path: Path) -> None:
 def test_special_token_text_does_not_crash_the_tokenizer(tmp_path: Path) -> None:
     doc = extract(_file(tmp_path, "a.txt", "Prompt marker <|endoftext|> appears in this log."), TXT)
     assert "<|endoftext|>" in doc.pages[0].text
+
+
+@pytest.mark.parametrize(("name", "mime"), [("a.txt", TXT), ("a.md", MD), ("a.docx", DOCX)])
+def test_non_pdf_with_more_text_than_max_pages_worth_is_too_much_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str, mime: str,
+) -> None:
+    """Only PDFs have a page count to cap; a 25 MB TXT/MD/DOCX must not become ~15k chunks."""
+    monkeypatch.setattr(settings, "MAX_PAGES", 1)   # the text limit scales with the page limit
+    big = make_docx(long_section_words=2000) if mime == DOCX else "# Notes\n\n" + _paragraphs(100)
+    with pytest.raises(PermanentError) as err:
+        extract(_file(tmp_path, name, big), mime)
+    assert err.value.code == ErrorCode.TOO_MUCH_TEXT
+    assert "characters" in err.value.message
+    small = make_docx() if mime == DOCX else "# Notes\n\nEmployees receive 18 PTO days per year."
+    assert extract(_file(tmp_path, name, small), mime).pages          # well under the same limit
+
+
+def _docx_of(text: str) -> bytes:
+    d = docx.Document()
+    d.add_paragraph(text)
+    buf = io.BytesIO()
+    d.save(buf)
+    return buf.getvalue()
+
+
+@pytest.mark.parametrize(("name", "mime"), [("a.txt", TXT), ("a.md", MD), ("a.docx", DOCX)])
+def test_token_dense_text_under_the_character_limit_is_still_too_much_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str, mime: str,
+) -> None:
+    """What the limit protects (chunks, embedding calls, the worker's time limit) grows with tokens, not characters.
+    English runs ~4 characters per token, but Chinese 1.3-2.4 tokens per character: 2.5M characters of it passed the
+    character limit as up to ~6M tokens and ~20k chunks."""
+    monkeypatch.setattr(settings, "MAX_PAGES", 1)
+    sentence = "雇员每年享有十八天带薪休假，未使用的假期在年底作废。"   # "18 paid days off a year; unused ones expire"
+    text = (sentence * 200)[: MAX_CHARS_PER_PAGE - 1]
+    assert count_tokens(text) > MAX_TOKENS_PER_PAGE                         # under one limit, over the other
+    with pytest.raises(PermanentError) as err:
+        extract(_file(tmp_path, name, _docx_of(text) if mime == DOCX else text), mime)
+    assert err.value.code == ErrorCode.TOO_MUCH_TEXT
+    assert "tokens" in err.value.message
+
+
+def test_token_limit_is_counted_in_bounded_slices_and_stops_once_over(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """tiktoken builds the whole list of tokens before it can be counted. In one call, 2.5M emoji (under the character
+    limit) held ~5M tokens, +500 MB, just to refuse the file: the refusal itself was the memory spike."""
+    seen: list[int] = []
+
+    def recording_count_tokens(text: str) -> int:
+        seen.append(len(text))
+        return count_tokens(text)
+
+    monkeypatch.setattr(extract_module, "count_tokens", recording_count_tokens)
+    text = "😀" * (settings.MAX_PAGES * MAX_CHARS_PER_PAGE - 1)    # ~2 tokens each: ~8x the token limit
+    with pytest.raises(PermanentError) as err:
+        extract(_file(tmp_path, "a.txt", text), TXT)
+    assert err.value.code == ErrorCode.TOO_MUCH_TEXT
+    assert max(seen) <= 100_000                     # never the whole text in one call
+    assert sum(seen) < len(text) // 2               # and no further than needed to pass the limit
 
 
 # --- Over-long "headings" ---------------------------------------------------------------------------------------------
