@@ -232,7 +232,10 @@ def _call_model(prompt_input: str, ledger: _Ledger) -> tuple[DocumentInsights, U
             # A refusal or a rejected request would get the same answer again; truncated/unparsable output gets
             # exactly one more try (with a bigger output budget when it was truncated).
             if code in (ErrorCode.INSIGHTS_REFUSED, ErrorCode.PROVIDER_BAD_REQUEST) or attempt == 2:
-                raise PermanentError(code, exc.message) from exc
+                # The message ends up in processing_runs (served by /metrics/processing): kind and status only. The
+                # vendor's text, which for a 401 echoes part of the API key, is logged here and nowhere else.
+                log.warning("insights_call_failed", kind=exc.kind, status_code=exc.status_code, error=exc.message)
+                raise PermanentError(code, exc.summary()) from exc
             if exc.kind == "incomplete":
                 budget = RETRY_OUTPUT_TOKENS
             log.warning("insights_retry", kind=exc.kind, max_output_tokens=budget)

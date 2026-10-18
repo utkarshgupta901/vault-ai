@@ -7,8 +7,8 @@
 
 Failures that no retry can fix raise PermanentError with a stable code (ENCRYPTED_PDF, CORRUPT_FILE,
 NO_EXTRACTABLE_TEXT, TOO_MANY_PAGES for a PDF over MAX_PAGES, TOO_MUCH_TEXT for a TXT/MD/DOCX over MAX_PAGES pages'
-worth of text, UNSAFE_ARCHIVE for a DOCX whose XML is too big to parse safely); the worker fails the document with that
-code and does not retry.
+worth of text, UNSAFE_ARCHIVE for a DOCX whose archive or XML is too big to open safely); the worker fails the document
+with that code and does not retry.
 A valid document never yields an empty page list: "nothing to index" is NO_EXTRACTABLE_TEXT.
 """
 
@@ -33,7 +33,7 @@ from pypdf.errors import DependencyError, PyPdfError
 from app.config import settings
 from app.core.errors import ErrorCode, PermanentError
 from app.ingestion.chunking import count_tokens, split_by_tokens
-from app.ingestion.sniff import DOCX, MD, PDF, TXT
+from app.ingestion.sniff import DOCX, MAX_ENTRY_UNCOMPRESSED, MAX_UNCOMPRESSED, MD, PDF, TXT
 
 log = structlog.get_logger(__name__)
 
@@ -67,8 +67,10 @@ MAX_XML_NODES = 500_000
 # pypdf is lenient, but a malformed file can still surface as a plain Python error from deep inside the parser.
 # Listed explicitly (not `except Exception`) so Celery's SoftTimeLimitExceeded is never mistaken for a corrupt file.
 _PDF_PARSE_ERRORS = (PyPdfError, ValueError, KeyError, TypeError, AttributeError, IndexError, RecursionError)
-# python-docx: not a package / missing part / broken XML (lxml's XMLSyntaxError is a SyntaxError).
-_DOCX_PARSE_ERRORS = (PackageNotFoundError, zipfile.BadZipFile, KeyError, ValueError, SyntaxError)
+# python-docx: not a package / missing part / broken XML (lxml's XMLSyntaxError is a SyntaxError). RecursionError: it
+# resolves a continued vertical merge by recursing up the rows, so a long merge chain overflows the stack. That file
+# fails the same way every time, so it is corrupt, not an unexpected (retryable) error.
+_DOCX_PARSE_ERRORS = (PackageNotFoundError, zipfile.BadZipFile, KeyError, ValueError, SyntaxError, RecursionError)
 # zipfile, for an entry it cannot read: a compression method it does not support, a bad CRC, broken or truncated
 # deflate data. (An encrypted entry was refused at upload, see sniff.py.)
 _ZIP_READ_ERRORS = (NotImplementedError, zipfile.BadZipFile, zlib.error, EOFError)
@@ -333,10 +335,20 @@ def _check_docx_xml(path: Path) -> None:
     makes on a part (fromstring on its bytes, which sniff.py capped at 30 MB an entry), so encodings such as UTF-16 and
     UTF-32 are detected exactly as python-docx will; lxml's streaming parsers miss UTF-32. An entry that is not XML
     (an image) fails on its first bytes. An entry zipfile cannot read is skipped: python-docx reads parts with the same
-    zipfile call, so it fails on that entry too if it is a part, and never opens it if it is not."""
+    zipfile call, so it fails on that entry too if it is a part, and never opens it if it is not.
+
+    Before any entry is read, the entry sizes (each, and in total) are checked against the upload's caps (sniff.py):
+    the worker extracts stored objects without sniffing them again, and one stored under older, looser caps can still
+    be reprocessed. The sizes in the zip headers bound the reads, because zipfile never returns more bytes than an
+    entry declares."""
     counter = _XmlNodeCounter()
     with zipfile.ZipFile(path) as archive:
-        for info in archive.infolist():
+        infos = archive.infolist()
+        sizes = [info.file_size for info in infos]
+        if sum(sizes) > MAX_UNCOMPRESSED or max(sizes, default=0) > MAX_ENTRY_UNCOMPRESSED:
+            raise PermanentError(ErrorCode.UNSAFE_ARCHIVE, "The Word document's archive is larger than can be opened "
+                                 "safely.")
+        for info in infos:
             try:
                 xml = archive.read(info)
             except _ZIP_READ_ERRORS:

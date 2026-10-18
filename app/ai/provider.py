@@ -72,6 +72,12 @@ class ProviderError(Exception):
         self.status_code = status_code
         self.usage = usage
 
+    def summary(self) -> str:
+        """Kind and HTTP status only, e.g. "bad_request (HTTP 401)": what may be stored where tenants can read it
+        (processing_runs feeds /metrics/processing). `message` can be the vendor's own text, and a 401's echoes part of
+        the server's API key, so it goes to the logs only."""
+        return self.kind if self.status_code is None else f"{self.kind} (HTTP {self.status_code})"
+
 
 class LLMProvider(Protocol):
     name: str

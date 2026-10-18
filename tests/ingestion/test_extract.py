@@ -3,6 +3,7 @@
 import io
 import os
 import struct
+import sys
 import time
 import zipfile
 from pathlib import Path
@@ -21,7 +22,7 @@ from app.ingestion.extract import (
     SECTION_TOKENS,
     extract,
 )
-from app.ingestion.sniff import DOCX, MD, PDF, TXT, sniff
+from app.ingestion.sniff import DOCX, MAX_ENTRY_UNCOMPRESSED, MAX_UNCOMPRESSED, MD, PDF, TXT, sniff
 from tests.ingestion.helpers import (
     PAGE_TEXTS,
     encrypt_pdf,
@@ -273,6 +274,76 @@ def test_docx_bomb_in_utf32_is_counted_too(tmp_path: Path, monkeypatch: pytest.M
     with pytest.raises(PermanentError) as err:
         extract(_file(tmp_path, "bomb.docx", data), DOCX)
     assert err.value.code == ErrorCode.UNSAFE_ARCHIVE
+
+
+def _docx_with_zero_entries(sizes: list[int]) -> bytes:
+    """make_docx() plus deflated zero-filled entries: tiny on disk, but zipfile hands back every byte on read."""
+    buf = io.BytesIO(make_docx())
+    with zipfile.ZipFile(buf, "a", zipfile.ZIP_DEFLATED) as zf:
+        for i, size in enumerate(sizes):
+            zf.writestr(f"word/media/zeros{i}.bin", bytes(size))
+    return buf.getvalue()
+
+
+@pytest.mark.parametrize("sizes", [
+    [MAX_ENTRY_UNCOMPRESSED + 1],                                   # one entry over the per-entry cap
+    [MAX_UNCOMPRESSED // 3 + 1] * 3,                                # each under it, together over the total
+], ids=["entry", "total"])
+def test_docx_over_the_upload_caps_is_refused_before_any_entry_is_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sizes: list[int],
+) -> None:
+    """The upload's sniff refuses such an archive, but the worker extracts stored objects without sniffing them again,
+    and a DOCX stored under the old 200 MB total cap can still be reprocessed. The XML count read each entry whole
+    (a 90 MB entry peaked at ~200 MB) before checking anything: the entry sizes in the zip headers come first now."""
+    data = _docx_with_zero_entries(sizes)
+    read: list[str] = []
+    real_read = zipfile.ZipFile.read
+
+    def recording_read(self: zipfile.ZipFile, name: str | zipfile.ZipInfo, pwd: bytes | None = None) -> bytes:
+        read.append(name.filename if isinstance(name, zipfile.ZipInfo) else name)
+        return real_read(self, name, pwd)
+
+    monkeypatch.setattr(zipfile.ZipFile, "read", recording_read)
+    monkeypatch.setattr(docx, "Document", _fail_if_parsed)
+    with pytest.raises(PermanentError) as err:
+        extract(_file(tmp_path, "big.docx", data), DOCX)
+    assert err.value.code == ErrorCode.UNSAFE_ARCHIVE
+    assert not [name for name in read if name.startswith("word/media/zeros")]
+
+
+def _docx_with_vertical_merge_chain(rows: int) -> bytes:
+    """A one-column table whose first cell starts a vertical merge that every later row continues."""
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    d = docx.Document()
+    d.add_paragraph("Employees receive 18 PTO days per year.")
+    for i, row in enumerate(d.add_table(rows=rows, cols=1).rows):
+        merge = OxmlElement("w:vMerge")
+        if i == 0:
+            merge.set(qn("w:val"), "restart")
+        row.cells[0]._tc.get_or_add_tcPr().append(merge)
+    buf = io.BytesIO()
+    d.save(buf)
+    return buf.getvalue()
+
+
+def test_docx_that_overflows_the_python_stack_is_corrupt_not_retryable(tmp_path: Path) -> None:
+    """python-docx resolves a continued vertical merge by recursing up the rows. A 1,100-row chain (37 KB) burned
+    ~27 s of worker CPU and then escaped as an unexpected RecursionError: 'Reprocess to try again', forever. The
+    stack is lowered here so a short chain shows the same thing quickly."""
+    path = _file(tmp_path, "merged.docx", _docx_with_vertical_merge_chain(300))
+    depth, frame = 0, sys._getframe()
+    while frame is not None:
+        depth, frame = depth + 1, frame.f_back
+    limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(depth + 120)
+    try:
+        with pytest.raises(PermanentError) as err:
+            extract(path, DOCX)
+    finally:
+        sys.setrecursionlimit(limit)
+    assert err.value.code == ErrorCode.CORRUPT_FILE
 
 
 def test_docx_part_with_a_doctype_is_refused(tmp_path: Path) -> None:

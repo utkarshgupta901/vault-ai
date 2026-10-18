@@ -199,6 +199,32 @@ async def test_failures_map_to_codes_on_get_document(
         assert "internal detail" in run.error_message                 # ...in processing_runs and the logs
 
 
+VENDOR_401 = "OpenAI rejected the request (401): Incorrect API key provided: sk-proj-****abcd"
+
+
+@pytest.mark.parametrize("task", ["ingest", "insights"])
+async def test_vendor_error_text_stays_out_of_the_processing_metrics(client: AsyncClient, fake: FakeProvider,
+                                                                    task: str) -> None:
+    """Regression: processing_runs.error_message held the vendor's own text, and /metrics/processing serves it to any
+    API key holder. A 401's text echoes the prefix and last characters of the server's key. Kind and status are
+    stored; the vendor text goes to the log only."""
+    rejected = ProviderError("bad_request", VENDOR_401, None, 401)
+    if task == "ingest":
+        fake.fail_next.append(rejected)                                  # the embed call
+        doc_id = (await upload(client, "a.txt", TEXT)).json()["document"]["id"]
+    else:
+        doc_id = await _ready_doc(client)
+        run = requeue(doc_id, scope="insights")
+        fake.fail_next.append(rejected)                                  # the insights call
+        generate_insights.apply(kwargs={"document_id": doc_id, "run_id": str(run)})
+    failed = runs_of(doc_id, task)[-1]
+    assert (failed.status, failed.error_code) == ("failed", "PROVIDER_BAD_REQUEST")
+    assert failed.error_message == "bad_request (HTTP 401)"
+    body = (await client.get("/api/v1/metrics/processing", headers=DEMO)).text
+    assert "PROVIDER_BAD_REQUEST" in body
+    assert "sk-proj" not in body and "Incorrect API key" not in body
+
+
 # --- advisory lock -------------------------------------------------------------------------------------------------
 
 
@@ -410,6 +436,29 @@ async def test_redelivered_ingest_with_broker_down_marks_insights_failed_retryab
     doc = get_doc(doc_id)
     assert doc.status == "ready"
     assert doc.insights_status == "failed" and doc.insights_error_code == "QUEUE_UNAVAILABLE"
+
+
+async def test_redelivered_ingest_with_broker_down_leaves_insights_another_worker_claimed(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The failure is written only while insights are still pending: an insights task that claimed them between the
+    check and the failed publish (another copy, or a manual reprocess's task) must not be failed under its feet."""
+    from app.core.db import sync_session
+    from app.services import state
+
+    doc_id = await _ready_doc(client)
+    run = _ready_but_insights_never_published(doc_id, monkeypatch)
+
+    def claimed_meanwhile_then_broker_down(document_id: uuid.UUID, run_id: uuid.UUID, *_: Any) -> None:
+        with sync_session() as s:
+            assert s.execute(state.claim_insights_stmt(document_id, run_id)).first() is not None
+        raise QueueUnavailable("connection refused")
+
+    monkeypatch.setattr(attempt_module, "enqueue_insights", claimed_meanwhile_then_broker_down, raising=False)
+    _run_ingest(doc_id, run)
+
+    doc = get_doc(doc_id)
+    assert (doc.status, doc.insights_status, doc.insights_error_code) == ("ready", "processing", None)
 
 
 # --- insights task -------------------------------------------------------------------------------------------------

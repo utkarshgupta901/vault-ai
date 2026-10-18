@@ -63,7 +63,8 @@ _PROVIDER_CODES: dict[str, str] = {
     "bad_request": ErrorCode.PROVIDER_BAD_REQUEST,
 }
 
-# What the user sees in error.message (technical detail goes to processing_runs.error_message and the logs).
+# What the user sees in error.message (technical detail goes to processing_runs.error_message and the logs; a provider
+# error stores only its kind and status there, see ProviderError.summary).
 _USER_MESSAGES: dict[str, str] = {
     ErrorCode.PROVIDER_UNAVAILABLE: "The AI provider was unavailable after several retries. Reprocess to try again.",
     ErrorCode.PROVIDER_BAD_REQUEST: "The AI provider rejected the request for this document.",
@@ -300,7 +301,7 @@ def _execute(task: Task, attempt: Attempt, body: Body) -> None:
                            retry_after=exc.retry_after)
         else:
             code = _PROVIDER_CODES.get(exc.kind, ErrorCode.PROVIDER_BAD_REQUEST)
-            _fail(attempt, code, _USER_MESSAGES[code], detail=exc.message, retryable=False)
+            _fail(attempt, code, _USER_MESSAGES[code], detail=exc.summary(), log_detail=exc.message, retryable=False)
     except PermanentError as exc:
         _fail(attempt, exc.code, exc.message, retryable=False)
     except SoftTimeLimitExceeded:
@@ -353,9 +354,13 @@ def _finish(attempt: Attempt, status: str, code: str | None = None, detail: str 
         s.execute(_finish_stmt(attempt, status, code, detail))
 
 
-def _fail(attempt: Attempt, code: str, message: str, *, retryable: bool, detail: str | None = None) -> None:
-    """Close the attempt and fail the run in ONE transaction (fenced: a superseded run's failure writes nothing)."""
-    log.warning("attempt_failed", kind=attempt.kind, code=code, retryable=retryable, detail=detail or message)
+def _fail(attempt: Attempt, code: str, message: str, *, retryable: bool, detail: str | None = None,
+          log_detail: str | None = None) -> None:
+    """Close the attempt and fail the run in ONE transaction (fenced: a superseded run's failure writes nothing).
+    `detail` is stored in processing_runs, which /metrics/processing serves to the owner's API keys; `log_detail`
+    (vendor text) is logged instead of it and never stored."""
+    log.warning("attempt_failed", kind=attempt.kind, code=code, retryable=retryable,
+                detail=log_detail or detail or message)
     with sync_session() as s:
         s.execute(_finish_stmt(attempt, "failed", code, detail or message))
         s.execute(_fail_document_stmt(attempt.kind, attempt.document_id, attempt.run_id, code, message, retryable))
