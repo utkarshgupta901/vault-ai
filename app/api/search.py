@@ -37,5 +37,8 @@ async def search(
         ge=1, le=40, description="Max hits per document (default: k for one document, else PER_DOC_CAP)")] = None,
 ) -> SearchResponse:
     """Hits carry `rrf`, `sem_rank`, `lex_rank`, `similarity` and `id_hit`:
-    rrf = 1/(RRF_K + sem_rank) + LEXICAL_WEIGHT / (RRF_K + lex_rank), a missing rank contributing 0."""
+    rrf = 1/(RRF_K + sem_rank) + LEXICAL_WEIGHT / (RRF_K + lex_rank) + (1/(RRF_K + 1) if `id_hit`), a missing rank
+    contributing 0. The last term is the identifier boost (D-02, on unless ID_HIT_BOOST is false): a chunk matching
+    an exact identifier (LRK-4471, clause 9.2, "Appendix C") also counts as a rank-1 vector hit, because found by the
+    keyword leg alone it would lose to chunks that are merely okay on both legs and be cut by the per-document cap."""
     return await svc.search(user.id, q=q, document_ids=document_ids, mode=mode, k=k, per_doc_cap=per_doc_cap)

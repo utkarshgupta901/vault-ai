@@ -36,12 +36,23 @@ WEAK_OVERLAP = 0.2              # below this, the cited chunk barely shares word
 MIN_BARE_NUMBER = Decimal(10)   # "3 years" is not checked; "18 days" and "2026" are
 SNIPPET_MAX_CHARS = 300
 
-CITATION_GROUP_RE = re.compile(r"\[(S\d+(?:\s*[,;]\s*S?\d+)*)\]")   # [S1]  [S1, S2]  [S1; 3]
-_REF_NUMBER_RE = re.compile(r"\d+")
+# [S1]  [S1, S2]  [S1; 3]  and the forms models also write: ranges [S1-3] / [S1–S3] and lower case [s1]. Parsing is
+# read-only: the stored and displayed answer keeps the marker exactly as the model wrote it.
+_RANGE_DASH = r"\s*[-–—]\s*"
+_REF_ITEM = rf"S?\d+(?:{_RANGE_DASH}S?\d+)?"
+CITATION_GROUP_RE = re.compile(rf"\[(S\d+(?:{_RANGE_DASH}S?\d+)?(?:\s*[,;]\s*{_REF_ITEM})*)\]", re.IGNORECASE)
+_REF_ITEM_RE = re.compile(rf"(\d+)(?:{_RANGE_DASH}S?(\d+))?", re.IGNORECASE)
+MAX_REF_RANGE = 20      # [S1-20] expands; a wider or reversed range ([S1-999], [S3-1]) keeps only its two ends
 
-# One sentence per line item; inside a line, split after . ! ? — but not when a citation follows ("days. [S1]"
-# belongs to the sentence before it) — and after a citation group that is followed by a new capitalised sentence.
-_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+(?![\s\[])|(?<=\])\s+(?=[A-Z])|\n+")
+# Abbreviations whose period does not end a sentence. Split after "vs.", "up to 18 days vs. 10 days [S1]." would leave
+# "up to 18 days vs.": a fact with no citation, i.e. an uncited claim that forces a low badge on a correct answer.
+_ABBREVIATIONS = ("vs", "e.g", "i.e", "approx", "etc", "no", "inc", "ltd", "dr", "mr", "ms", "cf")
+_NOT_AN_ABBREVIATION = "".join(rf"(?<!\b(?i:{re.escape(a)})\.)" for a in _ABBREVIATIONS)
+
+# One sentence per line item; inside a line, split after . ! ? — but not after an abbreviation, and not when a
+# citation follows ("days. [S1]" belongs to the sentence before it) — and after a citation group that is followed by
+# a new capitalised sentence.
+_SENTENCE_SPLIT_RE = re.compile(rf"(?<=[.!?]){_NOT_AN_ABBREVIATION}\s+(?![\s\[])|(?<=\])\s+(?=[A-Z])|\n+")
 
 _SCALE = {"k": 1_000, "thousand": 1_000, "m": 1_000_000, "mm": 1_000_000, "million": 1_000_000,
           "b": 1_000_000_000, "bn": 1_000_000_000, "billion": 1_000_000_000}
@@ -81,11 +92,23 @@ _TODAY_CUE_RE = re.compile(r"\b(?:today(?:['’]s\s+date)?(?:\s+is)?|as\s+of)" +
 
 # --- Citation parsing ------------------------------------------------------------------------------------------
 def parse_refs(text: str) -> list[str]:
-    """All cited refs in order of appearance, normalized to "S<n>" ([S1, 2] -> S1, S2). Duplicates kept."""
+    """All cited refs in order of appearance, normalized to "S<n>" ([S1, 2] -> S1, S2; [s1-3] -> S1, S2, S3).
+    Duplicates kept. Ids that were never provided ([S0], [S9] of 8) are returned too: check_answer reports them."""
     refs: list[str] = []
     for group in CITATION_GROUP_RE.finditer(text or ""):
-        refs.extend(f"S{int(n)}" for n in _REF_NUMBER_RE.findall(group.group(1)))
+        for first, last in _REF_ITEM_RE.findall(group.group(1)):
+            refs.extend(f"S{n}" for n in _expand(int(first), int(last) if last else None))
     return refs
+
+
+def _expand(first: int, last: int | None) -> list[int]:
+    """A range's ids, capped: a typo like [S1-999] must not turn into hundreds of refs, so it keeps its two ends (and
+    S999 is then reported as an invalid citation)."""
+    if last is None:
+        return [first]
+    if first <= last < first + MAX_REF_RANGE:
+        return list(range(first, last + 1))
+    return [first, last]
 
 
 def strip_citations(text: str) -> str:

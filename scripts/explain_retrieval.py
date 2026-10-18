@@ -5,8 +5,9 @@
 
 For each hit it shows the vector rank, the keyword rank and how they add up:
     rrf = 1/(RRF_K + sem_rank) + LEXICAL_WEIGHT * 1/(RRF_K + lex_rank)      (a missing rank contributes 0)
-and checks the recomputed value against the one the API returned. RRF_K / LEXICAL_WEIGHT default to this checkout's
-settings; pass --rrf-k / --w-lex if the server runs with different values.
+          + 1/(RRF_K + 1) when the hit matched an exact identifier          (the identifier boost, D-02)
+and checks the recomputed value against the one the API returned. RRF_K / LEXICAL_WEIGHT / ID_HIT_BOOST default to
+this checkout's settings; pass --rrf-k / --w-lex / --no-id-boost if the server runs with different values.
 """
 
 import argparse
@@ -29,17 +30,33 @@ def leg(rank: int | None, k: int, weight: float = 1.0) -> tuple[float, str]:
     return value, f"{prefix}1/({k}+{rank})"
 
 
-def explain_hit(i: int, hit: dict, rrf_k: int, w_lex: float) -> str:
-    sem, sem_txt = leg(hit["sem_rank"], rrf_k)
-    lex, lex_txt = leg(hit["lex_rank"], rrf_k, w_lex)
-    total = sem + lex
+def boost_leg(id_hit: bool, k: int, enabled: bool) -> tuple[float, str]:
+    """retrieve()'s identifier boost (D-02, the `id_boost` parameter in app/rag/retrieval.py): a chunk that matched an
+    exact identifier also scores as a rank-1 vector hit. Without it every identifier hit would print MISMATCH."""
+    return leg(1, k) if id_hit and enabled else (0.0, "0")
+
+
+def legs(hit: dict, rrf_k: int, w_lex: float, id_boost: bool) -> list[tuple[float, str]]:
+    """The terms of retrieve()'s fused score for one hit: vector leg, keyword leg, identifier boost."""
+    return [leg(hit["sem_rank"], rrf_k), leg(hit["lex_rank"], rrf_k, w_lex), boost_leg(hit["id_hit"], rrf_k, id_boost)]
+
+
+def fused_score(hit: dict, rrf_k: int, w_lex: float, id_boost: bool) -> float:
+    return sum(value for value, _ in legs(hit, rrf_k, w_lex, id_boost))
+
+
+def explain_hit(i: int, hit: dict, rrf_k: int, w_lex: float, id_boost: bool = settings.ID_HIT_BOOST) -> str:
+    sem, lex, boost = legs(hit, rrf_k, w_lex, id_boost)
+    terms = [sem, lex, boost] if boost[0] else [sem, lex]          # show the boost only on hits it applies to
+    total = fused_score(hit, rrf_k, w_lex, id_boost)
     check = "ok" if abs(total - hit["rrf"]) < 1e-5 else f"MISMATCH (api {hit['rrf']:.6f})"
     sim = "-" if hit["similarity"] is None else f"{hit['similarity']:.3f}"
     lines = [
         f"#{i}  {hit['filename']} · {hit['label']} · chunk {hit['chunk_id']}"
         + ("  [identifier match]" if hit["id_hit"] else ""),
         f"    vector rank {hit['sem_rank'] or '-':>3}  (similarity {sim})   keyword rank {hit['lex_rank'] or '-':>3}",
-        f"    rrf = {sem_txt} + {lex_txt} = {sem:.5f} + {lex:.5f} = {total:.5f}   {check}",
+        f"    rrf = {' + '.join(txt for _, txt in terms)} = {' + '.join(f'{v:.5f}' for v, _ in terms)}"
+        f" = {total:.5f}   {check}",
         textwrap.indent(textwrap.fill(hit["snippet"], width=100), "    > "),
     ]
     return "\n".join(lines)
@@ -55,6 +72,7 @@ def main() -> int:
     parser.add_argument("--k", type=int, default=settings.RETRIEVAL_K)
     parser.add_argument("--rrf-k", type=int, default=settings.RRF_K)
     parser.add_argument("--w-lex", type=float, default=settings.LEXICAL_WEIGHT)
+    parser.add_argument("--id-boost", action=argparse.BooleanOptionalAction, default=settings.ID_HIT_BOOST)
     args = parser.parse_args()
 
     params: dict = {"q": args.question, "mode": args.mode, "k": args.k}
@@ -71,11 +89,12 @@ def main() -> int:
     print(f"terms        : {' | '.join(body['terms']) or '(none: vector leg only)'}")
     print(f"identifiers  : {', '.join(body['id_terms']) or '(none)'}   -> ranked first in the keyword leg")
     print(f"top similarity {top}   gate fires below {settings.GATE_MIN_SIMILARITY} unless an identifier matched")
-    print(f"formula      : rrf = 1/({args.rrf_k} + sem_rank) + {args.w_lex:g} x 1/({args.rrf_k} + lex_rank)\n")
+    boost = f" + 1/({args.rrf_k} + 1) on an identifier match" if args.id_boost else ""
+    print(f"formula      : rrf = 1/({args.rrf_k} + sem_rank) + {args.w_lex:g} x 1/({args.rrf_k} + lex_rank){boost}\n")
     if not body["hits"]:
         print("no hits")
     for i, hit in enumerate(body["hits"], start=1):
-        print(explain_hit(i, hit, args.rrf_k, args.w_lex) + "\n")
+        print(explain_hit(i, hit, args.rrf_k, args.w_lex, args.id_boost) + "\n")
     return 0
 
 

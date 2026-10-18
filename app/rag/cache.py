@@ -37,11 +37,13 @@ async def get_cached_vector(text: str) -> list[float] | None:
     except Exception as exc:  # noqa: BLE001 - fail open: a cache problem is a miss
         log.warning("query_cache_get_failed", error=str(exc) or exc.__class__.__name__)
         return None
-    if not raw:
-        return None
     vec = array("f")
+    # Checked on bytes, before unpacking: a value that is not a whole number of float32s (truncated or foreign) would
+    # make frombytes raise, and embed_query would then drop to keyword-only retrieval instead of treating it as a miss.
+    if not raw or len(raw) != settings.EMBED_DIMS * vec.itemsize:
+        return None
     vec.frombytes(raw)
-    return vec.tolist() if len(vec) == settings.EMBED_DIMS else None
+    return vec.tolist()
 
 
 async def set_cached_vector(text: str, vector: list[float]) -> None:

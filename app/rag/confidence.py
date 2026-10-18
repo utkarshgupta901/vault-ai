@@ -2,16 +2,19 @@
 citation signals, so every badge and every refusal can be explained from numbers stored on the message.
 
 Gate: if the best semantic match is weak (top_similarity < GATE_MIN_SIMILARITY) and no identifier matched, the
-documents almost certainly don't cover the question ("what's the weather?"). Answering would cost ~$0.015 and risk a
-hallucination, so we send a fixed refusal instead. The identifier exception matters: "status of LRK-4471?" can embed
-poorly yet match a chunk exactly. With no sources at all there is nothing to ground on, so that also gates.
+documents almost certainly don't cover the question ("what's the weather?"). Answering would cost about half a cent
+(~$0.0053 per model-generated answer with a cold prompt cache, docs/EVAL.md) and risk a hallucination, so we send a
+fixed refusal instead. The identifier exception matters: "status of LRK-4471?" can embed poorly yet match a chunk
+exactly. With no sources at all there is nothing to ground on, so that also gates.
 
 Confidence:
   low    - not answered, any citation with weak support, or any factual sentence without a citation;
   high   - >= 1 valid citation, top_similarity >= TAU_HIGH, (a keyword match on a cited chunk or >= 2 valid
            citations), and no invalid citation ids;
   medium - everything else.
-TAU_HIGH is calibrated by the eval (25th percentile of top similarity among correct answers).
+TAU_HIGH (0.50) was set by hand in the first commit and later checked against the eval, not fitted to it: on the
+final run every badge bucket was 100% accurate, and it was kept at 0.50 rather than lowered for a demo case at 0.49
+(docs/EVAL.md, docs/DECISIONS.md D-06).
 """
 
 from collections.abc import Sequence

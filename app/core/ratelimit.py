@@ -13,9 +13,14 @@ request through (fail open). Money is still protected by the daily quota, which 
 every route that starts paid model work: chat, summaries, compare, upload (embeddings + insights) and reprocess.
 
 Quota: sum(ai_usage.cost_usd) since UTC midnight >= users.daily_cost_limit_usd -> 429 QUOTA_EXCEEDED until midnight.
-It is SOFT (check-then-act): N requests arriving together can all pass the check before any of them records its cost,
-so the overshoot is bounded by in-flight requests x the cost of one answer (about $0.03). A hard quota would reserve
-an estimated cost before the call and settle it after; deferred.
+It is SOFT (check-then-act): N requests arriving together can all pass the check before any of them records its cost.
+For chat, which records its cost before the request ends, the overshoot is bounded by in-flight requests x the cost
+of one turn (about $0.006: docs/EVAL.md measures ~$0.0053 per model-generated answer with a cold prompt cache, and
+the condense, follow-up and embedding calls add about $0.001). Summaries and compare also record within the request,
+but one call costs more the longer the documents are. Uploads and reprocesses are NOT bounded this way (known
+limitation): their embeddings and insights calls are recorded later by the worker, so every one queued before the
+worker records its cost passes the check, and only the per-minute limit caps them.
+A hard quota would reserve an estimated cost before the call and settle it after; deferred.
 
 Usage (route groups have separate counters, so a burst of uploads never blocks chatting):
     router = APIRouter(dependencies=CHAT_GUARDS)            # or @router.post(..., dependencies=AI_GUARDS)
