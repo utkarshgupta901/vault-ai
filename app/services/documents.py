@@ -56,9 +56,11 @@ def to_out(doc: Document) -> DocumentOut:
 def clean_filename(raw: str | None) -> str:
     """The client's filename as stored and shown: its last path component, at most 255 characters, with control
     characters replaced by '_'. Postgres refuses NUL in TEXT (the upload failed as a 500), and CR/LF or ESC would
-    forge or garble log lines; any other Unicode is kept as typed."""
+    forge or garble log lines; any other Unicode is kept as typed. A name with nothing to show ("/", "   ", "..")
+    becomes "upload", like a missing one: it would otherwise list as a blank row."""
     name = PurePath(raw or "upload").name
-    return "".join("_" if unicodedata.category(c) == "Cc" else c for c in name)[:255]
+    cleaned = "".join("_" if unicodedata.category(c) == "Cc" else c for c in name)[:255]
+    return cleaned if cleaned.strip() not in ("", ".", "..") else "upload"
 
 
 async def _delete_orphan(key: str) -> None:
@@ -93,6 +95,12 @@ async def _check_backpressure() -> None:
 
 
 async def _enqueue_or_fail(db: AsyncSession, doc: Document, run_id: uuid.UUID) -> None:
+    """Publish the ingest task; if the broker is unavailable, fail the run as retryable (and answer 503).
+
+    The publish can wait up to its timeout (PUBLISH_TIMEOUT_S), so the read transaction the caller's db.refresh(doc)
+    opened is ended first: a pool connection must not sit idle in transaction meanwhile. expire_on_commit=False keeps
+    `doc` loaded."""
+    await db.commit()
     try:
         await aenqueue_ingest(doc.id, run_id, get_request_id())
     except QueueUnavailable as exc:
@@ -145,6 +153,8 @@ async def upload(db: AsyncSession, owner_id: uuid.UUID, file: UploadFile) -> Upl
         # Any other failure (e.g. a value Postgres refuses): the row was not written and nothing points at the
         # object, so it would stay in the bucket forever. Kept only when the outcome is unknown, a dropped connection
         # or a cancellation (not an Exception) during COMMIT: the row may exist, and a row without its file is worse.
+        # Rolled back first, so the failed session gives its pool connection back before the S3 DELETE (and retries).
+        await db.rollback()
         if not (isinstance(exc, DBAPIError) and exc.connection_invalidated):
             await _delete_orphan(key)
         raise
@@ -237,7 +247,9 @@ def _check_reprocess_allowed(doc: Document, scope: str) -> None:
 
 async def _enqueue_insights_or_fail(db: AsyncSession, doc: Document, run_id: uuid.UUID) -> None:
     """Like _enqueue_or_fail, for an insights-only run. Without marking the run failed, insights would stay
-    'pending' under a run that no task will ever claim, and every retry would be refused as already in progress."""
+    'pending' under a run that no task will ever claim, and every retry would be refused as already in progress.
+    Ends the caller's read transaction first, for the same reason."""
+    await db.commit()
     try:
         await aenqueue_insights(doc.id, run_id, get_request_id())
     except QueueUnavailable as exc:

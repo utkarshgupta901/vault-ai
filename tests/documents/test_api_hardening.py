@@ -63,6 +63,11 @@ def test_content_disposition_fallback_cannot_break_the_header() -> None:
     ("Q3 report — final 契約 Résumé.txt", "Q3 report — final 契約 Résumé.txt"),   # any other Unicode is kept
     ("dir/sub/x.txt", "x.txt"),
     (None, "upload"),
+    ("/", "upload"),                                            # no last component at all
+    ("   ", "upload"),                                          # nothing to show in the list
+    (".", "upload"),
+    ("..", "upload"),
+    ("dir/..", "upload"),
 ])
 def test_clean_filename(raw: str | None, stored: str) -> None:
     assert svc.clean_filename(raw) == stored
