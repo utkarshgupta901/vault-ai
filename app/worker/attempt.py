@@ -219,8 +219,10 @@ def _republish_lost_insights(document_id: uuid.UUID, run_id: uuid.UUID, request_
     and then lost its worker before publishing the insights task (acks_late redelivers the ingest message, but
     nobody would ever publish insights). Publish them now.
 
-    A duplicate insights task is harmless: its claim is fenced by run_id and only matches insights pending/processing,
-    and the insights lock runs copies one at a time, so a second copy finds them ready (or failed) and stops."""
+    A duplicate insights task is usually harmless: its claim is fenced by run_id and only matches insights
+    pending/processing, and the insights lock runs copies one at a time, so a second copy finds them ready (or
+    failed) and stops. A duplicate consumed while the original waits for a retry can claim and run once more (one
+    extra model call at most); the run fence stops any stale write."""
     with sync_session() as s:
         lost = s.scalar(select(Document.id).where(
             Document.id == document_id, Document.current_run_id == run_id,

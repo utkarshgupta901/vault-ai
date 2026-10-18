@@ -2,8 +2,8 @@
 
 **Tool:** Claude Code (Opus 5.5) in the terminal: plan mode, multi-agent workflows, subagents working in isolated
 git worktrees, and the evaluation harness as the arbiter. **Time:** one day, plus a pre-demo pass the next day.
-**Result:** ~9.3k lines of Python in app/ (plus ~8.3k in tests), ~5.5k lines of TypeScript, ~615 tests, a 43-case
-evaluation, deployment config.
+**Result:** ~9.3k lines of Python in app/ (plus ~8.3k in tests), ~5.5k lines of TypeScript, ~615 tests (~850 after
+the 2026-10-18 review), a 43-case evaluation, deployment config.
 
 The short version: I used AI to **explore, build in parallel, and attack its own work**, and kept the decisions,
 contracts and verification with me. The chronological log with timestamps is in
@@ -79,12 +79,19 @@ stopword), remote images in model output as a prompt-injection exfiltration path
 un-regeneratable, a 500 on non-Latin-1 download filenames. Four fix agents worked in parallel worktrees on disjoint
 areas, each adding regression tests.
 
+A second review on 2026-10-18 went over the whole repo again with four reviewers, static analysis and dependency
+audits. It found no critical issue and no cross-tenant path, but found operational gaps (readiness that said "ok"
+under a revoked key, a download holding a DB connection for the whole stream, billed calls missing from the ledger).
+The fixes are on the `review-fixes` branch, which merges only after the evals pass again with a working key:
+[docs/REVIEW.md](docs/REVIEW.md).
+
 ## 6. Guardrails that made AI-written code trustworthy
 
 - **Frozen contracts + file ownership**: agents could not drift from the schema, SSE contract or each other.
 - **CLAUDE.md hard rules**, checked again by reviewers (e.g. a DB session held across a streaming LLM call, unescaped
   document text in a prompt, a status write not fenced by `run_id`).
-- **Offline FakeProvider**: ~615 tests run against real Postgres/pgvector with zero API cost.
+- **Offline FakeProvider**: ~615 tests (~850 since the 2026-10-18 review) run against real Postgres/pgvector with
+  zero API cost.
 - **Measure, don't assume**: model latency (TTFT p50/p95), retrieval ranks per case, cost per answer, all from real
   runs; README numbers are copied from reports, with the report id and the prompt-cache state.
 - **Honest log**: what went wrong is recorded (usage limit, withdrawn MinIO images, the bugs above), because that is

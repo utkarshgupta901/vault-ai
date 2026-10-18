@@ -4,7 +4,8 @@
 
 Checks, in the order they matter on demo day:
   - the API is reachable (/health/live) and ready (/health/ready), with every dependency check listed; the AI check
-    is soft (WARN), except that a key or model the provider rejects (auth_failed) FAILs: no chat turn can work;
+    is soft (WARN), except that a key or model the provider rejects (auth_failed) FAILs: at least one AI feature is
+    broken or degraded (a revoked key breaks them all; a missing answer model sends every answer to the fallback);
   - both Celery queues (ingest, ai) have a consumer: without them uploads queue forever;
   - the API key works;
   - the demo corpus (plus any real document in demo_docs/user/) is present, ready and has insights (pre-seeded by
@@ -60,7 +61,7 @@ def assess_ready(status_code: int, body: dict[str, Any]) -> list[Check]:
     for name, c in (body.get("checks") or {}).items():
         extra = {k: v for k, v in c.items() if k not in ("ok", "ms")}
         detail = f"{c.get('ms', '-')} ms" + (f" {extra}" if extra else "")
-        # A rejected AI key/model: the API still serves (so readiness only says degraded), but no answer can work.
+        # A rejected AI key/model: the API still serves (so readiness only says degraded), but an AI feature is broken.
         bad = "FAIL" if name in HARD_DEPENDENCIES or c.get("auth_failed") else "WARN"
         checks.append(Check("PASS" if c.get("ok") else bad, f"  {name}", detail))
     return checks

@@ -150,8 +150,10 @@ def is_stale(status: str, updated_at: datetime, now: datetime, stale_minutes: in
 
 
 def is_insights_stale(insights_status: str, updated_at: datetime, now: datetime, stale_minutes: int) -> bool:
-    """Insights that say pending/processing but have made no progress for `stale_minutes`: the task was lost
-    (lock wait gave up, hard time limit, worker died between 'ready' and the insights publish). Same clock as
+    """Insights that say pending/processing but have made no progress for `stale_minutes`: the task was lost (its
+    worker was killed past the hard time limit, or the broker lost the message without redelivering it). A lock wait
+    that gives up and a worker that dies between 'ready' and the insights publish no longer end here: the first fails
+    insights as retryable, and the redelivered ingest publishes them again (worker/attempt.py). Same clock as
     is_stale: insights only run once status=ready, and every insights write (claim, ready, failed) sets updated_at,
     while a healthy attempt is cut off by the 9-minute soft limit long before 15 minutes pass without a write."""
     return insights_status in INSIGHTS_IN_FLIGHT and _idle(updated_at, now, stale_minutes)

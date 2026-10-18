@@ -59,8 +59,10 @@ INSPECT_TIMEOUT_S = 1.0        # how long Celery waits for worker replies (the c
 _WAIT_POLL_S = 0.05
 CHECK_FAILED = "check failed (see the API log)"
 # Errors that mean the dependency could not be reached at all. Anything else reached it and failed there (a missing
-# table, a rejected password) and is reported as CHECK_FAILED, so nobody debugs the network for a schema problem.
-# redis-py's AuthenticationError is a ConnectionError subclass, hence the exception to the exception.
+# table, a rejected Valkey password) and is reported as CHECK_FAILED, so nobody debugs the network for a schema
+# problem. redis-py's AuthenticationError is a ConnectionError subclass, hence the exception to the exception. Known
+# gap: psycopg raises OperationalError for every failure while connecting, so a rejected Postgres password or a
+# missing database still reads "unreachable" (docs/REVIEW.md, deferred lows).
 _UNREACHABLE_ERRORS = (OSError, sqlalchemy.exc.OperationalError, sqlalchemy.exc.InterfaceError,
                        redis.exceptions.ConnectionError, kombu.exceptions.OperationalError)
 _REACHED_ERRORS = (redis.exceptions.AuthenticationError,)

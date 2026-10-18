@@ -129,7 +129,7 @@ snapshot-demo: ## Save the demo DB + S3 objects to demo_snapshot/ (refuses unles
 restore-demo: ## Restore the demo DB + S3 objects from demo_snapshot/ (overwrites current data)
 	bash scripts/restore_demo.sh
 
-doctor: ## Pre-demo checks: health, workers, API key, seeded docs + insights, spend, retrieval
+doctor: ## Pre-demo checks: health (FAIL on a rejected AI key/model), workers, API key, seeded docs + insights, spend, retrieval, one live embeddings call (fractions of a cent)
 	uv run python scripts/doctor.py --api $(API) --key $(KEY)
 
 workers: ## Which workers consume which queues

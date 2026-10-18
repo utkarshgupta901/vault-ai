@@ -22,13 +22,18 @@ Nothing is written to local disk except temp files during extraction.
 3. In Render: **New > Blueprint**, pick the repo. Render reads `render.yaml` and asks for every `sync: false` value:
    `OPENAI_API_KEY`, `S3_ENDPOINT_URL`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, and the three `SEED_*_API_KEY`
    values (choose long random strings; only their sha256 is stored). Secrets are entered for both the API and the
-   worker.
+   worker. With `APP_ENV=prod` (set by the Blueprint) the API, the worker and the pre-deploy bootstrap refuse to start
+   (or to seed) when an S3 key or a given `SEED_*_API_KEY` is empty or still the repo default (`app/config.py`,
+   `app/cli.py`), so a forgotten value fails the deploy instead of shipping the public demo keys.
 4. Deploy. The pre-deploy step migrates and seeds; when `vault-api` is live, open its URL: the dashboard loads from
    the same origin. Put the demo API key in the dashboard's Settings.
 5. Check `GET /health/ready`: `status: ok` means the hard checks pass (DB reachable, pgvector installed, schema at
    Alembic head; otherwise 503 `unavailable`) and Redis, a consumer on both worker queues, the storage bucket and the
-   AI provider (key set, recent calls not failing) are healthy; `degraded` (still 200) means a soft check failed: look
-   for the `checks.<name>` with `ok: false` (most include an `error`).
+   AI provider (key set, key and models not rejected, neither embeddings nor generation failing) are healthy;
+   `degraded` (still 200) means a soft check failed: look for the `checks.<name>` with `ok: false`. Its `error` is
+   generic on purpose (the endpoint needs no key): `unreachable`, `check failed (see the API log)` or `timed out after
+   2s`; the detail is in the API log (`health_check_failed`). A rejected OpenAI key or a missing model shows as
+   `checks.ai.auth_failed: true` with the HTTP status, path and model in its `error`.
 
 ## Cloud-specific details handled in code
 
