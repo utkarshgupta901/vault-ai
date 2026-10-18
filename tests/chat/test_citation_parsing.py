@@ -87,6 +87,21 @@ def test_ranges_and_lowercase_markers_are_parsed(text: str, refs: list[str]) -> 
     assert parse_refs(text) == refs
 
 
+@pytest.mark.parametrize("dash", ["\u2010", "\u2011", "\u2212"], ids=["hyphen", "non-breaking-hyphen", "minus"])
+def test_ranges_written_with_any_hyphen_are_parsed_and_stripped(dash: str) -> None:
+    """GPT-5-family models often write U+2011 (the date check already accepts it). Such a range was neither parsed
+    (the answer lost its citations: ungrounded, a low badge) nor stripped from history."""
+    assert parse_refs(f"A [S1{dash}3].") == ["S1", "S2", "S3"]
+    assert parse_refs(f"A [S1 {dash} S2; 4].") == ["S1", "S2", "S4"]
+    assert strip_citations(f"Employees get 18 days [S1{dash}2].") == "Employees get 18 days."
+    sources = {"S1": PTO["S1"], "S2": Source("Handbook (p. 5)", "Employees get up to 18 days of PTO per year.")}
+    answer = f"Employees get up to 18 days of PTO per year [S1{dash}2]."
+    check = check_answer(answer, sources)
+    assert check.answer_type == "answered" and check.uncited_claims == 0
+    assert [c.ref for c in check.citations] == ["S1", "S2"]
+    assert _badge(answer, sources) == "high"                  # was low: "ungrounded", no citation found
+
+
 def test_absurd_or_reversed_ranges_keep_only_their_ends() -> None:
     assert parse_refs("A [S1-999].") == ["S1", "S999"]        # never expands into hundreds of refs
     assert parse_refs("A [S3-S1].") == ["S3", "S1"]

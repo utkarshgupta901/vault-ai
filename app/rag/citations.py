@@ -37,8 +37,10 @@ MIN_BARE_NUMBER = Decimal(10)   # "3 years" is not checked; "18 days" and "2026"
 SNIPPET_MAX_CHARS = 300
 
 # [S1]  [S1, S2]  [S1; 3]  and the forms models also write: ranges [S1-3] / [S1–S3] and lower case [s1]. Parsing is
-# read-only: the stored and displayed answer keeps the marker exactly as the model wrote it.
-_RANGE_DASH = r"\s*[-–—]\s*"
+# read-only: the stored and displayed answer keeps the marker exactly as the model wrote it. A range may use any dash
+# models write: hyphen-minus, U+2010 hyphen, U+2011 non-breaking hyphen (common from GPT-5-family models), en and em
+# dash, U+2212 minus. frontend/src/lib/citations.ts mirrors this grammar to draw the chips.
+_RANGE_DASH = r"\s*[-\u2010\u2011\u2013\u2014\u2212]\s*"
 _REF_ITEM = rf"S?\d+(?:{_RANGE_DASH}S?\d+)?"
 CITATION_GROUP_RE = re.compile(rf"\[(S\d+(?:{_RANGE_DASH}S?\d+)?(?:\s*[,;]\s*{_REF_ITEM})*)\]", re.IGNORECASE)
 _REF_ITEM_RE = re.compile(rf"(\d+)(?:{_RANGE_DASH}S?(\d+))?", re.IGNORECASE)
