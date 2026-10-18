@@ -2,7 +2,8 @@
 
 Sandwich layout (the order is deliberate):
   instructions  = the rules below (system level; nothing in a document can edit them)
-  input[0..n-2] = prior turns as separate user/assistant messages, [S#] markers stripped (numbers restart each turn)
+  input[0..n-2] = prior turns as separate user/assistant messages, escaped, [S#] markers stripped (numbers restart
+                  each turn)
   input[n-1]    = Today's date + <sources> (escaped, untrusted) + a one-line restatement of the task + the question
 The task restatement and the question come AFTER the sources on purpose: after ~4k tokens of document text the last
 thing the model reads is what we asked, not whatever the final source says.
@@ -95,8 +96,10 @@ def render(
     sources: Sequence[PromptSource],
     today: date,
 ) -> tuple[str, str, list[Msg]]:
-    """Build (prompt_version, instructions, input messages). History messages are already [S#]-stripped; they are
-    separate messages with their own role boundaries, so there is no tag structure in them to escape."""
+    """Build (prompt_version, instructions, input messages). History messages are already [S#]-stripped. They keep
+    their own roles but are escaped like the question (hard rule 5): a past question is user text and a past answer
+    echoes document text, and either could otherwise forge a <sources> block ahead of the real one."""
     prompt_version, instructions = instructions_for(version)
     last = final_turn(question=question, standalone=standalone, sources=sources, today=shown_today(version, today))
-    return prompt_version, instructions, [*history, Msg(role="user", content=last)]
+    prior = [Msg(role=m["role"], content=escape(m["content"])) for m in history]
+    return prompt_version, instructions, [*prior, Msg(role="user", content=last)]

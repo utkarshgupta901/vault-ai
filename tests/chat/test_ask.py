@@ -4,9 +4,11 @@ idempotency, SESSION_BUSY, fallback model, time budgets and client disconnects."
 import asyncio
 import base64
 import re
+import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import date
+from functools import partial
 from typing import Any
 
 import pytest
@@ -19,7 +21,7 @@ from app.ai.fake_provider import FakeProvider
 from app.ai.provider import ProviderError, StreamEnd, Usage
 from app.config import Settings, settings
 from app.core.pagination import encode_cursor
-from app.schemas.chat import MessageCreate, TokenEvent
+from app.schemas.chat import CitationsEvent, MessageCreate, TokenEvent
 from app.services import chat as svc
 from tests.chat.helpers import API, ask_json, ask_stream, new_session, parse_sse, upload_ready
 from tests.conftest import DEMO
@@ -579,3 +581,263 @@ async def test_condense_call_cut_off_by_a_disconnect_is_recorded(
                            "WHERE operation = 'condense' AND message_id = :id", id=turn.assistant_message_id)
     assert len(rows) == 1 and rows[0]["estimated"] is True and rows[0]["success"] is False
     assert rows[0]["input_tokens"] > 0
+
+
+# --- failure paths: what the client sees, what is saved, what is billed -----------------------------------------
+class PerModelStreamProvider(FakeProvider):
+    """FakeProvider whose answer stream for a scripted model replays a fixed list: text deltas, a StreamEnd, or an
+    exception raised at that point. A model without a script answers like FakeProvider."""
+
+    def __init__(self, scripts: dict[str, list[str | StreamEnd | Exception]]) -> None:
+        super().__init__()
+        self.scripts = scripts
+
+    async def astream_text(self, *, model: str, effort: str, instructions: str, input: Any,
+                           max_output_tokens: int) -> AsyncIterator[str | StreamEnd]:
+        if model not in self.scripts:
+            async for item in super().astream_text(model=model, effort=effort, instructions=instructions,
+                                                   input=input, max_output_tokens=max_output_tokens):
+                yield item
+            return
+        self.calls.append({"op": "stream", "model": model})
+        for item in self.scripts[model]:
+            if isinstance(item, Exception):
+                raise item
+            yield item
+
+
+VENDOR_TEXT = "Incorrect API key provided: vendor-detail-7731"
+
+
+def _end(model: str, *, status: str = "completed", output_tokens: int = 12) -> StreamEnd:
+    return StreamEnd(usage=Usage(model=model, input_tokens=100, output_tokens=output_tokens), status=status)
+
+
+async def _last_answer(client: AsyncClient, session_id: str) -> dict[str, Any]:
+    return (await client.get(f"{API}/chat/sessions/{session_id}/messages", headers=DEMO)).json()["items"][-1]
+
+
+async def _answer_usage_rows(db: AsyncSession, message_id: Any) -> list[Any]:
+    return await _rows(db, "SELECT model, success, error_code, estimated, input_tokens, output_tokens FROM ai_usage "
+                           "WHERE operation = 'answer' AND message_id = :m ORDER BY id", m=message_id)
+
+
+async def test_provider_error_text_never_reaches_the_client(
+    client: AsyncClient, session_id: str, db: AsyncSession
+) -> None:
+    """Regression: the `error` event and the JSON 502 quoted the vendor's own error text (a 401 explains what is wrong
+    with the API key). The client gets the code and a generic message; the detail goes to the logs only."""
+    error = ProviderError("bad_request", f"OpenAI rejected the request (401): {VENDOR_TEXT}", status_code=401)
+    set_provider(PerModelStreamProvider({settings.ANSWER_MODEL: [error], settings.FAST_MODEL: [error]}))
+    sse = await ask_stream(client, session_id, QUESTION)
+    events = parse_sse(sse.text)
+    assert _names(events) == ["meta", "error"] and events[-1][1]["code"] == "UPSTREAM_AI_ERROR"
+    as_json = await ask_json(client, session_id, QUESTION)
+    assert as_json.status_code == 502 and as_json.json()["error"]["code"] == "UPSTREAM_AI_ERROR"
+    history = await client.get(f"{API}/chat/sessions/{session_id}/messages", headers=DEMO)
+    stored = await _rows(db, "SELECT m.*, u.error_code AS usage_error FROM chat_messages m "
+                             "LEFT JOIN ai_usage u ON u.message_id = m.id")
+    for seen in (sse.text, as_json.text, history.text, str(stored)):
+        assert "vendor-detail-7731" not in seen and "API key" not in seen
+
+
+async def test_both_models_failing_before_the_first_token_is_an_error_billed_at_zero(
+    client: AsyncClient, session_id: str, db: AsyncSession
+) -> None:
+    """Neither attempt produced anything (5xx), so neither was billed: two zero-token rows. Regression: the second
+    one was a full-prompt estimate, which inflated the daily quota and the cost metrics."""
+    error = ProviderError("transient", "OpenAI server error (500).", status_code=500)
+    set_provider(PerModelStreamProvider({settings.ANSWER_MODEL: [error], settings.FAST_MODEL: [error]}))
+    events = parse_sse((await ask_stream(client, session_id, QUESTION)).text)
+    assert _names(events) == ["meta", "error"] and events[-1][1]["code"] == "UPSTREAM_AI_ERROR"
+    answer = await _last_answer(client, session_id)
+    assert answer["status"] == "failed" and answer["content"] == "" and answer["warnings"] == ["fallback_model"]
+    assert answer["input_tokens"] == 0 and answer["output_tokens"] == 0
+    zero = {"success": False, "error_code": "UPSTREAM_AI_ERROR", "estimated": False, "input_tokens": 0,
+            "output_tokens": 0}
+    assert await _answer_usage_rows(db, answer["id"]) == [{"model": settings.ANSWER_MODEL, **zero},
+                                                          {"model": settings.FAST_MODEL, **zero}]
+
+
+async def test_provider_error_after_the_first_token_fails_without_fallback(
+    client: AsyncClient, session_id: str, db: AsyncSession
+) -> None:
+    """Once text was shown, another model would contradict it: no fallback, the partial answer is kept as failed and
+    billed as an estimate (the stream's own usage event never came)."""
+    cut = ProviderError("transient", "OpenAI stream failed: response.failed")
+    provider = PerModelStreamProvider({settings.ANSWER_MODEL: ["Employees receive ", "18 PTO days ", cut]})
+    set_provider(provider)
+    events = parse_sse((await ask_stream(client, session_id, QUESTION)).text)
+    assert _names(events) == ["meta", "token", "token", "error"] and events[-1][1]["code"] == "UPSTREAM_AI_ERROR"
+    assert [c["model"] for c in provider.calls if c["op"] == "stream"] == [settings.ANSWER_MODEL]
+    answer = await _last_answer(client, session_id)
+    assert answer["status"] == "failed" and answer["content"] == "Employees receive 18 PTO days "
+    assert answer["warnings"] == []
+    rows = await _answer_usage_rows(db, answer["id"])
+    assert len(rows) == 1 and rows[0]["model"] == settings.ANSWER_MODEL and rows[0]["success"] is False
+    assert rows[0]["error_code"] == "UPSTREAM_AI_ERROR" and rows[0]["estimated"] is True
+    assert rows[0]["input_tokens"] > 0 and rows[0]["output_tokens"] > 0
+
+
+@pytest.mark.parametrize("first_attempt", [
+    pytest.param([_end(settings.ANSWER_MODEL, status="incomplete", output_tokens=4000)], id="no-text-budget-spent"),
+    pytest.param([" ", "\n", _end(settings.ANSWER_MODEL, output_tokens=4000)], id="whitespace-only"),
+    pytest.param([ProviderError("refusal", "The model refused.", usage=Usage(model=settings.ANSWER_MODEL,
+                                                                             input_tokens=100, output_tokens=4000))],
+                 id="refusal"),
+])
+async def test_first_attempt_without_answer_text_falls_back(
+    client: AsyncClient, session_id: str, db: AsyncSession, first_attempt: list[Any]
+) -> None:
+    """Regression: a stream that ended without text (reasoning spent the whole output budget) was saved as an empty
+    'complete' answer. Nothing was shown yet, so it is a failed first attempt like any other: fall back. Its row keeps
+    the usage the provider reported, because those tokens were billed."""
+    set_provider(PerModelStreamProvider({settings.ANSWER_MODEL: first_attempt}))
+    events = parse_sse((await ask_stream(client, session_id, QUESTION)).text)
+    assert _names(events)[-1] == "done" and events[-1][1]["model"] == settings.FAST_MODEL
+    assert "".join(d["delta"] for n, d in events if n == "token").startswith("Based on the documents")
+    answer = await _last_answer(client, session_id)
+    assert answer["status"] == "complete" and answer["warnings"] == ["fallback_model"]
+    first, second = await _answer_usage_rows(db, answer["id"])
+    assert first == {"model": settings.ANSWER_MODEL, "success": False, "error_code": "UPSTREAM_AI_ERROR",
+                     "estimated": False, "input_tokens": 100, "output_tokens": 4000}
+    assert second["model"] == settings.FAST_MODEL and second["success"] is True
+
+
+async def test_no_answer_text_from_either_model_is_failed_not_an_empty_complete(
+    client: AsyncClient, session_id: str, db: AsyncSession
+) -> None:
+    """Regression: the empty answer was saved 'complete', so every retry with the same client_message_id replayed
+    it. Now it is UPSTREAM_AI_ERROR, and the retry regenerates on the same user row."""
+    set_provider(PerModelStreamProvider({
+        settings.ANSWER_MODEL: [_end(settings.ANSWER_MODEL, status="incomplete", output_tokens=4000)],
+        settings.FAST_MODEL: [" ", _end(settings.FAST_MODEL, status="incomplete", output_tokens=4000)]}))
+    r = await ask_json(client, session_id, QUESTION, client_message_id="c-empty")
+    assert r.status_code == 502, r.text
+    assert r.json()["error"]["code"] == "UPSTREAM_AI_ERROR"
+    failed = await _last_answer(client, session_id)
+    assert failed["status"] == "failed" and failed["content"] == ""
+    rows = await _answer_usage_rows(db, failed["id"])
+    assert [(u["model"], u["output_tokens"], u["estimated"]) for u in rows] == [
+        (settings.ANSWER_MODEL, 4000, False), (settings.FAST_MODEL, 4000, False)]       # both were billed
+
+    set_provider(FakeProvider())
+    retry = (await ask_json(client, session_id, QUESTION, client_message_id="c-empty")).json()
+    assert retry["answer"]["status"] == "complete" and retry["answer"]["content"]
+    assert retry["answer"]["id"] != failed["id"] and retry["user_message"]["id"] == failed["reply_to_id"]
+
+
+def _wrap_final_commit(monkeypatch: pytest.MonkeyPatch,
+                       wrap: Callable[[Callable[[], Awaitable[None]]], Awaitable[None]]) -> None:
+    """Route the commit of the save that stores the complete answer through wrap(real_commit). That save opens the
+    first DB session after the citations are checked."""
+    armed: list[bool] = []
+    real_citations_event, real_session = svc._citations_event, svc.async_session
+
+    def citations_event(*args: Any) -> Any:
+        armed.append(True)
+        return real_citations_event(*args)
+
+    def session() -> AsyncSession:
+        db_session = real_session()
+        if armed:
+            armed.clear()
+            db_session.commit = partial(wrap, db_session.commit)      # type: ignore[method-assign]
+        return db_session
+
+    monkeypatch.setattr(svc, "_citations_event", citations_event)
+    monkeypatch.setattr(svc, "async_session", session)
+
+
+async def _saved_turn(db: AsyncSession, message_id: uuid.UUID | None) -> tuple[dict[str, Any], list[str]]:
+    msg = (await _rows(db, "SELECT status, confidence, citations FROM chat_messages WHERE id = :id", id=message_id))[0]
+    usage = await _rows(db, "SELECT operation FROM ai_usage WHERE message_id = :id ORDER BY id", id=message_id)
+    return dict(msg), [u["operation"] for u in usage]
+
+
+async def test_disconnect_at_the_citations_event_keeps_the_answer_complete(
+    client: AsyncClient, session_id: str, demo_user_id: uuid.UUID, db: AsyncSession
+) -> None:
+    """Regression: the answer was saved only after the `citations` event was sent, so a client leaving right then
+    left a fully streamed answer stored as 'interrupted'."""
+    turn = await _turn(client, session_id, demo_user_id)
+    events = svc.answer(turn)
+    async for event in events:
+        if isinstance(event, CitationsEvent):
+            break
+    await events.aclose()                       # what the SSE layer does when the client goes away
+    msg, operations = await _saved_turn(db, turn.assistant_message_id)
+    assert msg["status"] == "complete" and msg["confidence"] and msg["citations"]
+    assert operations == ["embed_query", "answer"]
+
+
+async def test_cancel_right_after_the_final_commit_does_not_save_the_turn_twice(
+    client: AsyncClient, session_id: str, demo_user_id: uuid.UUID, db: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: the turn counted as saved only once the DB session had closed. A cancel landing in between (the
+    commit already done) let answer()'s cleanup save it again as 'interrupted', with its ai_usage rows a second time."""
+    async def commit_then_cancel(commit: Callable[[], Awaitable[None]]) -> None:
+        await commit()
+        asyncio.current_task().cancel()         # type: ignore[union-attr]  # delivered at the next await
+
+    turn = await _turn(client, session_id, demo_user_id)
+    _wrap_final_commit(monkeypatch, commit_then_cancel)
+
+    async def drain() -> None:
+        async for _ in svc.answer(turn):
+            pass
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.create_task(drain())
+    msg, operations = await _saved_turn(db, turn.assistant_message_id)
+    assert msg["status"] == "complete" and msg["confidence"] and msg["citations"]
+    assert operations == ["embed_query", "answer"]
+
+
+async def test_json_deadline_during_the_final_save_waits_for_it(
+    client: AsyncClient, session_id: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The complete save is shielded: the JSON deadline (like a disconnect) expiring mid-commit lets it finish.
+    Regression: the commit was cut, the cleanup stored the answer as 'interrupted' and the client got a 504."""
+    async def slow_commit(commit: Callable[[], Awaitable[None]]) -> None:
+        await asyncio.sleep(2.5)
+        await commit()
+
+    monkeypatch.setattr(settings, "JSON_ANSWER_TIMEOUT_S", 2.0)
+    _wrap_final_commit(monkeypatch, slow_commit)
+    r = await ask_json(client, session_id, QUESTION)
+    assert r.status_code == 200, r.text
+    assert r.json()["answer"]["status"] == "complete" and r.json()["answer"]["citations"]
+
+
+async def test_json_deadline_during_followups_returns_the_saved_answer(
+    client: AsyncClient, session_id: str, monkeypatch: pytest.MonkeyPatch, db: AsyncSession
+) -> None:
+    """Regression: the JSON deadline also covered the best-effort follow-ups, so a slow follow-ups call turned an
+    answer already saved 'complete' into a 504. It is returned without chips instead."""
+    monkeypatch.setattr(settings, "JSON_ANSWER_TIMEOUT_S", 3.0)        # FOLLOWUPS_TIMEOUT_S (8 s) is longer
+    set_provider(HangingJsonProvider("FollowupQuestions"))
+    started = time.perf_counter()
+    r = await ask_json(client, session_id, QUESTION)
+    assert r.status_code == 200, r.text
+    assert time.perf_counter() - started < 6
+    answer = r.json()["answer"]
+    assert answer["status"] == "complete" and answer["citations"] and answer["followups"] == []
+    rows = await _rows(db, "SELECT estimated, success FROM ai_usage WHERE operation = 'followups'")
+    assert rows == [{"estimated": True, "success": False}]             # the abandoned call is still on the ledger
+
+
+async def test_slow_followups_are_cut_off_at_their_own_budget(
+    client: AsyncClient, session_id: str, monkeypatch: pytest.MonkeyPatch, db: AsyncSession
+) -> None:
+    """FOLLOWUPS_TIMEOUT_S bounds the chips: the stream still ends with `done`, just without a followups event."""
+    monkeypatch.setattr(settings, "FOLLOWUPS_TIMEOUT_S", 0.3)
+    set_provider(HangingJsonProvider("FollowupQuestions"))             # would hang for 30 s
+    started = time.perf_counter()
+    events = parse_sse((await ask_stream(client, session_id, QUESTION)).text)
+    assert time.perf_counter() - started < 5
+    assert _names(events) == ["meta", *["token"] * _names(events).count("token"), "citations", "done"]
+    assert (await _last_answer(client, session_id))["status"] == "complete"
+    rows = await _rows(db, "SELECT success, error_code FROM ai_usage WHERE operation = 'followups'")
+    assert rows == [{"success": False, "error_code": "UPSTREAM_TIMEOUT"}]

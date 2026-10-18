@@ -15,7 +15,6 @@ DB rule: no session is held across a model call or while streaming. Every DB tou
 block; the answer is saved once at the end, together with its ai_usage rows, in one transaction.
 """
 
-import asyncio
 import time
 import uuid
 from collections.abc import AsyncIterator, Sequence
@@ -483,8 +482,12 @@ async def _pipeline(run: _Run, provider: LLMProvider) -> AsyncIterator[ChatEvent
     run.latency_ms = _ms(turn.started)
     check = check_answer(run.content, run.numbered, today=run.prompt.today if run.prompt else None)
     citations_event = _citations_event(run, check)
+    # Saved BEFORE the event goes out: a client leaving at that yield must not turn a fully streamed answer into an
+    # 'interrupted' one. Shielded, so a disconnect or the JSON deadline arriving mid-commit waits for it instead of
+    # leaving a row the cleanup can't know was written.
+    with anyio.CancelScope(shield=True):
+        await _save(run, "complete", citations_event=citations_event)
     yield citations_event
-    await _save(run, "complete", citations_event=citations_event)
 
     followups = await _followups(run, provider, check)
     if followups:
@@ -569,21 +572,31 @@ async def _stream(run: _Run, provider: LLMProvider, history: History) -> AsyncIt
     except AnswerStalled as exc:
         yield await _fail(run, ErrorCode.UPSTREAM_TIMEOUT, f"The answer stalled: {exc}")
     except ProviderError as exc:
-        yield await _fail(run, ErrorCode.UPSTREAM_AI_ERROR, f"The AI provider failed: {exc.message}")
+        if exc.usage is not None:       # the model ran and billed but gave no usable answer: its own numbers
+            run.answer_usage = exc.usage
+        elif not run.content:           # failed before any output, like an abandoned first attempt: zero tokens
+            run.answer_usage = Usage(model=run.model or settings.ANSWER_MODEL)
+        # exc.message can be the vendor's own text (a 401 explains what is wrong with the API key): logs only.
+        yield await _fail(run, ErrorCode.UPSTREAM_AI_ERROR, "The AI provider could not answer. Please try again.",
+                          detail=f"{exc.kind}: {exc.message}")
     except TimeoutError:
         yield await _fail(run, ErrorCode.UPSTREAM_TIMEOUT, "No answer from the AI provider in time.")
 
 
 def _abandoned_attempt_usage(prompt: AnswerPrompt, fallback: FallbackUsed) -> Usage:
     """A first attempt that timed out was still processing (and billing) our input, so estimate it; one that failed
-    with an error (5xx, connection) is recorded at zero tokens."""
+    with an error (5xx, connection) is recorded at zero tokens; one that ran but gave no answer text (refusal, output
+    budget spent on reasoning) is recorded with the usage the provider reported."""
+    if fallback.usage is not None:
+        return fallback.usage
     if fallback.error_code == ErrorCode.UPSTREAM_TIMEOUT:
         return Usage(model=fallback.failed_model, input_tokens=count_tokens(prompt.text()), estimated=True)
     return Usage(model=fallback.failed_model)
 
 
-async def _fail(run: _Run, code: ErrorCode, message: str) -> ErrorEvent:
-    log.warning("answer_failed", code=code, message=message, partial_chars=len(run.content))
+async def _fail(run: _Run, code: ErrorCode, message: str, *, detail: str | None = None) -> ErrorEvent:
+    """`message` is what the client sees (event, JSON body); `detail` (vendor text) is only logged."""
+    log.warning("answer_failed", code=code, message=message, detail=detail, partial_chars=len(run.content))
     await _save(run, "failed", error_code=code)
     return ErrorEvent(code=code, message=message)
 
@@ -630,8 +643,9 @@ async def _save_followups(run: _Run, questions: list[str], usage: Usage, *, succ
 
 # --- Persistence -----------------------------------------------------------------------------------------------
 def _answer_usage(run: _Run) -> Usage | None:
-    """The provider's own usage when the stream finished; otherwise a local tiktoken estimate (estimated=true),
-    because an abandoned stream never delivers its final usage event but was still billed."""
+    """The provider's own usage when the stream finished (or zero for one that failed before any output, see
+    _stream); otherwise a local tiktoken estimate (estimated=true), because an abandoned stream never delivers its
+    final usage event but was still billed."""
     if run.answer_usage is not None:
         return run.answer_usage
     if run.prompt is None or run.model is None:
@@ -698,8 +712,10 @@ async def _save(run: _Run, status: str, *, citations_event: CitationsEvent | Non
                     title=func.coalesce(func.nullif(ChatSession.title, ""), turn.question[:TITLE_CHARS].strip()))
         )
         await db.commit()
-    run.pending_usage.clear()
-    run.finished = True
+        # Saved means committed, with no await in between: a cancel landing while the session closes must not let
+        # answer()'s finally save the turn again (overwriting it) and insert its ai_usage rows a second time.
+        run.pending_usage.clear()
+        run.finished = True
     log.info("chat_answer_saved", message_id=str(turn.assistant_message_id), status=status,
              answer_type=values.get("answer_type"), model=run.model, total_ms=total_ms)
 
@@ -785,19 +801,25 @@ _ERROR_STATUS = {ErrorCode.UPSTREAM_TIMEOUT: 504, ErrorCode.UPSTREAM_AI_ERROR: 5
 
 
 async def answer_json(turn: Turn) -> AskResponse:
-    """Drain the same generator as the SSE endpoint under one overall deadline, then return the saved rows."""
+    """Drain the same generator as the SSE endpoint under one overall deadline, then return the saved rows.
+
+    The deadline is an anyio scope, not asyncio.timeout: only an anyio cancellation waits for the shielded save of a
+    complete answer instead of cutting it mid-commit."""
     error: ErrorEvent | None = None
     try:
-        async with asyncio.timeout(settings.JSON_ANSWER_TIMEOUT_S):
+        with anyio.fail_after(settings.JSON_ANSWER_TIMEOUT_S):
             async with aclosing(answer(turn)) as events:
                 async for event in events:
                     if isinstance(event, ErrorEvent):
                         error = event
     except TimeoutError as exc:
-        # The generator's finally already saved the partial answer as 'interrupted'; for the client it failed.
-        await _mark_failed(turn)
-        raise AppError(ErrorCode.UPSTREAM_TIMEOUT, 504,
-                       f"No complete answer within {settings.JSON_ANSWER_TIMEOUT_S:g}s.") from exc
+        if not await _is_complete(turn):
+            # The generator's finally already saved the partial answer as 'interrupted'; for the client it failed.
+            await _mark_failed(turn)
+            raise AppError(ErrorCode.UPSTREAM_TIMEOUT, 504,
+                           f"No complete answer within {settings.JSON_ANSWER_TIMEOUT_S:g}s.") from exc
+        # Time ran out in the best-effort follow-ups, after the answer was saved complete (a retry would replay it):
+        # return it without chips rather than call it a failure.
     if error is not None:
         raise AppError(ErrorCode(error.code), _ERROR_STATUS.get(error.code, 500), error.message,
                        {"message_id": str(turn.assistant_message_id)})
@@ -813,6 +835,11 @@ async def _owned_message(db: AsyncSession, turn: Turn, message_id: uuid.UUID | N
     if msg is None:
         raise not_found(ErrorCode.SESSION_NOT_FOUND, "Chat session")
     return msg
+
+
+async def _is_complete(turn: Turn) -> bool:
+    async with async_session() as db:
+        return (await _owned_message(db, turn, turn.assistant_message_id)).status == "complete"
 
 
 async def _mark_failed(turn: Turn) -> None:
