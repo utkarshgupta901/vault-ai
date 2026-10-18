@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { askJson, askStream, listMessages } from '../api/chat'
 import { ApiError, isAbortError } from '../api/client'
 import type { CitationsEvent, DoneEvent, ErrorEvent, MessageOut, MetaEvent } from '../api/types'
+import { askExclusively } from '../lib/askSlot'
 import { useLatest } from './useApi'
 import { useToast } from './useToast'
 
@@ -50,6 +51,7 @@ export function useChat(sessionId: string | undefined) {
   const [doneById, setDoneById] = useState<Record<string, DoneEvent>>({})
   const abortRef = useRef<AbortController | null>(null)
   const liveRef = useLatest(live)
+  const sessionRef = useLatest(sessionId)
 
   // Switching session: reset during render (React's "adjust state when a prop changes" pattern), not in an effect,
   // so the previous conversation is never painted under the new session's header.
@@ -67,10 +69,11 @@ export function useChat(sessionId: string | undefined) {
     async (signal?: AbortSignal) => {
       if (!sessionId) return
       const page = await listMessages(sessionId, null, signal)
+      if (sessionRef.current !== sessionId) return // another chat is shown now: do not paint this one's history into it
       setMessages(page.items)
       setOlderCursor(page.next_cursor)
     },
-    [sessionId],
+    [sessionId, sessionRef],
   )
 
   useEffect(() => {
@@ -89,6 +92,8 @@ export function useChat(sessionId: string | undefined) {
       })
     return () => {
       controller.abort()
+      // Read at cleanup time on purpose: the question to stop is the one in flight now (askExclusively sets the ref).
+      // oxlint-disable-next-line react-hooks/exhaustive-deps
       abortRef.current?.abort() // leaving the session stops its stream (the server saves it as interrupted)
     }
   }, [sessionId])
@@ -107,49 +112,52 @@ export function useChat(sessionId: string | undefined) {
   const ask = useCallback(
     async (question: string, stream: boolean, retryOf?: LiveTurn) => {
       const content = question.trim()
-      if (!sessionId || !content || abortRef.current) return
+      if (!sessionId || !content) return
       const clientMessageId = retryOf?.clientMessageId ?? newClientMessageId()
-      // A stopped/failed turn was persisted by the server; fold it into the history before starting a new question.
-      if (!retryOf && liveRef.current) await loadLatest().catch(() => undefined)
 
       // Only touch the live turn if it is still this question (the user may have switched session meanwhile).
       const update = (fn: (t: LiveTurn) => LiveTurn | null) =>
         setLive((t) => (t && t.clientMessageId === clientMessageId ? fn(t) : t))
-      setLive({
-        clientMessageId,
-        question: content,
-        stream,
-        status: 'streaming',
-        meta: null,
-        content: '',
-        result: null,
-        followups: [],
-        error: null,
-      })
-      const controller = new AbortController()
-      abortRef.current = controller
-      try {
-        if (stream) await streamAnswer(sessionId, content, clientMessageId, controller.signal, update, setDoneById)
-        else await askJson(sessionId, content, clientMessageId, controller.signal)
-        update((t) => ({ ...t, status: 'done' }))
+      const send = async (signal: AbortSignal) => {
+        setLive({
+          clientMessageId,
+          question: content,
+          stream,
+          status: 'streaming',
+          meta: null,
+          content: '',
+          result: null,
+          followups: [],
+          error: null,
+        })
         try {
-          await loadLatest()
-          update(() => null) // the persisted copy is now in `messages`
+          if (stream) await streamAnswer(sessionId, content, clientMessageId, signal, update, setDoneById)
+          else await askJson(sessionId, content, clientMessageId, signal)
+          update((t) => ({ ...t, status: 'done' }))
+          try {
+            await loadLatest()
+            update(() => null) // the persisted copy is now in `messages`
+          } catch (err) {
+            toast.error(err, 'Answer saved, but the conversation could not be refreshed')
+          }
         } catch (err) {
-          toast.error(err, 'Answer saved, but the conversation could not be refreshed')
+          if (isAbortError(err)) {
+            update((t) => ({ ...t, status: 'stopped' }))
+          } else {
+            update((t) => ({ ...t, status: 'error', error: toTurnError(err) }))
+            toast.error(err)
+          }
         }
-      } catch (err) {
-        if (isAbortError(err)) {
-          update((t) => ({ ...t, status: 'stopped' }))
-        } else {
-          update((t) => ({ ...t, status: 'error', error: toTurnError(err) }))
-          toast.error(err)
-        }
-      } finally {
-        if (abortRef.current === controller) abortRef.current = null
       }
+      // Claims abortRef before its first await, so a double click cannot send the question twice (lib/askSlot.ts).
+      await askExclusively(abortRef, {
+        // A stopped/failed turn was persisted by the server; fold it into the history before starting a new question.
+        refresh: !retryOf && liveRef.current ? loadLatest : null,
+        isCurrent: () => sessionRef.current === sessionId,
+        send,
+      })
     },
-    [sessionId, loadLatest, toast, liveRef],
+    [sessionId, loadLatest, toast, liveRef, sessionRef],
   )
 
   const stop = useCallback(() => abortRef.current?.abort(), [])
