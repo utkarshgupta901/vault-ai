@@ -54,7 +54,7 @@ async def test_bogus_key_is_rejected_before_the_upload_body(db: Any) -> None:
 
 async def test_valid_key_passes_and_is_cached(db: Any) -> None:
     auth._known_key_hashes.clear()
-    p = await Probe().call("POST", "/api/v1/documents/batch",
+    p = await Probe().call("POST", "/api/v1/documents",
                            {"X-API-Key": settings.SEED_DEMO_API_KEY, "Content-Length": UPLOAD_SIZE})
     assert (p.status, p.app_called) == (204, True)
     assert auth.hash_api_key(settings.SEED_DEMO_API_KEY) in auth._known_key_hashes
@@ -71,6 +71,12 @@ async def test_oversized_upload_is_rejected_without_a_db_lookup() -> None:
 async def test_large_json_body_is_rejected_before_it_is_read(method: str) -> None:
     length = str(settings.MAX_BODY_KB * 1024 + 1)
     p = await Probe().call(method, "/api/v1/chat/sessions", {"Content-Length": length})   # no key at all
+    assert (p.status, p.body_reads, p.app_called) == (413, 0, False)
+
+
+async def test_only_the_real_upload_route_gets_the_upload_limit() -> None:
+    # There is no batch upload route: a 20 MB body sent to a path under /documents gets the JSON body limit.
+    p = await Probe().call("POST", "/api/v1/documents/batch", {"Content-Length": UPLOAD_SIZE})
     assert (p.status, p.body_reads, p.app_called) == (413, 0, False)
 
 

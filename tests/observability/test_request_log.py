@@ -196,3 +196,19 @@ async def test_buffer_is_bounded_when_the_db_is_unreachable() -> None:
     assert buffer.dropped == 1
     buffer.discard_pending()
     await buffer.aclose()
+
+
+async def test_app_shutdown_writes_the_rows_still_buffered(db: AsyncSession, quiet_request_logs: None,
+                                                           monkeypatch: pytest.MonkeyPatch) -> None:
+    """The requests of the last second before a restart or deploy are still logged: the lifespan closes the buffer
+    the middleware writes to. Its flusher is restarted with a long interval first, so only that close can write."""
+    from app import main
+    from app.rag import tokens
+
+    await request_log_buffer.aclose()
+    monkeypatch.setattr(request_log_buffer, "interval_s", 3600.0)
+    monkeypatch.setattr(tokens, "warm_up", lambda: None)
+    async with main.lifespan(FastAPI()):
+        request_log_buffer.add(_row(route="/api/v1/last-request"))
+    count = await db.scalar(text("SELECT count(*) FROM request_logs WHERE route = '/api/v1/last-request'"))
+    assert count == 1

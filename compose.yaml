@@ -11,6 +11,8 @@
 # the running vault-ai containers on them (the taken port is often vault-ai's own). A second, separate stack also needs
 # COMPOSE_PROJECT_NAME=<other> (its own containers and volumes). It still shares the vault-ai:latest image tag: a build
 # there retags the image that a later `make demo-luna` (no --build) here would start.
+# Postgres, Valkey and S3 are published on 127.0.0.1 only: they run with this repo's public credentials, and on
+# 0.0.0.0 anyone on the same network could read the database or push tasks into the Celery broker.
 name: vault-ai
 
 x-app: &app
@@ -41,7 +43,7 @@ services:
     image: pgvector/pgvector:pg17          # Postgres 17 + pgvector, same major version as Render
     environment: { POSTGRES_USER: vault, POSTGRES_PASSWORD: vault, POSTGRES_DB: vault }
     command: ["postgres", "-c", "shared_buffers=256MB", "-c", "max_connections=100"]
-    ports: ["${PG_PORT:-5433}:5432"]
+    ports: ["127.0.0.1:${PG_PORT:-5433}:5432"]
     volumes: [pgdata:/var/lib/postgresql/data]
     healthcheck: { test: ["CMD-SHELL", "pg_isready -U vault -d vault"], interval: 3s, timeout: 3s, retries: 30 }
     restart: unless-stopped
@@ -51,7 +53,7 @@ services:
     # db0 = Celery broker, db1 = cache + rate-limit counters.
     # AOF keeps queued tasks across restarts; noeviction (with maxmemory) means broker keys are never evicted.
     command: ["valkey-server", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "noeviction"]
-    ports: ["${VALKEY_PORT:-6380}:6379"]
+    ports: ["127.0.0.1:${VALKEY_PORT:-6380}:6379"]
     volumes: [valkeydata:/data]
     healthcheck: { test: ["CMD", "valkey-cli", "ping"], interval: 3s, timeout: 3s, retries: 30 }
     restart: unless-stopped
@@ -59,7 +61,7 @@ services:
   s3:
     image: rustfs/rustfs:1.0.1             # S3-compatible object store (Cloudflare R2 / AWS S3 in the cloud)
     environment: { RUSTFS_ACCESS_KEY: vaultlocal, RUSTFS_SECRET_KEY: vaultlocalsecret }
-    ports: ["${S3_PORT:-9200}:9000"]
+    ports: ["127.0.0.1:${S3_PORT:-9200}:9000"]
     volumes: [s3data:/data]
     healthcheck: { test: ["CMD-SHELL", "nc -z localhost 9000 || exit 1"], interval: 3s, timeout: 3s, retries: 30 }
     restart: unless-stopped

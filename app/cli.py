@@ -9,6 +9,7 @@ import sys
 import time
 from pathlib import Path
 
+import structlog
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import select
@@ -20,6 +21,7 @@ from app.core.logging import configure_logging
 from app.models import User
 from app.services import storage
 
+log = structlog.get_logger(__name__)   # main() configures it first: readable lines locally, JSON in prod
 ROOT = Path(__file__).resolve().parents[1]
 
 # name -> (settings attribute holding the key, daily cost limit USD, requests/min)
@@ -47,11 +49,17 @@ def ensure_bucket(retries: int = 20) -> None:
         except Exception as exc:  # noqa: BLE001 - object store may still be starting
             if attempt == retries - 1:
                 raise
-            print(f"waiting for object storage ({exc.__class__.__name__})...", file=sys.stderr)
+            log.info("waiting_for_object_storage", error=exc.__class__.__name__, attempt=attempt + 1)
             time.sleep(1.5)
 
 
 def seed_users() -> None:
+    if settings.APP_ENV == "prod":
+        # Settings only checks the seed keys a process was given (the worker gets none), so an API service missing
+        # them still starts; seeding the public defaults here would turn them into working prod keys.
+        public = settings.public_secrets(key_attr for key_attr, _, _ in SEED_USERS.values())
+        if public:
+            raise SystemExit(f"Refusing to seed users in prod with empty or repo-default keys: {', '.join(public)}")
     with sync_session() as s:
         for name, (key_attr, limit, rpm) in SEED_USERS.items():
             key_hash = hash_api_key(getattr(settings, key_attr))
@@ -67,13 +75,13 @@ def main(argv: list[str]) -> None:
     cmd = argv[1] if len(argv) > 1 else "bootstrap"
     if cmd in ("bootstrap", "migrate"):
         migrate()
-        print("migrations: at head")
+        log.info("migrations_at_head")
     if cmd in ("bootstrap",):
         ensure_bucket()
-        print(f"storage: bucket '{settings.S3_BUCKET}' ready")
+        log.info("bucket_ready", bucket=settings.S3_BUCKET)
     if cmd in ("bootstrap", "seed-users"):
         seed_users()
-        print(f"users: seeded {', '.join(SEED_USERS)}")
+        log.info("users_seeded", users=list(SEED_USERS))     # names only: never the keys
 
 
 if __name__ == "__main__":

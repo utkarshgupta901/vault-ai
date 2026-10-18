@@ -3,6 +3,7 @@
 Every function takes owner_id; nothing here can read another owner's data."""
 
 import hashlib
+import unicodedata
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -12,8 +13,8 @@ from typing import IO
 import anyio
 import structlog
 from fastapi import UploadFile
-from sqlalchemy import and_, delete, or_, select, text
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import and_, delete, or_, select, text, update
+from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -50,6 +51,22 @@ def to_out(doc: Document) -> DocumentOut:
     out.error = error
     out.stale = state.is_stale(doc.status, doc.updated_at, now, settings.STALE_PROCESSING_MIN)
     return out
+
+
+def clean_filename(raw: str | None) -> str:
+    """The client's filename as stored and shown: its last path component, at most 255 characters, with control
+    characters replaced by '_'. Postgres refuses NUL in TEXT (the upload failed as a 500), and CR/LF or ESC would
+    forge or garble log lines; any other Unicode is kept as typed."""
+    name = PurePath(raw or "upload").name
+    return "".join("_" if unicodedata.category(c) == "Cc" else c for c in name)[:255]
+
+
+async def _delete_orphan(key: str) -> None:
+    """Delete an object no row will ever point at. Best effort: the caller's own outcome matters more."""
+    try:
+        await anyio.to_thread.run_sync(storage.delete, key)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("storage_delete_failed", key=key, error=str(exc))
 
 
 def _hash_and_size(f: IO[bytes]) -> tuple[str, int]:
@@ -96,12 +113,13 @@ async def upload(db: AsyncSession, owner_id: uuid.UUID, file: UploadFile) -> Upl
         raise AppError(ErrorCode.EMPTY_FILE, 422, "The uploaded file is empty.")
     if size > settings.max_upload_bytes:
         raise AppError(ErrorCode.FILE_TOO_LARGE, 413, f"File exceeds the {settings.MAX_UPLOAD_MB} MB limit.")
-    filename = PurePath(file.filename or "upload").name[:255]
+    filename = clean_filename(file.filename)
     sniffed = await anyio.to_thread.run_sync(sniff, f, filename)
 
     existing = await db.scalar(select(Document).where(Document.owner_id == owner_id, Document.sha256 == sha256))
     if existing is not None:
         return await _handle_duplicate(db, existing)
+    await db.rollback()  # end the dedup read: its pool connection must not sit idle in transaction during the S3 PUT
 
     document_id, run_id = uuid.uuid4(), uuid.uuid4()
     key = storage.storage_key(owner_id, document_id, sniffed.ext)
@@ -118,11 +136,18 @@ async def upload(db: AsyncSession, owner_id: uuid.UUID, file: UploadFile) -> Upl
     except IntegrityError:
         # A concurrent upload of the same bytes won the race on UNIQUE(owner_id, sha256).
         await db.rollback()
-        await anyio.to_thread.run_sync(storage.delete, key)
+        await _delete_orphan(key)
         winner = await db.scalar(select(Document).where(Document.owner_id == owner_id, Document.sha256 == sha256))
         if winner is None:
             raise
         return await _handle_duplicate(db, winner)
+    except Exception as exc:
+        # Any other failure (e.g. a value Postgres refuses): the row was not written and nothing points at the
+        # object, so it would stay in the bucket forever. Kept only when the outcome is unknown, a dropped connection
+        # or a cancellation (not an Exception) during COMMIT: the row may exist, and a row without its file is worse.
+        if not (isinstance(exc, DBAPIError) and exc.connection_invalidated):
+            await _delete_orphan(key)
+        raise
     await db.refresh(doc)
     await _enqueue_or_fail(db, doc, run_id)
     log.info("document_uploaded", document_id=str(doc.id), mime=sniffed.mime_type, size=size)
@@ -130,19 +155,22 @@ async def upload(db: AsyncSession, owner_id: uuid.UUID, file: UploadFile) -> Upl
 
 
 async def _handle_duplicate(db: AsyncSession, doc: Document) -> UploadResult:
-    """Same bytes again: no new work, no new cost. Exception: a retryable failure gets a fresh run."""
+    """Same bytes again: no new work, no new cost. Exception: a retryable failure gets a fresh run.
+
+    `doc` was read before this call and may be stale: a concurrent re-upload or reprocess can have requeued it since.
+    So the requeue repeats "failed and retryable" in its WHERE (zero rows = another request already started a run,
+    which must not be replaced), and upload_count is incremented in SQL so concurrent duplicates are all counted."""
+    run_id, requeued = uuid.uuid4(), False
     if doc.status == "failed" and doc.error_retryable:
-        run_id = uuid.uuid4()
-        await db.execute(state.requeue_stmt(doc.id, run_id))
-        doc.upload_count += 1
-        await db.commit()
-        await db.refresh(doc)
-        await _enqueue_or_fail(db, doc, run_id)
-        return UploadResult(doc, duplicate=True, requeued=True)
-    doc.upload_count += 1
+        result = await db.execute(state.requeue_stmt(doc.id, run_id)
+                                  .where(Document.status == "failed", Document.error_retryable.is_(True)))
+        requeued = result.first() is not None
+    await db.execute(update(Document).where(Document.id == doc.id).values(upload_count=Document.upload_count + 1))
     await db.commit()
     await db.refresh(doc)
-    return UploadResult(doc, duplicate=True, requeued=False)
+    if requeued:
+        await _enqueue_or_fail(db, doc, run_id)
+    return UploadResult(doc, duplicate=True, requeued=requeued)
 
 
 async def get_owned(db: AsyncSession, owner_id: uuid.UUID, document_id: uuid.UUID) -> Document:

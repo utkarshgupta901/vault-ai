@@ -4,7 +4,7 @@ FastAPI reads the request body (multipart files are spooled to disk, JSON is buf
 dependencies run, so auth/size checks inside a route would come after a client already made us read the whole body.
 This pure-ASGI guard runs first. Cheap header checks come before the one that needs the database.
 
-Uploads (POST /api/v1/documents and /api/v1/documents/batch):
+Uploads (POST /api/v1/documents):
   - no X-API-Key header        -> 401
   - no Content-Length          -> 411 (chunked uploads can't be size-checked up front)
   - Content-Length too large   -> 413 FILE_TOO_LARGE
@@ -22,7 +22,7 @@ from app.config import settings
 from app.core.auth import is_known_api_key
 from app.core.errors import ErrorCode, send_error
 
-UPLOAD_PATHS = {"/api/v1/documents", "/api/v1/documents/batch"}
+UPLOAD_PATHS = {"/api/v1/documents"}
 BODY_METHODS = {"POST", "PUT", "PATCH"}
 MULTIPART_OVERHEAD_BYTES = 1024 * 1024
 

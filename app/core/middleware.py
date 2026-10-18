@@ -11,7 +11,8 @@ For a streamed chat answer ttfb_ms is the time until headers go out and total_ms
 Why a buffer: inserting a row inside the request would add a DB round trip to every response and turn a DB hiccup
 into an API outage. Instead each request appends a dict to an in-process list, and one background task inserts the
 whole batch every second (or as soon as 100 rows are waiting) in one short transaction. Telemetry is best effort:
-a DB error drops that batch with a warning, and rows still in memory when the process dies (at most ~1 s) are lost.
+a DB error drops that batch with a warning. A normal shutdown writes what is left (main.py's lifespan calls
+aclose()); rows still in memory when the process is killed (at most ~1 s) are lost.
 """
 
 import asyncio
@@ -78,7 +79,7 @@ class RequestLogBuffer:
     """In-process queue of request_logs rows, drained by one lazily started background task.
 
     The task is started on the first add() rather than at import or app startup: there is no running event loop at
-    import time, and main.py's lifespan belongs to WP0. It is restarted if it died or the event loop changed (tests).
+    import time. It is restarted if it died or the event loop changed (tests).
     `flush()` holds a lock so a caller (a test, or a shutdown hook) that awaits it knows every row added before the
     call is committed, even if the background task was mid-insert."""
 
@@ -107,7 +108,7 @@ class RequestLogBuffer:
         self._rows = []
 
     async def aclose(self) -> None:
-        """Stop the background task and write what is left (call from an app shutdown hook to keep the last second)."""
+        """Stop the background task and write what is left (main.py's lifespan calls it on shutdown)."""
         if self._task is not None and not self._task.done():
             self._task.cancel()
             try:

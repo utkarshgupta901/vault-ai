@@ -150,8 +150,11 @@ def content_disposition(disposition: str, filename: str) -> str:
 
 
 @router.get("/{document_id}/file", summary="Download the original file", response_class=StreamingResponse)
-async def get_file(document_id: uuid.UUID, user: User, db: Db) -> StreamingResponse:
-    doc = await svc.get_owned(db, user.id, document_id)
+async def get_file(document_id: uuid.UUID, user: User) -> StreamingResponse:
+    # A short session, closed before streaming. With `Db` the session would only close after the last byte (FastAPI
+    # exits yield-dependencies after the response), keeping a pool connection idle in transaction per download.
+    async with async_session() as db:
+        doc = await svc.get_owned(db, user.id, document_id)
     # Headers first: nothing that can fail runs between opening the S3 stream and handing it to the response.
     headers = {
         "Content-Disposition": content_disposition(

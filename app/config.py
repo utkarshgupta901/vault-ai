@@ -2,16 +2,23 @@
 in tests and on Render. Every tunable the README or eval mentions lives here."""
 
 import re
+from collections.abc import Iterable
 from datetime import date
 from functools import lru_cache
-from typing import Literal
+from typing import Literal, Self
 
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Their defaults are public (README, .env.example, the dashboard's default key): fine for the local stack, but in
+# prod they would be working credentials that anyone who has read this repo could use.
+S3_KEY_SETTINGS = ("S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY")
+SEED_KEY_SETTINGS = ("SEED_DEMO_API_KEY", "SEED_OTHER_API_KEY", "SEED_EVAL_API_KEY")
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    # hide_input_in_errors: a failed validation would otherwise print every configured secret into the deploy log.
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore", hide_input_in_errors=True)
 
     APP_ENV: Literal["local", "test", "prod"] = "local"
     LOG_LEVEL: str = "INFO"
@@ -105,6 +112,24 @@ class Settings(BaseSettings):
     def _normalize_db_url(cls, v: str) -> str:
         # Render/Heroku hand out postgres:// or postgresql://; SQLAlchemy needs the psycopg3 dialect name.
         return re.sub(r"^postgres(ql)?(\+\w+)?://", "postgresql+psycopg://", v)
+
+    @model_validator(mode="after")
+    def _no_public_secrets_in_prod(self) -> Self:
+        """APP_ENV=prod fails at startup rather than run with the demo credentials. Seed keys are checked only when
+        this process was given one: render.yaml gives them to the API service (whose deploy step seeds the users),
+        while the worker never seeds and has none. app.cli refuses to seed public keys in prod, so an API service
+        given none of them still fails its deploy."""
+        if self.APP_ENV != "prod":
+            return self
+        given_seed_keys = [name for name in SEED_KEY_SETTINGS if name in self.model_fields_set]
+        public = self.public_secrets([*S3_KEY_SETTINGS, *given_seed_keys])
+        if public:
+            raise ValueError(f"APP_ENV=prod needs real secrets, not empty values or repo defaults: {', '.join(public)}")
+        return self
+
+    def public_secrets(self, names: Iterable[str]) -> list[str]:
+        """The settings among `names` that are empty or still hold the value this repo ships as their default."""
+        return [name for name in names if getattr(self, name) in ("", type(self).model_fields[name].default)]
 
     @property
     def max_upload_bytes(self) -> int:

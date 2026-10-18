@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 # Settings of the caller that would leak into the child: ports exported in this shell, or `make test API_PORT=...`
@@ -50,6 +51,22 @@ def test_harness_follows_the_ports_compose_publishes_on() -> None:
 def test_harness_defaults_are_compose_defaults() -> None:
     # Empty counts as unset, as in compose's ${PG_PORT:-5433}.
     assert hosts(harness_urls(PG_PORT="")) == {"localhost:5433", "localhost:6380", "localhost:9200"}
+
+
+# --- compose.yaml -----------------------------------------------------------------------------------------------
+def published_ports() -> dict[str, list[str]]:
+    services = yaml.safe_load((ROOT / "compose.yaml").read_text())["services"]
+    return {name: svc.get("ports", []) for name, svc in services.items()}
+
+
+def test_stateful_services_are_published_on_loopback_only() -> None:
+    # Postgres, Valkey (the Celery broker) and the object store run with the repo's public credentials: published on
+    # all interfaces, anyone on the same Wi-Fi could read or write them. Host-side tools all use localhost.
+    ports = published_ports()
+    assert ports["postgres"] == ["127.0.0.1:${PG_PORT:-5433}:5432"]
+    assert ports["valkey"] == ["127.0.0.1:${VALKEY_PORT:-6380}:6379"]
+    assert ports["s3"] == ["127.0.0.1:${S3_PORT:-9200}:9000"]
+    assert ports["api"] == ["${API_PORT:-8000}:8000"]               # the API (behind its API keys) is unchanged
 
 
 # --- Makefile ---------------------------------------------------------------------------------------------------

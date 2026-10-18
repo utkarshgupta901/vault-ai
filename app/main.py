@@ -14,11 +14,12 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from app.api import documents, health
+from app.api import chat, documents, health, insights, metrics, search
 from app.config import settings
 from app.core.db import get_async_engine
 from app.core.errors import AppError, ErrorCode, UnhandledErrorMiddleware, install_error_handlers
 from app.core.logging import configure_logging
+from app.core.middleware import RequestLogMiddleware, request_log_buffer
 from app.core.request_context import RequestIdMiddleware
 from app.core.upload_guard import UploadGuardMiddleware
 from app.rag import tokens
@@ -75,20 +76,8 @@ async def lifespan(_: FastAPI):
     configure_logging()
     await asyncio.to_thread(tokens.warm_up)     # the first follow-up question must not load (or download) it
     yield
+    await request_log_buffer.aclose()           # write the last second of request logs while the engine still exists
     await get_async_engine().dispose()
-
-
-def _optional_routers() -> list:
-    """Routers owned by later work packages; included when present so the skeleton boots on its own."""
-    import importlib
-
-    routers = []
-    for name in ("insights", "chat", "search", "metrics"):
-        try:
-            routers.append(importlib.import_module(f"app.api.{name}").router)
-        except ModuleNotFoundError:
-            pass
-    return routers
 
 
 def create_app() -> FastAPI:
@@ -100,19 +89,13 @@ def create_app() -> FastAPI:
     app.add_middleware(CORSMiddleware, allow_origins=settings.CORS_ORIGINS, allow_methods=["*"],
                        allow_headers=["*"], expose_headers=["X-Request-ID", "Location"])
     app.add_middleware(UploadGuardMiddleware)
-    try:
-        from app.core.middleware import RequestLogMiddleware  # WP4
-
-        app.add_middleware(RequestLogMiddleware)
-    except ModuleNotFoundError:
-        pass
+    app.add_middleware(RequestLogMiddleware)
     app.add_middleware(UnhandledErrorMiddleware)   # directly inside RequestId (the last added is the outermost)
     app.add_middleware(RequestIdMiddleware)
 
     app.include_router(health.router)
-    app.include_router(documents.router, prefix="/api/v1")
-    for router in _optional_routers():
-        app.include_router(router, prefix="/api/v1")
+    for module in (documents, insights, chat, search, metrics):
+        app.include_router(module.router, prefix="/api/v1")
 
     root = spa_dir()
     if (root / "index.html").exists():
