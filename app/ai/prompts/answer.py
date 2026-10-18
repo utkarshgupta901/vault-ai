@@ -97,9 +97,10 @@ def render(
     today: date,
 ) -> tuple[str, str, list[Msg]]:
     """Build (prompt_version, instructions, input messages). History messages are already [S#]-stripped. They keep
-    their own roles but are escaped like the question (hard rule 5): a past question is user text and a past answer
-    echoes document text, and either could otherwise forge a <sources> block ahead of the real one."""
+    their own roles but are escaped (hard rule 5): a past question is user text and a past answer echoes document
+    text, and either could otherwise forge a <sources> block ahead of the real one. Quotes stay as typed (no attribute
+    to break out of): escaped, the model saw its own past answers as "don&#x27;t" and could copy that into new ones."""
     prompt_version, instructions = instructions_for(version)
     last = final_turn(question=question, standalone=standalone, sources=sources, today=shown_today(version, today))
-    prior = [Msg(role=m["role"], content=escape(m["content"])) for m in history]
+    prior = [Msg(role=m["role"], content=escape(m["content"], quote=False)) for m in history]
     return prompt_version, instructions, [*prior, Msg(role="user", content=last)]

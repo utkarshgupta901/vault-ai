@@ -312,8 +312,10 @@ WHERE session_id = :session_id AND status = 'streaming'
 """)
 
 
-async def _latest_reply(db: AsyncSession, user_message_id: uuid.UUID) -> ChatMessage | None:
-    return await db.scalar(select(ChatMessage).where(ChatMessage.reply_to_id == user_message_id)
+async def _latest_reply(db: AsyncSession, session_id: uuid.UUID, user_message_id: uuid.UUID) -> ChatMessage | None:
+    """session_id as well: no index covers reply_to_id alone, (session_id, seq) is indexed."""
+    return await db.scalar(select(ChatMessage).where(ChatMessage.session_id == session_id,
+                                                     ChatMessage.reply_to_id == user_message_id)
                            .order_by(ChatMessage.seq.desc()).limit(1))
 
 
@@ -335,6 +337,8 @@ async def start_turn(owner_id: uuid.UUID, session_id: uuid.UUID, body: MessageCr
       previous answer complete    -> replay it (no model call, no new rows)
       previous answer streaming   -> 409 MESSAGE_IN_PROGRESS
       failed / interrupted / none -> regenerate: new assistant row replying to the SAME user row
+    A blank 'complete' answer is regenerated too: rows saved before empty streams became failures still hold some,
+    and replaying one would answer that client_message_id with nothing forever.
     """
     started = time.perf_counter()
     async with async_session() as db:
@@ -355,8 +359,8 @@ async def start_turn(owner_id: uuid.UUID, session_id: uuid.UUID, body: MessageCr
                                "client_message_id was already used for a different question; "
                                "send a new client_message_id for a new question.",
                                {"field": "client_message_id"})
-            previous = await _latest_reply(db, existing_user.id)
-            if previous is not None and previous.status == "complete":
+            previous = await _latest_reply(db, session_id, existing_user.id)
+            if previous is not None and previous.status == "complete" and previous.content.strip():
                 await db.commit()
                 return Turn(owner_id, session_id, existing_user.id, existing_user.seq, existing_user.content, started,
                             assistant_message_id=previous.id, replay=previous)
@@ -483,10 +487,8 @@ async def _pipeline(run: _Run, provider: LLMProvider) -> AsyncIterator[ChatEvent
     check = check_answer(run.content, run.numbered, today=run.prompt.today if run.prompt else None)
     citations_event = _citations_event(run, check)
     # Saved BEFORE the event goes out: a client leaving at that yield must not turn a fully streamed answer into an
-    # 'interrupted' one. Shielded, so a disconnect or the JSON deadline arriving mid-commit waits for it instead of
-    # leaving a row the cleanup can't know was written.
-    with anyio.CancelScope(shield=True):
-        await _save(run, "complete", citations_event=citations_event)
+    # 'interrupted' one. (_save is shielded: a disconnect arriving mid-commit waits for it.)
+    await _save(run, "complete", citations_event=citations_event)
     yield citations_event
 
     followups = await _followups(run, provider, check)
@@ -703,19 +705,24 @@ async def _save(run: _Run, status: str, *, citations_event: CitationsEvent | Non
         rows.append(usage_row(operation="answer", usage=usage, owner_id=turn.owner_id,
                               prompt_version=values["prompt_version"], message_id=turn.assistant_message_id,
                               success=status == "complete", error_code=error_code))
-    async with async_session() as db:
-        await db.execute(update(ChatMessage).where(ChatMessage.id == turn.assistant_message_id).values(**values))
-        db.add_all(rows)
-        await db.execute(
-            update(ChatSession).where(ChatSession.id == turn.session_id, ChatSession.owner_id == turn.owner_id)
-            .values(last_message_at=func.now(),
-                    title=func.coalesce(func.nullif(ChatSession.title, ""), turn.question[:TITLE_CHARS].strip()))
-        )
-        await db.commit()
-        # Saved means committed, with no await in between: a cancel landing while the session closes must not let
-        # answer()'s finally save the turn again (overwriting it) and insert its ai_usage rows a second time.
-        run.pending_usage.clear()
-        run.finished = True
+    # Shielded, whatever the status: a disconnect or the JSON deadline arriving while the COMMIT is in flight (done on
+    # the server, its reply not back yet) would leave run.finished False, and answer()'s finally would then save the
+    # turn again as 'interrupted', overwriting it and inserting its answer ai_usage row a second time. Shielded, the
+    # cancel waits for the commit and is delivered after it.
+    with anyio.CancelScope(shield=True):
+        async with async_session() as db:
+            await db.execute(update(ChatMessage).where(ChatMessage.id == turn.assistant_message_id).values(**values))
+            db.add_all(rows)
+            await db.execute(
+                update(ChatSession).where(ChatSession.id == turn.session_id, ChatSession.owner_id == turn.owner_id)
+                .values(last_message_at=func.now(),
+                        title=func.coalesce(func.nullif(ChatSession.title, ""), turn.question[:TITLE_CHARS].strip()))
+            )
+            await db.commit()
+            # Saved means committed, with no await in between: a cancel landing while the session closes must not
+            # let answer()'s finally save the turn again (overwriting it) and insert its ai_usage rows a second time.
+            run.pending_usage.clear()
+            run.finished = True
     log.info("chat_answer_saved", message_id=str(turn.assistant_message_id), status=status,
              answer_type=values.get("answer_type"), model=run.model, total_ms=total_ms)
 
@@ -803,8 +810,8 @@ _ERROR_STATUS = {ErrorCode.UPSTREAM_TIMEOUT: 504, ErrorCode.UPSTREAM_AI_ERROR: 5
 async def answer_json(turn: Turn) -> AskResponse:
     """Drain the same generator as the SSE endpoint under one overall deadline, then return the saved rows.
 
-    The deadline is an anyio scope, not asyncio.timeout: only an anyio cancellation waits for the shielded save of a
-    complete answer instead of cutting it mid-commit."""
+    The deadline is an anyio scope, not asyncio.timeout: only an anyio cancellation waits for the shielded save (see
+    _save) instead of cutting it mid-commit."""
     error: ErrorEvent | None = None
     try:
         with anyio.fail_after(settings.JSON_ANSWER_TIMEOUT_S):

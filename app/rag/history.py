@@ -4,7 +4,8 @@ Rules (design §2c):
   - the last HISTORY_TURNS turns (user question + its answer), ordered by `seq` — never by created_at, because rows
     inserted in one transaction share the same now();
   - only finished answers: a half-streamed or failed answer would teach the model its own broken output (and its
-    question, left without an answer, is skipped with it);
+    question, left without an answer, is skipped with it). A blank 'complete' answer is not finished either: rows
+    saved before empty streams became failures still hold some;
   - [S#] markers stripped, because source numbers restart every turn ("S2" now is a different chunk);
   - capped at HISTORY_MAX_TOKENS by dropping the OLDEST messages first (recent context matters most); a newest
     message that alone exceeds the cap is truncated, never dropped (see cap_tokens).
@@ -32,14 +33,18 @@ class History:
 
 async def load_history(db: AsyncSession, *, owner_id: uuid.UUID, session_id: uuid.UUID, before_seq: int) -> History:
     """The last HISTORY_TURNS COMPLETE turns: a question counts only together with its complete answer. Limiting rows
-    instead let questions whose answer failed or never came take the slots of real turns."""
+    instead let questions whose answer failed or never came take the slots of real turns.
+
+    The reply is matched on session_id as well as reply_to_id: no index covers reply_to_id, so without it every turn
+    scanned every owner's chat_messages; (session_id, seq) is indexed."""
     question, reply = aliased(ChatMessage), aliased(ChatMessage)
     turns = (await db.execute(
         select(question, reply)
         .join(reply, reply.reply_to_id == question.id)
         .join(ChatSession, ChatSession.id == question.session_id)
         .where(ChatSession.owner_id == owner_id, question.session_id == session_id, question.role == "user",
-               question.seq < before_seq, reply.role == "assistant", reply.status == "complete")
+               question.seq < before_seq, reply.session_id == session_id, reply.role == "assistant",
+               reply.status == "complete", reply.content.regexp_match(r"\S"))
         .distinct(question.seq)         # one answer per question, the newest, should a retry ever complete twice
         .order_by(question.seq.desc(), reply.seq.desc())
         .limit(settings.HISTORY_TURNS)

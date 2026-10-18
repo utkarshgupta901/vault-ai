@@ -1,11 +1,13 @@
 """load_history against real rows: which past turns the next question gets as conversation context."""
 
 import uuid
+from typing import Any
 
-from sqlalchemy import text
+from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
+from app.core.db import get_async_engine
 from app.rag.history import load_history
 
 
@@ -24,10 +26,12 @@ async def _message(db: AsyncSession, session_id: uuid.UUID, role: str, content: 
     return row.id, row.seq
 
 
-async def _turn(db: AsyncSession, session_id: uuid.UUID, n: int, reply_status: str | None = "complete") -> None:
+async def _turn(db: AsyncSession, session_id: uuid.UUID, n: int, reply_status: str | None = "complete",
+                answer: str | None = None) -> None:
     user_id, _ = await _message(db, session_id, "user", f"question {n}")
     if reply_status is not None:
-        await _message(db, session_id, "assistant", f"answer {n}", status=reply_status, reply_to=user_id)
+        await _message(db, session_id, "assistant", f"answer {n}" if answer is None else answer, status=reply_status,
+                       reply_to=user_id)
 
 
 async def test_failed_and_unanswered_turns_do_not_crowd_out_complete_ones(
@@ -70,3 +74,50 @@ async def test_a_regenerated_turn_counts_once_with_its_complete_answer(
 
     history = await load_history(db, owner_id=demo_user_id, session_id=session_id, before_seq=current_seq)
     assert [(m["role"], m["content"]) for m in history.messages] == [("user", "question 1"), ("assistant", "answer 1")]
+
+
+async def test_a_blank_complete_answer_is_not_a_turn(db: AsyncSession, demo_user_id: uuid.UUID) -> None:
+    """Before the empty-answer fix an answer stream with no text was saved as an empty 'complete' message, and such
+    rows are still in existing databases. They took history slots and left their question there without an answer."""
+    session_id = await _session(db, demo_user_id)
+    for n in (1, 2, 3):
+        await _turn(db, session_id, n)
+    await _turn(db, session_id, 4, answer="")
+    await _turn(db, session_id, 5, answer=" \n")
+    _, current_seq = await _message(db, session_id, "user", "the question being answered now")
+    await db.commit()
+
+    history = await load_history(db, owner_id=demo_user_id, session_id=session_id, before_seq=current_seq)
+    assert [(m["role"], m["content"]) for m in history.messages] == [
+        ("user", "question 1"), ("assistant", "answer 1"),
+        ("user", "question 2"), ("assistant", "answer 2"),
+        ("user", "question 3"), ("assistant", "answer 3"),
+    ]
+    assert history.previous_query == "question 3"
+
+
+async def test_the_history_query_reads_only_this_sessions_messages(db: AsyncSession, demo_user_id: uuid.UUID) -> None:
+    """Regression: the reply side of the join was found by reply_to_id alone, which no index covers, so every chat
+    turn with prior turns scanned every owner's chat_messages. Checked on the plan of the query load_history really
+    runs, with sequential scans priced out (the test table is small enough that a scan would win anyway)."""
+    session_id = await _session(db, demo_user_id)
+    await _turn(db, session_id, 1)
+    _, current_seq = await _message(db, session_id, "user", "question 2")
+    await db.commit()
+    seen: list[tuple[str, Any]] = []
+
+    def capture(conn: Any, cursor: Any, statement: str, parameters: Any, *args: Any) -> None:
+        if "reply_to_id" in statement:
+            seen.append((statement, parameters))
+
+    engine = get_async_engine().sync_engine
+    event.listen(engine, "before_cursor_execute", capture)
+    try:
+        await load_history(db, owner_id=demo_user_id, session_id=session_id, before_seq=current_seq)
+    finally:
+        event.remove(engine, "before_cursor_execute", capture)
+    (statement, parameters), = seen
+    await db.execute(text("SET LOCAL enable_seqscan = off"))
+    plan = "\n".join((await (await db.connection()).exec_driver_sql(f"EXPLAIN {statement}", parameters)).scalars())
+    await db.rollback()
+    assert "Seq Scan on chat_messages" not in plan, plan

@@ -11,6 +11,8 @@ from datetime import date
 from functools import partial
 from typing import Any
 
+import anyio
+import anyio.lowlevel
 import pytest
 from httpx import AsyncClient
 from sqlalchemy import text
@@ -263,6 +265,20 @@ async def test_failed_client_message_id_is_regenerated_on_the_same_user_row(
     assert body["user_message"]["id"] == str(user_id) and body["answer"]["reply_to_id"] == str(user_id)
     msgs = (await client.get(f"{API}/chat/sessions/{session_id}/messages", headers=DEMO)).json()["items"]
     assert [m["status"] for m in msgs] == ["complete", "failed", "complete"]
+
+
+async def test_a_legacy_empty_complete_answer_is_regenerated_not_replayed(
+    client: AsyncClient, session_id: str, db: AsyncSession
+) -> None:
+    """Before empty streams became failures, an answer with no text was saved as an empty 'complete' message, and
+    such rows are still in existing databases: a retry of its client_message_id replayed the empty answer forever."""
+    first = (await ask_json(client, session_id, QUESTION, client_message_id="c-legacy")).json()
+    await db.execute(text("UPDATE chat_messages SET content = '' WHERE id = :id"), {"id": first["answer"]["id"]})
+    await db.commit()
+    retry = (await ask_json(client, session_id, QUESTION, client_message_id="c-legacy")).json()
+    assert retry["answer"]["status"] == "complete" and retry["answer"]["content"].strip()
+    assert retry["answer"]["id"] != first["answer"]["id"]                      # regenerated, not replayed ...
+    assert retry["user_message"]["id"] == first["user_message"]["id"]          # ... on the same user row
 
 
 async def test_second_ask_while_streaming_is_session_busy(
@@ -793,6 +809,54 @@ async def test_cancel_right_after_the_final_commit_does_not_save_the_turn_twice(
     msg, operations = await _saved_turn(db, turn.assistant_message_id)
     assert msg["status"] == "complete" and msg["confidence"] and msg["citations"]
     assert operations == ["embed_query", "answer"]
+
+
+def _wrap_failed_save_commit(monkeypatch: pytest.MonkeyPatch,
+                             wrap: Callable[[Callable[[], Awaitable[None]]], Awaitable[None]]) -> None:
+    """Route the commit of the save that stores a failed answer through wrap(real_commit). That save opens the first
+    DB session after _fail() is called."""
+    armed: list[bool] = []
+    real_fail, real_session = svc._fail, svc.async_session
+
+    async def fail(*args: Any, **kwargs: Any) -> Any:
+        armed.append(True)
+        return await real_fail(*args, **kwargs)
+
+    def session() -> AsyncSession:
+        db_session = real_session()
+        if armed:
+            armed.clear()
+            db_session.commit = partial(wrap, db_session.commit)      # type: ignore[method-assign]
+        return db_session
+
+    monkeypatch.setattr(svc, "_fail", fail)
+    monkeypatch.setattr(svc, "async_session", session)
+
+
+async def test_cancel_while_the_failed_save_commits_does_not_save_the_turn_twice(
+    client: AsyncClient, session_id: str, demo_user_id: uuid.UUID, db: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: only the complete save was shielded. A disconnect or the JSON deadline landing while a failed
+    answer's COMMIT was in flight (done on the server, its reply not back yet) let answer()'s cleanup save the turn
+    again as 'interrupted', inserting its answer ai_usage row a second time."""
+    error = ProviderError("transient", "OpenAI server error (500).", status_code=500)
+    set_provider(PerModelStreamProvider({settings.ANSWER_MODEL: [error], settings.FAST_MODEL: [error]}))
+    turn = await _turn(client, session_id, demo_user_id)
+    with anyio.CancelScope() as scope:
+        async def commit_then_cancel(commit: Callable[[], Awaitable[None]]) -> None:
+            await commit()
+            scope.cancel()              # the client leaves now, while the commit's reply is on its way back ...
+            await anyio.lowlevel.checkpoint()   # ... and the cancellation is delivered inside the commit
+
+        _wrap_failed_save_commit(monkeypatch, commit_then_cancel)
+        async for _ in svc.answer(turn):
+            pass
+    msg, operations = await _saved_turn(db, turn.assistant_message_id)
+    assert msg["status"] == "failed"
+    assert operations == ["embed_query", "answer", "answer"]
+    assert [r["model"] for r in await _answer_usage_rows(db, turn.assistant_message_id)] == [
+        settings.ANSWER_MODEL, settings.FAST_MODEL]
 
 
 async def test_json_deadline_during_the_final_save_waits_for_it(

@@ -15,8 +15,10 @@ UNTRUSTED_RULE = (
 )
 
 
-def escape(s: str | None) -> str:
-    return html.escape(s or "", quote=True)
+def escape(s: str | None, *, quote: bool = True) -> str:
+    """quote=False keeps ' and " as typed, for text that sits between tags and never inside an attribute: escaping
+    <, > and & is what stops it closing or forging a tag there."""
+    return html.escape(s or "", quote=quote)
 
 
 def source_tag(ref: str, *, document: str, location: str, content: str, date: str | None = None) -> str:
