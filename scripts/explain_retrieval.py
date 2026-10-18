@@ -20,6 +20,7 @@ import httpx
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.config import settings  # noqa: E402
+from app.rag import retrieval  # noqa: E402
 
 
 def leg(rank: int | None, k: int, weight: float = 1.0) -> tuple[float, str]:
@@ -31,9 +32,12 @@ def leg(rank: int | None, k: int, weight: float = 1.0) -> tuple[float, str]:
 
 
 def boost_leg(id_hit: bool, k: int, enabled: bool) -> tuple[float, str]:
-    """retrieve()'s identifier boost (D-02, the `id_boost` parameter in app/rag/retrieval.py): a chunk that matched an
-    exact identifier also scores as a rank-1 vector hit. Without it every identifier hit would print MISMATCH."""
-    return leg(1, k) if id_hit and enabled else (0.0, "0")
+    """retrieve()'s identifier boost (D-02), from the same function (app/rag/retrieval.py id_boost): a chunk that
+    matched an exact identifier also scores as a rank-1 vector hit. Without it every identifier hit would print
+    MISMATCH."""
+    if not (id_hit and enabled):
+        return 0.0, "0"
+    return retrieval.id_boost(k, enabled), f"1/({k}+1)"
 
 
 def legs(hit: dict, rrf_k: int, w_lex: float, id_boost: bool) -> list[tuple[float, str]]:

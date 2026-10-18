@@ -38,7 +38,8 @@ jobs:
     env:
       # Where tiktoken keeps its encodings. Ingestion's chunker has no offline fallback, so the files are fetched once
       # below (as the Dockerfile bakes them) and cached, instead of downloaded by whichever test needs them first.
-      TIKTOKEN_CACHE_DIR: ${{ github.workspace }}/.cache/tiktoken
+      # Outside the checkout, so it never shows up as untracked files (a job-level env cannot use runner.temp).
+      TIKTOKEN_CACHE_DIR: /tmp/tiktoken-cache
     services:
       # Host ports are compose.yaml's defaults (PG_PORT 5433, VALKEY_PORT 6380, S3_PORT 9200): conftest reads those.
       # Service containers cannot take a `command`, so compose's tuning flags (shared_buffers, AOF, maxmemory) are

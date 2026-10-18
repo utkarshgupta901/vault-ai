@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.fake_provider import fake_vector
 from app.config import settings
+from app.rag import retrieval
 from app.rag.retrieval import retrieve
 from tests.chat.helpers import API, insert_document
 from tests.conftest import DEMO
@@ -61,3 +62,12 @@ async def test_script_ranking_equals_retrieve(client: AsyncClient, db: AsyncSess
     unboosted = {h["chunk_id"]: script.fused_score(h, settings.RRF_K, settings.LEXICAL_WEIGHT, False) for h in hits}
     assert truth.chunks[0].content.startswith("9.2 ")
     assert max(unboosted, key=lambda cid: (unboosted[cid], -cid)) != truth.chunks[0].chunk_id
+
+
+def test_script_reuses_the_boost_of_retrieve(monkeypatch: pytest.MonkeyPatch) -> None:
+    """One formula, not two kept equal by a test: an edit to the boost in app/rag reaches the script too."""
+    assert retrieval.id_boost(60, True) == pytest.approx(1 / 61) and retrieval.id_boost(60, False) == 0.0
+    script = _load_script()
+    monkeypatch.setattr(retrieval, "id_boost", lambda rrf_k, enabled: 0.5 if enabled else 0.0)
+    assert script.boost_leg(True, 60, True) == (0.5, "1/(60+1)")
+    assert script.boost_leg(True, 60, False) == (0.0, "0") and script.boost_leg(False, 60, True) == (0.0, "0")

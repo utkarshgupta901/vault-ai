@@ -69,6 +69,18 @@ def test_stateful_services_are_published_on_loopback_only() -> None:
     assert ports["api"] == ["${API_PORT:-8000}:8000"]               # the API (behind its API keys) is unchanged
 
 
+# --- .github/workflows/ci.yml -----------------------------------------------------------------------------------
+def test_ci_keeps_the_tokenizer_cache_outside_the_checkout() -> None:
+    """An untracked .cache/ inside the checkout (it is not gitignored) makes the tree dirty for anything that checks it
+    later, such as `git describe --dirty` or the eval runner's git_dirty(). A job-level env cannot read the runner
+    context (runner.temp), so the path is a fixed one outside the workspace."""
+    job = yaml.safe_load((ROOT / ".github" / "workflows" / "ci.yml").read_text())["jobs"]["test"]
+    cache_dir = job["env"]["TIKTOKEN_CACHE_DIR"]
+    assert cache_dir.startswith("/") and "${{" not in cache_dir, cache_dir
+    cache_step = next(step for step in job["steps"] if step.get("uses", "").startswith("actions/cache"))
+    assert cache_step["with"]["path"] == "${{ env.TIKTOKEN_CACHE_DIR }}"
+
+
 # --- Makefile ---------------------------------------------------------------------------------------------------
 def make_dry_run(tmp_path: Path, *args: str, **env: str) -> subprocess.CompletedProcess[str]:
     """`make -n` on a copy of the Makefile in an empty folder. Recipes are printed, not run (a recursive $(MAKE) line

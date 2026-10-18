@@ -131,6 +131,14 @@ def vector_literal(vec: list[float]) -> str:
     return "[" + ",".join(repr(float(x)) for x in vec) + "]"
 
 
+def id_boost(rrf_k: int, enabled: bool) -> float:
+    """The identifier boost (D-02): a chunk matching an exact identifier (LRK-4471, 9.2, Appendix C) gets the score of
+    a rank-1 semantic hit on top of its lexical score. Without it, a chunk found ONLY by keyword (rank 1) scores 1/61
+    and loses to every chunk that is merely "okay" on both legs (~2/65), then the per-document cap cuts it.
+    scripts/explain_retrieval.py calls this too, so its arithmetic cannot drift from the real ranking."""
+    return 1.0 / (rrf_k + 1) if enabled else 0.0
+
+
 def build_sql(mode: str) -> str:
     semantic = _SEMANTIC if mode in ("hybrid", "vector") else _NO_SEMANTIC
     lexical = _LEXICAL if mode in ("hybrid", "keyword") else _NO_LEXICAL
@@ -164,11 +172,7 @@ async def retrieve(
     params: dict = {
         "owner_id": owner_id, "doc_ids": list(document_ids), "n": candidates or settings.RETRIEVAL_CANDIDATES,
         "rrf_k": settings.RRF_K, "w_lex": settings.LEXICAL_WEIGHT if w_lex is None else w_lex,
-        "per_doc_cap": per_doc_cap, "k": k,
-        # Identifier boost: a chunk matching an exact identifier (LRK-4471, 9.2, Appendix C) gets the score of a
-        # rank-1 semantic hit on top of its lexical score. Without it, a chunk found ONLY by keyword (rank 1) scores
-        # 1/61 and loses to every chunk that is merely "okay" on both legs (~2/65), then the per-document cap cuts it.
-        "id_boost": (1.0 / (settings.RRF_K + 1)) if settings.ID_HIT_BOOST else 0.0,
+        "per_doc_cap": per_doc_cap, "k": k, "id_boost": id_boost(settings.RRF_K, settings.ID_HIT_BOOST),
     }
     if mode in ("hybrid", "vector"):
         params["qvec"] = vector_literal(query_vec or [])
