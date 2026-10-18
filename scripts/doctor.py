@@ -3,7 +3,8 @@
     uv run python scripts/doctor.py [--api http://localhost:8000] [--key vault-demo-key]
 
 Checks, in the order they matter on demo day:
-  - the API is reachable (/health/live) and ready (/health/ready), with every dependency check listed;
+  - the API is reachable (/health/live) and ready (/health/ready), with every dependency check listed; the AI check
+    is soft (WARN), except that a key or model the provider rejects (auth_failed) FAILs: no chat turn can work;
   - both Celery queues (ingest, ai) have a consumer: without them uploads queue forever;
   - the API key works;
   - the demo corpus (plus any real document in demo_docs/user/) is present, ready and has insights (pre-seeded by
@@ -13,12 +14,15 @@ Checks, in the order they matter on demo day:
     first two);
   - today's AI spend for this key is well under its daily quota (/metrics/ai-usage, when deployed);
   - the keyword leg ranks the LRK-4471 board-update chunk first (/search, when deployed);
+  - one real embeddings call works: a vector-mode /search for a query unique to this run (the API's embedding cache
+    cannot answer it), which must neither fail nor quietly fall back to keyword (costs a fraction of a cent);
   - which models the server is configured to use.
 Each assessment is a pure function of an API response, so it is unit-tested without a server."""
 
 import argparse
 import os
 import sys
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -56,7 +60,8 @@ def assess_ready(status_code: int, body: dict[str, Any]) -> list[Check]:
     for name, c in (body.get("checks") or {}).items():
         extra = {k: v for k, v in c.items() if k not in ("ok", "ms")}
         detail = f"{c.get('ms', '-')} ms" + (f" {extra}" if extra else "")
-        bad = "FAIL" if name in HARD_DEPENDENCIES else "WARN"
+        # A rejected AI key/model: the API still serves (so readiness only says degraded), but no answer can work.
+        bad = "FAIL" if name in HARD_DEPENDENCIES or c.get("auth_failed") else "WARN"
         checks.append(Check("PASS" if c.get("ok") else bad, f"  {name}", detail))
     return checks
 
@@ -125,6 +130,31 @@ def assess_lrk_search(resp: dict[str, Any]) -> Check:
                  if hits else "LRK-4471 returned no hits")
 
 
+def embedding_probe_query() -> str:
+    """Unique to this run, so the API's query-embedding cache cannot answer it: the embeddings API is really called."""
+    return f"doctor embedding probe {uuid.uuid4()}"
+
+
+def assess_embedding_probe(resp: dict[str, Any]) -> Check:
+    """When the query embedding fails, /search still answers 200 but drops the vector leg; `mode` (the legs that
+    actually ran) is the only sign of it."""
+    mode = resp.get("mode")
+    if mode == "vector":
+        return Check("PASS", "embedding probe", f"live embeddings call OK, top_similarity={resp.get('top_similarity')}")
+    return Check("FAIL", "embedding probe", f"vector search ran as mode={mode}: the query embedding failed "
+                 "(API key, model or quota; see the API log)")
+
+
+def run_embedding_probe(client: VaultClient, docs: list[dict[str, Any]]) -> Check:
+    if not any(d["status"] == "ready" for d in docs):
+        return Check("WARN", "embedding probe", "skipped: no ready document (the API embeds a query only to search one)")
+    try:
+        resp = client.search(embedding_probe_query(), document_ids=None, mode="vector", k=1)
+    except ApiError as exc:
+        return Check("FAIL", "embedding probe", f"vector search failed: {exc}")
+    return assess_embedding_probe(resp)
+
+
 # ---------------------------------------------------------------------------------------------------------------
 def colour(level: str) -> str:
     if not sys.stdout.isatty() or os.environ.get("NO_COLOR"):
@@ -156,6 +186,7 @@ def gather(client: VaultClient) -> list[Check]:
         checks.append(Check("WARN", "AI spend today", "metrics API not deployed"))
     if client.has_route(f"{API_PREFIX}/search"):
         checks.append(assess_lrk_search(client.search("LRK-4471", document_ids=None, mode="keyword", k=5)))
+        checks.append(run_embedding_probe(client, docs))
     chat = client.has_route(f"{API_PREFIX}/chat/sessions")
     checks.append(Check("PASS" if chat else "FAIL", "chat API", "deployed" if chat else "not in /openapi.json"))
     models = ready.get("models") or {}

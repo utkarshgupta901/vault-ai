@@ -3,8 +3,10 @@ no key). Two rules are pinned here:
   - only OpenAI's own errors become ProviderError; Celery's SoftTimeLimitExceeded keeps its type, so the worker can
     fail the run as PROCESSING_TIMEOUT instead of retrying it as a "transient" provider error;
   - a structured reply that was billed but is unusable (truncated, unparsable, refused) carries its usage, so the
-    caller can still write the ai_usage row."""
+    caller can still write the ai_usage row.
+Also: embeddings come back at the size the database stores, and a streamed refusal is an error, not an empty answer."""
 
+import json
 from collections.abc import Callable
 from typing import Any
 
@@ -14,7 +16,7 @@ from celery.exceptions import SoftTimeLimitExceeded
 from pydantic import BaseModel
 
 from app.ai.openai_provider import OpenAIProvider
-from app.ai.provider import ProviderError
+from app.ai.provider import ProviderError, StreamEnd
 from app.config import settings
 
 USAGE = {"input_tokens": 100, "input_tokens_details": {"cached_tokens": 5}, "output_tokens": 8000,
@@ -122,3 +124,81 @@ def test_soft_time_limit_inside_an_embedding_call_keeps_its_type(provider) -> No
 def test_soft_time_limit_inside_a_structured_call_keeps_its_type(provider) -> None:
     with pytest.raises(SoftTimeLimitExceeded):
         complete(provider(_soft_limit_fires))
+
+
+# --- embeddings: the size the database stores -------------------------------------------------------------------------
+def embedding_body(dims: int, n: int = 1) -> dict[str, Any]:
+    return {"object": "list", "model": settings.EMBED_MODEL,
+            "data": [{"object": "embedding", "index": i, "embedding": [0.01] * dims} for i in range(n)],
+            "usage": {"prompt_tokens": 7, "total_tokens": 7}}
+
+
+def recording(body: dict[str, Any], sent: list[dict[str, Any]]) -> Handler:
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        sent.append(json.loads(request.content))
+        return httpx2.Response(200, json=body)
+    return handler
+
+
+def test_embeddings_ask_for_the_stored_dimensions(provider) -> None:
+    sent: list[dict[str, Any]] = []
+    result = provider(recording(embedding_body(settings.EMBED_DIMS, n=2), sent)).embed(["a", "b"])
+    assert sent[0]["model"] == settings.EMBED_MODEL and sent[0]["dimensions"] == settings.EMBED_DIMS
+    assert [len(v) for v in result.vectors] == [settings.EMBED_DIMS] * 2
+
+
+def test_older_embedding_models_get_no_dimensions_parameter(provider, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "EMBED_MODEL", "text-embedding-ada-002")     # rejects `dimensions`
+    sent: list[dict[str, Any]] = []
+    provider(recording(embedding_body(settings.EMBED_DIMS), sent)).embed(["a"])
+    assert "dimensions" not in sent[0]
+
+
+async def test_embedding_of_the_wrong_size_is_rejected_with_usage(provider) -> None:
+    """A 3072-d vector would be billed and then fail at the vector(1536) write; fail here, with the billed usage."""
+    p = provider(reply(embedding_body(3072)))
+    with pytest.raises(ProviderError) as sync_error:
+        p.embed(["a"])
+    with pytest.raises(ProviderError) as async_error:
+        await p.aembed(["a"])
+    for err in (sync_error.value, async_error.value):
+        assert err.kind == "bad_request" and err.usage is not None and err.usage.input_tokens == 7
+
+
+# --- streaming --------------------------------------------------------------------------------------------------------
+def sse(*events: dict[str, Any]) -> Handler:
+    body = "".join(f"event: {e['type']}\ndata: {json.dumps(e)}\n\n" for e in events)
+    return lambda request: httpx2.Response(200, content=body.encode(), headers={"content-type": "text/event-stream"})
+
+
+def part_event(kind: str, seq: int, **fields: Any) -> dict[str, Any]:
+    return {"type": kind, "item_id": "msg_1", "output_index": 0, "content_index": 0, "sequence_number": seq,
+            **fields}
+
+
+async def stream_items(p: OpenAIProvider) -> list[Any]:
+    return [item async for item in p.astream_text(model="gpt-test", effort="low", instructions="i", input="x",
+                                                  max_output_tokens=8000)]
+
+
+async def test_a_streamed_answer_yields_text_then_its_end(provider) -> None:
+    items = await stream_items(provider(sse(
+        part_event("response.output_text.delta", 1, delta="60 days", logprobs=[]),
+        {"type": "response.completed", "sequence_number": 2, "response": response_body("60 days")},
+    )))
+    assert items[0] == "60 days" and isinstance(items[-1], StreamEnd) and items[-1].usage.output_tokens == 8000
+
+
+async def test_a_streamed_refusal_raises_instead_of_ending_empty(provider) -> None:
+    """Refusal events used to be skipped: the caller saw a "successful" stream with no text at all."""
+    refusal = "I can't help with that."
+    with pytest.raises(ProviderError) as exc_info:
+        await stream_items(provider(sse(
+            part_event("response.refusal.delta", 1, delta="I can't "),
+            part_event("response.refusal.delta", 2, delta="help with that."),
+            part_event("response.refusal.done", 3, refusal=refusal),
+            {"type": "response.completed", "sequence_number": 4, "response": response_body(None, refusal=refusal)},
+        )))
+    err = exc_info.value
+    assert err.kind == "refusal" and err.message == refusal
+    assert err.usage is not None and err.usage.output_tokens == 8000         # a refusal is billed too

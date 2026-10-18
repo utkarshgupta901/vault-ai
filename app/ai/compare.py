@@ -184,6 +184,12 @@ async def compare_documents(owner_id: uuid.UUID, req: CompareRequest) -> Compare
                        f"{COMPARE_MAX_INPUT_TOKENS}). Use multi-document chat instead.",
                        {"tokens": tokens, "max_tokens": COMPARE_MAX_INPUT_TOKENS, "hint": "use multi-document chat"})
     comparison, usage = await _generate(prompt_input, owner_id)
+    # The call is paid: record it before any post-processing, so neither a postprocess bug nor a cancelled request
+    # (client gone) loses the ledger row. Shielded, because a cancelled task would be cancelled again at the DB await.
+    with anyio.CancelScope(shield=True):
+        async with async_session() as db:
+            db.add(usage_row(operation="compare", usage=usage, owner_id=owner_id, prompt_version=prompt.VERSION))
+            await db.commit()
     out = CompareOut(
         documents=[ComparedDocument(ref=d.ref, document_id=d.id, filename=d.filename, title=d.title) for d in docs],
         dimensions=postprocess(comparison, docs),
@@ -191,8 +197,5 @@ async def compare_documents(owner_id: uuid.UUID, req: CompareRequest) -> Compare
         differences=[s.strip() for s in comparison.differences if s.strip()],
         summary=comparison.summary.strip(), model=usage.model, prompt_version=prompt.VERSION,
     )
-    async with async_session() as db:
-        db.add(usage_row(operation="compare", usage=usage, owner_id=owner_id, prompt_version=prompt.VERSION))
-        await db.commit()
     log.info("documents_compared", documents=len(docs), tokens=tokens, dimensions=len(out.dimensions))
     return out

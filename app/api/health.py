@@ -11,7 +11,10 @@ tabs, `make doctor`/smoke/eval preflights), so it must stay cheap and bounded wh
     check that runs out of time reports ok=false, error="timed out" instead of hanging the request.
   - The two checks that need a thread (Celery worker inspect, S3 ping) go through SingleFlightCheck: at most one of
     each runs at a time, concurrent callers share its result, and the result is reused for THREAD_CHECK_TTL_S.
+    The DB probe gets the same treatment from AsyncSingleFlightCheck, with a shorter TTL (DB_CHECK_TTL_S).
   - The worker inspect runs on its own broker connection, never one borrowed from Celery's shared pool.
+  - A failed check reports a generic error ("unreachable", "timed out after 2s"); the exception detail goes to the
+    log. Raw exception text can name hosts, users or bucket URLs, and this endpoint needs no API key.
 
 Why (incident 2026-10-13): the worker check used to call `inspect().active_queues()` on every request. Celery's
 broadcast holds a connection from the shared broker pool (broker_pool_limit=10) while kombu borrows a SECOND pool
@@ -21,27 +24,32 @@ once those were gone every `to_thread` call hung (uploads, downloads) and so did
 httpx's truststore SSLContext makes anyio run `wrap_bio` for the TLS handshake in a worker thread.
 """
 
+import asyncio
 import threading
 import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
 import anyio
+import structlog
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
-from app.ai import PROVIDER_RESET_AFTER_FAILURES, consecutive_provider_failures
+from app.ai import PROVIDER_RESET_AFTER_FAILURES, provider_failures, provider_rejections
 from app.config import settings
 from app.core.db import async_session
 from app.core.redis import get_async_cache
 from app.services import storage
 from app.worker.celery_app import celery_app
 
+log = structlog.get_logger(__name__)
+
 router = APIRouter(prefix="/health", tags=["health"])
 EXPECTED_HEAD = "0001"
 CHECK_TIMEOUT_S = 2.0          # per check; checks run concurrently, so this is also ~the endpoint's worst case
 THREAD_CHECK_TTL_S = 10.0      # a worker/S3 result is reused this long (the dashboard polls every 15 s)
+DB_CHECK_TTL_S = 2.0           # short: the DB is the hard dependency a load balancer drains on
 INSPECT_TIMEOUT_S = 1.0        # how long Celery waits for worker replies (the call always takes about this long)
 _WAIT_POLL_S = 0.05
 
@@ -110,6 +118,57 @@ class SingleFlightCheck:
             self._lock.release()
 
 
+_Outcome = tuple[float, Any, str | None]     # (finished_at, value, error)
+
+
+class AsyncSingleFlightCheck:
+    """SingleFlightCheck for a check that is a coroutine (the DB probe needs no thread). Same contract: at most one
+    run at a time, concurrent callers share it, and its outcome (failures too) is reused for `ttl_s`.
+
+    - The run is a task of its own, shielded from its callers: a caller that gives up at CHECK_TIMEOUT_S leaves it
+      running, and the next caller joins it instead of opening another connection to a database that is already slow.
+    - A run that reaches `timeout_s` is abandoned and NOT cached, so the next caller starts a fresh one: a hung
+      connection must not keep readiness red after the database is back.
+    """
+
+    def __init__(self, fn: Callable[[], Awaitable[Any]], ttl_s: float, timeout_s: float = CHECK_TIMEOUT_S):
+        self._fn = fn
+        self._ttl_s = ttl_s
+        self._timeout_s = timeout_s
+        self._run: asyncio.Task[_Outcome | None] | None = None
+        self._result: _Outcome | None = None
+
+    def reset(self) -> None:
+        """Forget the cached result (tests)."""
+        self._result = None
+
+    async def get(self) -> Any:
+        outcome = self._result
+        if outcome is None or time.monotonic() - outcome[0] >= self._ttl_s:
+            if self._run is None or self._run.done():
+                self._run = asyncio.create_task(self._refresh())
+            outcome = await asyncio.shield(self._run)
+            if outcome is None:
+                raise TimeoutError(f"timed out after {self._timeout_s:g}s")
+        _, value, error = outcome
+        if error is not None:
+            raise RuntimeError(error)
+        return value
+
+    async def _refresh(self) -> _Outcome | None:
+        """Never raises: the outcome is cached and returned to every caller; None when the run hit its time limit."""
+        try:
+            async with asyncio.timeout(self._timeout_s):
+                value = await self._fn()
+            outcome: _Outcome = (time.monotonic(), value, None)
+        except TimeoutError:
+            return None
+        except Exception as exc:  # noqa: BLE001 - reported as the check's error
+            outcome = (time.monotonic(), None, str(exc)[:200] or type(exc).__name__)
+        self._result = outcome
+        return outcome
+
+
 def _worker_queues() -> dict[str, int]:
     """Consumers per queue, from the live workers' replies.
 
@@ -128,7 +187,8 @@ workers_check = SingleFlightCheck(_worker_queues, ttl_s=THREAD_CHECK_TTL_S)
 storage_check = SingleFlightCheck(storage.ping, ttl_s=THREAD_CHECK_TTL_S)
 
 
-async def _timed(fn: Callable[[], Awaitable[Any]]) -> tuple[bool, Any, int]:
+async def _timed(name: str, fn: Callable[[], Awaitable[Any]]) -> tuple[bool, Any, int]:
+    """One check under CHECK_TIMEOUT_S. A failure is reported generically (see the module docstring) and logged."""
     started = time.perf_counter()
 
     def ms() -> int:
@@ -141,7 +201,8 @@ async def _timed(fn: Callable[[], Awaitable[Any]]) -> tuple[bool, Any, int]:
     except TimeoutError:
         return False, f"timed out after {CHECK_TIMEOUT_S:g}s", ms()
     except Exception as exc:  # noqa: BLE001
-        return False, str(exc)[:200], ms()
+        log.warning("health_check_failed", check=name, error=str(exc)[:200] or type(exc).__name__)
+        return False, "unreachable", ms()
 
 
 async def _db() -> dict[str, Any]:
@@ -152,32 +213,49 @@ async def _db() -> dict[str, Any]:
     return {"pgvector": vector, "alembic_head": head}
 
 
+db_check = AsyncSingleFlightCheck(_db, ttl_s=DB_CHECK_TTL_S)
+
+
 async def _redis() -> bool:
     return bool(await get_async_cache().ping())
 
 
+def _rejection_error(rejections: dict[str, int]) -> str:
+    """Generic on purpose: the vendor's message for a 401 can echo part of the key."""
+    path, status = next(iter(rejections.items()))
+    what = "AI model not found" if status == 404 else "AI provider rejected our credentials"
+    return f"{what} (HTTP {status}, {path})"
+
+
 def _ai_check() -> dict[str, Any]:
-    """Configured, and the last AI calls in this process did not all fail (see app.ai's provider watchdog)."""
+    """Configured, the provider accepts our key and models, and neither path's last calls all failed in this process
+    (see app.ai's provider watchdog). `consecutive_failures` is the worse path's count."""
     configured = settings.LLM_PROVIDER == "fake" or bool(settings.OPENAI_API_KEY)
-    failures = consecutive_provider_failures()
-    check: dict[str, Any] = {"ok": configured and failures < PROVIDER_RESET_AFTER_FAILURES,
-                             "provider": settings.LLM_PROVIDER, "consecutive_failures": failures}
+    failures = provider_failures()
+    rejections = provider_rejections()
+    worst_path = max(failures, key=failures.__getitem__)
+    worst = failures[worst_path]
+    check: dict[str, Any] = {"ok": configured and not rejections and worst < PROVIDER_RESET_AFTER_FAILURES,
+                             "provider": settings.LLM_PROVIDER, "consecutive_failures": worst,
+                             "failures": failures, "auth_failed": bool(rejections)}
     if not configured:
         check["error"] = "OPENAI_API_KEY is not set"
+    elif rejections:
+        check["error"] = _rejection_error(rejections)
     elif not check["ok"]:
-        check["error"] = f"last {failures} AI calls failed"
+        check["error"] = f"last {worst} {worst_path} calls failed"
     return check
 
 
 @router.get("/ready", summary="Readiness probe (hard vs degraded dependencies)")
 async def ready() -> JSONResponse:
     probes: dict[str, Callable[[], Awaitable[Any]]] = {
-        "database": _db, "redis": _redis, "workers": workers_check.get, "storage": storage_check.get,
+        "database": db_check.get, "redis": _redis, "workers": workers_check.get, "storage": storage_check.get,
     }
     results: dict[str, tuple[bool, Any, int]] = {}
 
     async def run(name: str) -> None:
-        results[name] = await _timed(probes[name])
+        results[name] = await _timed(name, probes[name])
 
     async with anyio.create_task_group() as tg:   # concurrently: the slowest check bounds the response, not the sum
         for name in probes:

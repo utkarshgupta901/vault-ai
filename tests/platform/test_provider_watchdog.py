@@ -1,11 +1,13 @@
-"""The API's provider watchdog: after PROVIDER_RESET_AFTER_FAILURES failed calls in a row the cached provider is
-dropped, so the next get_provider() builds a fresh client; any answer resets the count."""
+"""The API's provider watchdog: after PROVIDER_RESET_AFTER_FAILURES failed calls in a row on one path (embeddings or
+text generation) the cached provider is dropped, so the next get_provider() builds a fresh client; any answer on that
+path resets its count. An auth/model rejection (401/403/404) is remembered until that path answers again."""
 
 import asyncio
 from collections.abc import AsyncIterator, Iterator
 from typing import Any
 
 import pytest
+from pydantic import BaseModel
 
 import app.ai as ai
 from app.ai import PROVIDER_RESET_AFTER_FAILURES, ProviderWatchdog, get_provider, set_provider
@@ -77,13 +79,14 @@ async def test_caller_timeouts_count_as_failures() -> None:
     watched = ProviderWatchdog(Hanging())
     set_provider(watched)
     try:
-        for _ in range(PROVIDER_RESET_AFTER_FAILURES - 1):
-            with pytest.raises(TimeoutError):
-                async with asyncio.timeout(0.05):       # how rag/cache.py bounds the query embedding
-                    await watched.aembed(["q"])
         with pytest.raises(TimeoutError):
             async with asyncio.timeout(0.05):           # how rag/generation.py bounds the first token
                 await anext(watched.astream_text(**STREAM_ARGS))
+        assert ai.provider_failures() == {"embeddings": 0, "generation": 1}
+        for _ in range(PROVIDER_RESET_AFTER_FAILURES):
+            with pytest.raises(TimeoutError):
+                async with asyncio.timeout(0.05):       # how rag/cache.py bounds the query embedding
+                    await watched.aembed(["q"])
         assert get_provider() is not watched
     finally:
         set_provider(None)
@@ -107,3 +110,70 @@ def test_workers_get_the_bare_provider() -> None:
         assert isinstance(get_provider(for_worker=True), FakeProvider)   # Celery retries own failures there
     finally:
         set_provider(None)
+
+
+# --- per-path counts and auth/model rejections ---------------------------------------------------------------------
+class Reply(BaseModel):
+    answer: str
+
+
+JSON_ARGS: dict[str, Any] = {**STREAM_ARGS, "schema": Reply}
+
+
+async def _fails(call: Any) -> None:
+    with pytest.raises(ProviderError):
+        await call
+
+
+async def _stream_fails(watched: ProviderWatchdog) -> None:
+    with pytest.raises(ProviderError):
+        async for _ in watched.astream_text(**STREAM_ARGS):
+            pass
+
+
+async def test_an_embedding_success_does_not_hide_failing_text_generation(watched: ProviderWatchdog) -> None:
+    """One follow-up turn with a dead answer path: condense fails, the query embedding works, the answer and its
+    fallback fail. With one shared count the embedding reset it in the middle and readiness never tripped."""
+    fake: FakeProvider = watched.inner           # type: ignore[assignment]
+    fake.fail_next.append(TRANSIENT)
+    await _fails(watched.acomplete_json(**JSON_ARGS))           # condense
+    await watched.aembed(["q"])                                 # the query embedding answers
+    fake.fail_next.extend([TRANSIENT, TRANSIENT])
+    await _stream_fails(watched)                                # answer model
+    await _stream_fails(watched)                                # fallback model
+    assert ai.provider_failures() == {"embeddings": 0, "generation": PROVIDER_RESET_AFTER_FAILURES}
+    assert ai.consecutive_provider_failures() == PROVIDER_RESET_AFTER_FAILURES
+    assert get_provider() is not watched                        # the shared client was reset
+
+
+async def test_a_text_success_does_not_hide_failing_embeddings(watched: ProviderWatchdog) -> None:
+    fake: FakeProvider = watched.inner           # type: ignore[assignment]
+    for _ in range(PROVIDER_RESET_AFTER_FAILURES):
+        fake.fail_next.append(TRANSIENT)
+        await _fails(watched.aembed(["q"]))
+        await watched.acomplete_text(**STREAM_ARGS)
+    assert ai.provider_failures() == {"embeddings": PROVIDER_RESET_AFTER_FAILURES, "generation": 0}
+
+
+@pytest.mark.parametrize("status", [401, 403, 404])
+async def test_an_auth_or_model_rejection_is_sticky_until_that_path_answers(watched: ProviderWatchdog,
+                                                                           status: int) -> None:
+    """401/403 (key rejected) and 404 (model not found) fail every call the same way: the client works, but no chat
+    turn can. They used to count as successes, so readiness said ok while every call failed."""
+    fake: FakeProvider = watched.inner           # type: ignore[assignment]
+    fake.fail_next.append(ProviderError("bad_request", f"OpenAI rejected the request ({status}): vendor text",
+                                        None, status))
+    await _stream_fails(watched)
+    assert ai.provider_rejections() == {"generation": status}
+    await watched.aembed(["q"])                                 # the other path answering does not clear it
+    assert ai.provider_rejections() == {"generation": status}
+    assert get_provider() is watched                            # a new client would be rejected the same way
+    await watched.acomplete_text(**STREAM_ARGS)                 # the next success on the same path does
+    assert ai.provider_rejections() == {}
+
+
+async def test_other_http_rejections_are_not_auth_failures(watched: ProviderWatchdog) -> None:
+    fake: FakeProvider = watched.inner           # type: ignore[assignment]
+    fake.fail_next.append(ProviderError("bad_request", "OpenAI rejected the request (400): bad input", None, 400))
+    await _fails(watched.aembed(["q"]))
+    assert ai.provider_rejections() == {}

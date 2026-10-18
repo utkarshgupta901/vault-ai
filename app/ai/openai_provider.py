@@ -114,6 +114,15 @@ def _reasoning(effort: str) -> dict[str, str]:
     return {"effort": effort}
 
 
+def _embed_params() -> dict[str, Any]:
+    """text-embedding-3 models return 1536 (small) or 3072 (large) dimensions unless told otherwise, and the chunks
+    table stores vector(EMBED_DIMS); asking for EMBED_DIMS keeps a model switch from failing at the write. Older
+    models (ada-002) reject the parameter."""
+    if settings.EMBED_MODEL.startswith("text-embedding-3"):
+        return {"model": settings.EMBED_MODEL, "dimensions": settings.EMBED_DIMS}
+    return {"model": settings.EMBED_MODEL}
+
+
 class OpenAIProvider:
     name = "openai"
 
@@ -127,7 +136,7 @@ class OpenAIProvider:
     def embed(self, texts: list[str]) -> EmbedResult:
         started = time.perf_counter()
         try:
-            r = self._sync.embeddings.create(model=settings.EMBED_MODEL, input=texts)
+            r = self._sync.embeddings.create(input=texts, **_embed_params())
         except openai.OpenAIError as exc:  # only OpenAI's errors: see the module docstring
             raise _translate(exc) from exc
         return self._embed_result(r, started)
@@ -135,7 +144,7 @@ class OpenAIProvider:
     async def aembed(self, texts: list[str]) -> EmbedResult:
         started = time.perf_counter()
         try:
-            r = await self._async.embeddings.create(model=settings.EMBED_MODEL, input=texts)
+            r = await self._async.embeddings.create(input=texts, **_embed_params())
         except openai.OpenAIError as exc:
             raise _translate(exc) from exc
         return self._embed_result(r, started)
@@ -148,6 +157,10 @@ class OpenAIProvider:
             input_tokens=r.usage.prompt_tokens,
             latency_ms=int((time.perf_counter() - started) * 1000),
         )
+        wrong = {len(v) for v in vectors} - {settings.EMBED_DIMS}
+        if wrong:   # would fail later at the vector(EMBED_DIMS) write, after the call was billed
+            raise ProviderError("bad_request", f"Embedding model returned {sorted(wrong)} dimensions, expected "
+                                f"{settings.EMBED_DIMS}.", usage=usage)
         return EmbedResult(vectors=vectors, usage=usage)
 
     # --- Structured output -------------------------------------------------------------------------------
@@ -201,15 +214,27 @@ class OpenAIProvider:
             )
         except openai.OpenAIError as exc:
             raise _translate(exc) from exc
+        # A refusal arrives as refusal events, not text. Skipping them gave the caller an empty "successful" stream;
+        # instead it becomes the same "refusal" error as in structured output, raised once the usage is known.
+        answered = False
+        refusal: list[str] = []
         try:
             async for event in stream:
                 if event.type == "response.output_text.delta":
+                    answered = True
                     yield event.delta
+                elif event.type == "response.refusal.delta":
+                    refusal.append(event.delta)
                 elif event.type in ("response.completed", "response.incomplete"):
-                    yield StreamEnd(usage=_usage(model, event.response, started), status=event.response.status or "completed")
+                    usage = _usage(model, event.response, started)
+                    if refusal and not answered:
+                        raise ProviderError("refusal", "".join(refusal) or "Model refused.", usage=usage)
+                    yield StreamEnd(usage=usage, status=event.response.status or "completed")
                     return
                 elif event.type in ("response.failed", "error"):
                     raise ProviderError("transient", f"OpenAI stream failed: {getattr(event, 'message', event.type)}")
+            if refusal and not answered:     # the stream ended without its completion event
+                raise ProviderError("refusal", "".join(refusal) or "Model refused.")
         except openai.OpenAIError as exc:
             raise _translate(exc) from exc
         except _PARSE_ERRORS as exc:  # a garbled event: a provider/network glitch, worth a retry like any other
