@@ -9,10 +9,11 @@ The counts are per path because a chat turn mixes both: a working query embeddin
 must not hide that no answer can be generated. The counts also feed /health/ready, which reports the AI check as
 failing instead of "ok because a key is set".
 
-The watchdog also remembers an auth/model rejection (HTTP 401/403/404) until that path succeeds again. Those calls
-"answer", so they never counted as failures, yet with a revoked key or a missing model every call fails the same way
-(2026-10-17: readiness said ai ok while every call returned 401). A fresh client would not help, so they do not count
-towards a reset; readiness reports them instead.
+The watchdog also remembers an auth/model rejection (HTTP 401/403/404) per model, until that same model answers
+again. Those calls "answer", so they never counted as failures, yet with a revoked key or a missing model every call
+fails the same way (2026-10-17: readiness said ai ok while every call returned 401). A fresh client would not help, so
+they do not count towards a reset; readiness reports them instead. Per model, not per path, because a chat turn whose
+answer model is missing (404) still answers on the fallback model: that success must not hide the 404.
 
 Honest scope: on 2026-10-13 every OpenAI call from one API process timed out while a new process worked. The cause was
 the exhausted anyio thread pool (see api/health.py): the TLS handshake of a new connection needs a worker thread. A
@@ -24,7 +25,7 @@ Workers keep the bare provider: there Celery owns failures (retries with backoff
 import asyncio
 from collections.abc import AsyncIterator, Awaitable
 from contextlib import aclosing
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, TypeVar
 
 import structlog
@@ -44,10 +45,10 @@ R = TypeVar("R")
 
 @dataclass
 class _PathHealth:
-    """What the watchdog knows about one call path. A success replaces it with a fresh one."""
+    """What the watchdog knows about one call path. A success resets the failures and clears that model's rejection."""
 
     failures: int = 0                       # transient failures (or caller timeouts) in a row
-    rejected_status: int | None = None      # HTTP status of an auth/model rejection, until this path succeeds
+    rejected: dict[str, int] = field(default_factory=dict)   # model -> HTTP status of its rejection, until it answers
 
 
 def _fresh_health() -> dict[str, _PathHealth]:
@@ -91,9 +92,10 @@ def consecutive_provider_failures() -> int:
     return max(provider_failures().values())
 
 
-def provider_rejections() -> dict[str, int]:
-    """Paths whose provider currently rejects our key or model -> that HTTP status. Read by /health/ready."""
-    return {path: h.rejected_status for path, h in _health.items() if h.rejected_status is not None}
+def provider_rejections() -> dict[str, dict[str, int]]:
+    """Paths with a model the provider currently rejects (our key or that model) -> {model: HTTP status}. Read by
+    /health/ready, which names the model (the configured model names are public there already)."""
+    return {path: dict(h.rejected) for path, h in _health.items() if h.rejected}
 
 
 class ProviderWatchdog:
@@ -101,7 +103,7 @@ class ProviderWatchdog:
 
     A call FAILED when it raised a transient ProviderError (timeout, 5xx, connection error, 429) or was cancelled
     before the provider gave anything back (the caller's asyncio.timeout fired). A 401/403/404 is a REJECTION: the
-    client works, but our key or model does not; it is remembered until the path succeeds. Any other answer,
+    client works, but our key or model does not; it is remembered until that model answers. Any other answer,
     including a refusal or a bad_request, means the client works, so it counts as a success. For a stream, the first
     item decides. A cancellation can also be a client that went away; counting it is harmless because one success
     resets the count, and a needless reset only costs a new HTTPS connection."""
@@ -111,8 +113,10 @@ class ProviderWatchdog:
         self.name = inner.name
 
     # --- outcome bookkeeping --------------------------------------------------------------------------------
-    def _succeeded(self, path: str) -> None:
-        _health[path] = _PathHealth()
+    def _succeeded(self, path: str, model: str) -> None:
+        health = _health[path]
+        health.failures = 0
+        health.rejected.pop(model, None)       # another model's rejection stays: its calls still fail
 
     def _failed(self, path: str, reason: str) -> None:
         global _provider
@@ -122,31 +126,33 @@ class ProviderWatchdog:
             _provider = None   # the next get_provider() builds a fresh client; in-flight calls keep this one
             log.warning("ai_provider_reset", path=path, consecutive_failures=health.failures, reason=reason)
 
-    def _rejected(self, path: str, status: int) -> None:
-        """No reset (a fresh client sends the same key and model). Logged once per change, never with the vendor's
-        message: it can echo part of the key."""
-        if _health[path].rejected_status != status:
-            log.warning("ai_provider_rejected", path=path, status_code=status)
-        _health[path] = _PathHealth(rejected_status=status)
+    def _rejected(self, path: str, model: str, status: int) -> None:
+        """No reset (a fresh client sends the same key and model). The client did answer, so the failure count
+        restarts. Logged once per change, never with the vendor's message: it can echo part of the key."""
+        health = _health[path]
+        if health.rejected.get(model) != status:
+            log.warning("ai_provider_rejected", path=path, model=model, status_code=status)
+        health.failures = 0
+        health.rejected[model] = status
 
-    def _record_error(self, path: str, exc: ProviderError) -> None:
+    def _record_error(self, path: str, model: str, exc: ProviderError) -> None:
         if exc.status_code is not None and exc.status_code in AUTH_REJECTED_STATUSES:
-            self._rejected(path, exc.status_code)
+            self._rejected(path, model, exc.status_code)
         elif exc.kind == "transient":
             self._failed(path, exc.message)
         else:
-            self._succeeded(path)
+            self._succeeded(path, model)
 
-    async def _watch(self, path: str, call: Awaitable[R]) -> R:
+    async def _watch(self, path: str, model: str, call: Awaitable[R]) -> R:
         try:
             result = await call
         except ProviderError as exc:
-            self._record_error(path, exc)
+            self._record_error(path, model, exc)
             raise
         except asyncio.CancelledError:
             self._failed(path, "cancelled before the provider answered (timeout)")
             raise
-        self._succeeded(path)
+        self._succeeded(path, model)
         return result
 
     # --- LLMProvider -----------------------------------------------------------------------------------------
@@ -159,17 +165,17 @@ class ProviderWatchdog:
                                         schema=schema, max_output_tokens=max_output_tokens)
 
     async def aembed(self, texts: list[str]) -> EmbedResult:
-        return await self._watch(EMBEDDINGS, self.inner.aembed(texts))
+        return await self._watch(EMBEDDINGS, settings.EMBED_MODEL, self.inner.aembed(texts))
 
     async def acomplete_json(self, *, model: str, effort: str, instructions: str, input: str | list[Msg],
                              schema: type[T], max_output_tokens: int) -> tuple[T, Usage]:
-        return await self._watch(GENERATION, self.inner.acomplete_json(
+        return await self._watch(GENERATION, model, self.inner.acomplete_json(
             model=model, effort=effort, instructions=instructions, input=input, schema=schema,
             max_output_tokens=max_output_tokens))
 
     async def acomplete_text(self, *, model: str, effort: str, instructions: str, input: str | list[Msg],
                              max_output_tokens: int) -> tuple[str, Usage]:
-        return await self._watch(GENERATION, self.inner.acomplete_text(
+        return await self._watch(GENERATION, model, self.inner.acomplete_text(
             model=model, effort=effort, instructions=instructions, input=input, max_output_tokens=max_output_tokens))
 
     async def astream_text(self, *, model: str, effort: str, instructions: str, input: str | list[Msg],
@@ -182,11 +188,11 @@ class ProviderWatchdog:
                 async for item in stream:
                     if not answered:
                         answered = True
-                        self._succeeded(GENERATION)
+                        self._succeeded(GENERATION, model)
                     yield item
             except ProviderError as exc:
                 if not answered:
-                    self._record_error(GENERATION, exc)
+                    self._record_error(GENERATION, model, exc)
                 raise
             except asyncio.CancelledError:
                 if not answered:

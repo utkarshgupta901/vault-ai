@@ -16,7 +16,7 @@ from tests.evals.test_scripts import load_script
 
 UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")
 AUTH_FAILED = {"ok": False, "provider": "openai", "auth_failed": True,
-               "error": "AI provider rejected our credentials (HTTP 401, embeddings)"}
+               "error": "AI provider rejected our credentials (HTTP 401, embeddings: text-embedding-3-small)"}
 
 
 class ProbedApi(FakeVaultApi):

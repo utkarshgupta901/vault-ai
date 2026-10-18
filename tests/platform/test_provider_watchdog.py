@@ -164,11 +164,28 @@ async def test_an_auth_or_model_rejection_is_sticky_until_that_path_answers(watc
     fake.fail_next.append(ProviderError("bad_request", f"OpenAI rejected the request ({status}): vendor text",
                                         None, status))
     await _stream_fails(watched)
-    assert ai.provider_rejections() == {"generation": status}
+    assert ai.provider_rejections() == {"generation": {"m": status}}
     await watched.aembed(["q"])                                 # the other path answering does not clear it
-    assert ai.provider_rejections() == {"generation": status}
+    assert ai.provider_rejections() == {"generation": {"m": status}}
     assert get_provider() is watched                            # a new client would be rejected the same way
-    await watched.acomplete_text(**STREAM_ARGS)                 # the next success on the same path does
+    await watched.acomplete_text(**STREAM_ARGS)                 # the next success of the same model does
+    assert ai.provider_rejections() == {}
+
+
+async def test_another_model_answering_does_not_clear_a_models_rejection(watched: ProviderWatchdog) -> None:
+    """Every chat turn whose answer model is missing (404) answers on the fallback model. That success used to clear
+    the path's rejection, so readiness said ok while every turn paid a failed first attempt."""
+    fake: FakeProvider = watched.inner           # type: ignore[assignment]
+    answer, fast = {**STREAM_ARGS, "model": "answer-model"}, {**STREAM_ARGS, "model": "fast-model"}
+    fake.fail_next.append(ProviderError("bad_request", "OpenAI rejected the request (404): no such model", None, 404))
+    with pytest.raises(ProviderError):
+        async for _ in watched.astream_text(**answer):
+            pass
+    _ = [item async for item in watched.astream_text(**fast)]      # the fallback answers
+    await watched.acomplete_json(**{**JSON_ARGS, "model": "fast-model"})
+    assert ai.provider_rejections() == {"generation": {"answer-model": 404}}
+    assert ai.provider_failures() == {"embeddings": 0, "generation": 0}
+    _ = [item async for item in watched.astream_text(**answer)]    # the answer model works again
     assert ai.provider_rejections() == {}
 
 

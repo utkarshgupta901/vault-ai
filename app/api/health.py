@@ -13,8 +13,9 @@ tabs, `make doctor`/smoke/eval preflights), so it must stay cheap and bounded wh
     each runs at a time, concurrent callers share its result, and the result is reused for THREAD_CHECK_TTL_S.
     The DB probe gets the same treatment from AsyncSingleFlightCheck, with a shorter TTL (DB_CHECK_TTL_S).
   - The worker inspect runs on its own broker connection, never one borrowed from Celery's shared pool.
-  - A failed check reports a generic error ("unreachable", "timed out after 2s"); the exception detail goes to the
-    log. Raw exception text can name hosts, users or bucket URLs, and this endpoint needs no API key.
+  - A failed check reports a generic error ("unreachable" when the dependency could not be reached at all, "check
+    failed (see the API log)" when it was reached and failed there, "timed out after 2s"); the exception detail goes
+    to the log. Raw exception text can name hosts, users or bucket URLs, and this endpoint needs no API key.
 
 Why (incident 2026-10-13): the worker check used to call `inspect().active_queues()` on every request. Celery's
 broadcast holds a connection from the shared broker pool (broker_pool_limit=10) while kombu borrows a SECOND pool
@@ -28,9 +29,13 @@ import asyncio
 import threading
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any
 
 import anyio
+import kombu.exceptions
+import redis.exceptions
+import sqlalchemy.exc
 import structlog
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
@@ -52,6 +57,38 @@ THREAD_CHECK_TTL_S = 10.0      # a worker/S3 result is reused this long (the das
 DB_CHECK_TTL_S = 2.0           # short: the DB is the hard dependency a load balancer drains on
 INSPECT_TIMEOUT_S = 1.0        # how long Celery waits for worker replies (the call always takes about this long)
 _WAIT_POLL_S = 0.05
+CHECK_FAILED = "check failed (see the API log)"
+# Errors that mean the dependency could not be reached at all. Anything else reached it and failed there (a missing
+# table, a rejected password) and is reported as CHECK_FAILED, so nobody debugs the network for a schema problem.
+# redis-py's AuthenticationError is a ConnectionError subclass, hence the exception to the exception.
+_UNREACHABLE_ERRORS = (OSError, sqlalchemy.exc.OperationalError, sqlalchemy.exc.InterfaceError,
+                       redis.exceptions.ConnectionError, kombu.exceptions.OperationalError)
+_REACHED_ERRORS = (redis.exceptions.AuthenticationError,)
+
+
+def _is_unreachable(exc: BaseException) -> bool:
+    return isinstance(exc, _UNREACHABLE_ERRORS) and not isinstance(exc, _REACHED_ERRORS)
+
+
+@dataclass(frozen=True)
+class _Failure:
+    """A failed check's outcome, cached and shared by every caller of a single-flight check."""
+
+    detail: str             # the exception text: logged, never returned
+    unreachable: bool       # see _is_unreachable; decided here because callers only ever see CheckFailed
+
+    @classmethod
+    def of(cls, exc: Exception) -> "_Failure":
+        return cls(str(exc)[:200] or type(exc).__name__, _is_unreachable(exc))
+
+
+class CheckFailed(RuntimeError):
+    """Raised to each caller of a cached failure: a fresh instance every time (one shared exception object would grow
+    its traceback with every caller), carrying whether the original error was a connection failure."""
+
+    def __init__(self, failure: _Failure):
+        super().__init__(failure.detail)
+        self.unreachable = failure.unreachable
 
 
 @router.get("/live", summary="Liveness probe")
@@ -75,7 +112,7 @@ class SingleFlightCheck:
         self._ttl_s = ttl_s
         self._lock = threading.Lock()          # held by the thread that is running the check
         self._starting = False                 # a caller in this event loop is handing a refresh to a thread
-        self._result: tuple[float, Any, str | None] | None = None   # (finished_at, value, error)
+        self._result: tuple[float, Any, _Failure | None] | None = None   # (finished_at, value, error)
 
     def reset(self) -> None:
         """Forget the cached result (tests)."""
@@ -97,7 +134,7 @@ class SingleFlightCheck:
             raise RuntimeError("check has not completed yet")
         _, value, error = self._result
         if error is not None:
-            raise RuntimeError(error)
+            raise CheckFailed(error)
         return value
 
     def _fresh(self) -> bool:
@@ -113,12 +150,12 @@ class SingleFlightCheck:
             try:
                 self._result = (time.monotonic(), self._fn(), None)
             except Exception as exc:  # noqa: BLE001 - reported as the check's error
-                self._result = (time.monotonic(), None, str(exc)[:200] or type(exc).__name__)
+                self._result = (time.monotonic(), None, _Failure.of(exc))
         finally:
             self._lock.release()
 
 
-_Outcome = tuple[float, Any, str | None]     # (finished_at, value, error)
+_Outcome = tuple[float, Any, _Failure | None]     # (finished_at, value, error)
 
 
 class AsyncSingleFlightCheck:
@@ -152,7 +189,7 @@ class AsyncSingleFlightCheck:
                 raise TimeoutError(f"timed out after {self._timeout_s:g}s")
         _, value, error = outcome
         if error is not None:
-            raise RuntimeError(error)
+            raise CheckFailed(error)
         return value
 
     async def _refresh(self) -> _Outcome | None:
@@ -164,7 +201,7 @@ class AsyncSingleFlightCheck:
         except TimeoutError:
             return None
         except Exception as exc:  # noqa: BLE001 - reported as the check's error
-            outcome = (time.monotonic(), None, str(exc)[:200] or type(exc).__name__)
+            outcome = (time.monotonic(), None, _Failure.of(exc))
         self._result = outcome
         return outcome
 
@@ -202,7 +239,8 @@ async def _timed(name: str, fn: Callable[[], Awaitable[Any]]) -> tuple[bool, Any
         return False, f"timed out after {CHECK_TIMEOUT_S:g}s", ms()
     except Exception as exc:  # noqa: BLE001
         log.warning("health_check_failed", check=name, error=str(exc)[:200] or type(exc).__name__)
-        return False, "unreachable", ms()
+        unreachable = exc.unreachable if isinstance(exc, CheckFailed) else _is_unreachable(exc)
+        return False, "unreachable" if unreachable else CHECK_FAILED, ms()
 
 
 async def _db() -> dict[str, Any]:
@@ -220,11 +258,13 @@ async def _redis() -> bool:
     return bool(await get_async_cache().ping())
 
 
-def _rejection_error(rejections: dict[str, int]) -> str:
-    """Generic on purpose: the vendor's message for a 401 can echo part of the key."""
-    path, status = next(iter(rejections.items()))
+def _rejection_error(rejections: dict[str, dict[str, int]]) -> str:
+    """Generic on purpose: the vendor's message for a 401 can echo part of the key. The model is named because a 404
+    is about one model (the configured model names are public in this response's "models" anyway)."""
+    path, models = next(iter(rejections.items()))
+    model, status = next(iter(models.items()))
     what = "AI model not found" if status == 404 else "AI provider rejected our credentials"
-    return f"{what} (HTTP {status}, {path})"
+    return f"{what} (HTTP {status}, {path}: {model})"
 
 
 def _ai_check() -> dict[str, Any]:

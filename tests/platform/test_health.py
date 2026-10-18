@@ -7,7 +7,7 @@ in-process app against the test broker (Valkey db15, no workers) and then publis
 import json
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 from functools import partial
 from typing import Any
 
@@ -16,14 +16,16 @@ import pytest
 import redis
 from httpx import AsyncClient
 from sqlalchemy import event
+from sqlalchemy.exc import OperationalError, ProgrammingError
 
 from app.ai import PROVIDER_RESET_AFTER_FAILURES, ProviderWatchdog, get_provider, set_provider
 from app.ai.fake_provider import FakeProvider
-from app.ai.provider import ProviderError
+from app.ai.provider import Msg, ProviderError, StreamEnd
 from app.api import health
 from app.api.health import AsyncSingleFlightCheck, SingleFlightCheck
 from app.config import settings
 from app.core.db import get_async_engine
+from app.rag.generation import FallbackUsed, stream_answer
 from app.worker.celery_app import celery_app
 from app.worker.dispatch import _publish_in_thread
 
@@ -218,9 +220,9 @@ async def test_ai_check_fails_when_either_path_keeps_failing(watched: ProviderWa
 
 
 @pytest.mark.parametrize(("status", "error"), [
-    (401, "AI provider rejected our credentials (HTTP 401, embeddings)"),
-    (403, "AI provider rejected our credentials (HTTP 403, embeddings)"),
-    (404, "AI model not found (HTTP 404, embeddings)"),
+    (401, f"AI provider rejected our credentials (HTTP 401, embeddings: {settings.EMBED_MODEL})"),
+    (403, f"AI provider rejected our credentials (HTTP 403, embeddings: {settings.EMBED_MODEL})"),
+    (404, f"AI model not found (HTTP 404, embeddings: {settings.EMBED_MODEL})"),
 ])
 async def test_ai_check_reports_a_rejected_key_or_model_generically(watched: ProviderWatchdog, status: int,
                                                                     error: str) -> None:
@@ -237,6 +239,41 @@ async def test_ai_check_reports_a_rejected_key_or_model_generically(watched: Pro
     assert "sk-proj" not in json.dumps(check) and "Incorrect" not in json.dumps(check)   # no vendor text
     await watched.aembed(["q"])                      # the key works again: the next success clears it
     assert health._ai_check()["ok"] is True
+
+
+class MissingModel(FakeProvider):
+    """A key whose project has no access to one model: that model's calls return 404, the others answer."""
+
+    def __init__(self, missing: str) -> None:
+        super().__init__()
+        self.missing = missing
+
+    async def astream_text(self, **kwargs: Any) -> AsyncIterator[str | StreamEnd]:
+        if kwargs["model"] == self.missing:
+            raise ProviderError("bad_request", "OpenAI rejected the request (404): model_not_found", None, 404)
+        async for item in super().astream_text(**kwargs):
+            yield item
+
+
+async def test_ai_check_stays_red_while_the_answer_model_is_missing_and_turns_answer_on_the_fallback() -> None:
+    """Regression: the fallback model's first token cleared the answer model's 404, so readiness said ai ok while
+    every chat turn paid a failed first attempt (and it flapped red only between the 404 and that token)."""
+    watched = ProviderWatchdog(MissingModel(settings.ANSWER_MODEL))
+    set_provider(watched)
+    msgs = [Msg(role="user", content="q")]
+    try:
+        items = [item async for item in stream_answer(watched, instructions="", input=msgs)]
+        assert isinstance(items[0], FallbackUsed) and isinstance(items[-1], StreamEnd)   # the turn was answered
+        check = health._ai_check()
+        assert check["ok"] is False and check["auth_failed"] is True
+        assert check["error"] == f"AI model not found (HTTP 404, generation: {settings.ANSWER_MODEL})"
+
+        watched.inner.missing = "none"           # type: ignore[attr-defined]  # access granted: the next turn answers
+        items = [item async for item in stream_answer(watched, instructions="", input=msgs)]
+        assert not any(isinstance(item, FallbackUsed) for item in items)
+        assert health._ai_check()["ok"] is True
+    finally:
+        set_provider(None)
 
 
 async def test_ready_reports_a_rejected_key(client: AsyncClient, fake: FakeProvider) -> None:
@@ -312,6 +349,32 @@ async def test_ready_does_not_echo_dependency_errors(client: AsyncClient, monkey
     assert "10.20.30.40" not in r.text
     logged = {kw.get("check"): kw.get("error") for _, kw in recorder.events}
     assert SECRET in logged["database"] and "10.20.30.40" in logged["storage"]
+
+
+SCHEMA_ERROR = ProgrammingError("SELECT version_num FROM alembic_version", {},
+                                Exception('relation "alembic_version" does not exist'))
+
+
+@pytest.mark.parametrize(("error", "public"), [
+    (ConnectionError("connection refused"), "unreachable"),
+    (OperationalError("SELECT 1", {}, Exception("connection to server failed")), "unreachable"),
+    (redis.exceptions.ConnectionError("Error 111 connecting to localhost:6380."), "unreachable"),
+    (SCHEMA_ERROR, "check failed (see the API log)"),
+    (redis.exceptions.AuthenticationError("invalid username-password pair"), "check failed (see the API log)"),
+    (ValueError("unexpected reply"), "check failed (see the API log)"),
+], ids=["os", "db-connection", "redis-connection", "db-schema", "redis-auth", "other"])
+async def test_only_a_dependency_that_could_not_be_reached_is_called_unreachable(error: Exception,
+                                                                                public: str) -> None:
+    """Regression: every failure said "unreachable", so a missing alembic_version table or a rejected password sent
+    the operator debugging the network. Through the single-flight caches too, which re-raise a cached failure."""
+    async def direct() -> None:
+        raise error
+
+    probes = {"direct": direct, "async-cached": AsyncSingleFlightCheck(CountingProbe(error=error), ttl_s=10).get,
+              "thread-cached": SingleFlightCheck(CountingCheck(error=error), ttl_s=10).get}
+    for name, probe in probes.items():
+        ok, value, _ = await health._timed(name, probe)
+        assert (ok, value) == (False, public), name
 
 
 # --- AsyncSingleFlightCheck (no services) -----------------------------------------------------------------------------
