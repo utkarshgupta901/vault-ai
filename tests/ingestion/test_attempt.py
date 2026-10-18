@@ -1,5 +1,5 @@
 """Worker reliability rules (worker/attempt.py): backoff, run_id fencing, crash counter, retries, failure codes,
-advisory-lock contention, and insights failures that leave the document usable.
+advisory-lock contention, lost hand-offs and lost messages, and insights failures that leave the document usable.
 
 Eager Celery note: task.retry() re-runs the task inline after the failed attempt returns and ignores the countdown,
 so retry tests are fast; max_retries is lowered with monkeypatch where exhaustion is tested."""
@@ -8,17 +8,22 @@ import random
 import sys
 import types
 import uuid
+from typing import Any
 
 import pytest
-from celery.exceptions import SoftTimeLimitExceeded
+from botocore.exceptions import EndpointConnectionError
+from celery.exceptions import Reject, SoftTimeLimitExceeded
 from httpx import AsyncClient
+from kombu.exceptions import OperationalError as BrokerError
 
 from app.ai.fake_provider import FakeProvider
 from app.ai.insights import InsightsResult
 from app.ai.provider import ProviderError
 from app.core.errors import ErrorCode, PermanentError
+from app.services import storage
 from app.worker import attempt as attempt_module
 from app.worker.attempt import MAX_LOCK_WAITS, advisory_lock, backoff
+from app.worker.dispatch import QueueUnavailable
 from app.worker.tasks import generate_insights, ingest_document
 from tests.conftest import DEMO, upload
 from tests.ingestion.helpers import (
@@ -208,7 +213,6 @@ async def test_lock_contention_republishes_without_using_a_retry(
     with advisory_lock(f"ingest:{doc_id}") as held:        # another worker is on this document
         assert held
         _run_ingest(doc_id, run, lock_waits=3)
-        _run_ingest(doc_id, run, lock_waits=MAX_LOCK_WAITS)   # waited long enough: give up quietly
 
     assert published == [{"kwargs": {"document_id": doc_id, "run_id": str(run), "request_id": "req_test",
                                      "lock_waits": 4}, "countdown": 15}]
@@ -217,6 +221,195 @@ async def test_lock_contention_republishes_without_using_a_retry(
 
     _run_ingest(doc_id, run)                                          # lock released: the run proceeds
     assert get_doc(doc_id).status == "ready"
+
+
+# --- runs that would otherwise be dropped silently -----------------------------------------------------------------
+
+
+def _broker_down(**_: Any) -> None:
+    raise BrokerError("Error 111 connecting to localhost:6380. Connection refused.")
+
+
+async def test_lock_wait_that_never_ends_fails_the_run_retryable(client: AsyncClient) -> None:
+    doc_id = await _ready_doc(client)
+    run = requeue(doc_id)
+
+    with advisory_lock(f"ingest:{doc_id}") as held:
+        assert held
+        _run_ingest(doc_id, run, lock_waits=MAX_LOCK_WAITS)   # waited 10 minutes: give up, but visibly
+
+    assert get_doc(doc_id).status == "failed"                 # not 'queued' forever with no task left to run it
+    error = await _error(client, doc_id)
+    assert error["code"] == "PROCESSING_TIMEOUT" and error["retryable"] is True
+
+
+async def test_insights_lock_wait_that_never_ends_fails_insights_only(client: AsyncClient) -> None:
+    doc_id = await _ready_doc(client)
+    run = requeue(doc_id, scope="insights")
+
+    with advisory_lock(f"insights:{doc_id}") as held:
+        assert held
+        generate_insights.apply(kwargs={"document_id": doc_id, "run_id": str(run), "lock_waits": MAX_LOCK_WAITS})
+
+    doc = get_doc(doc_id)
+    assert doc.status == "ready"
+    assert doc.insights_status == "failed" and doc.insights_error_code == "PROCESSING_TIMEOUT"
+
+
+async def test_lock_wait_republish_with_broker_down_fails_the_run_retryable(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    doc_id = await _ready_doc(client)
+    run = requeue(doc_id)
+    monkeypatch.setattr(ingest_document, "apply_async", _broker_down)
+
+    with advisory_lock(f"ingest:{doc_id}") as held:
+        assert held
+        _run_ingest(doc_id, run, lock_waits=3)
+
+    assert get_doc(doc_id).status == "failed"                 # the message is gone, so say so
+    error = await _error(client, doc_id)
+    assert error["code"] == "QUEUE_UNAVAILABLE" and error["retryable"] is True
+
+
+async def test_waiting_duplicate_never_fails_a_run_whose_attempt_is_running(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    doc_id = await _ready_doc(client)
+    run = requeue(doc_id)
+    insert_running_attempts(doc_id, run, 1)                   # the lock holder is an attempt of this same run
+    monkeypatch.setattr(ingest_document, "apply_async", _broker_down)
+
+    with advisory_lock(f"ingest:{doc_id}") as held:
+        assert held
+        _run_ingest(doc_id, run, lock_waits=3)
+        _run_ingest(doc_id, run, lock_waits=MAX_LOCK_WAITS)
+
+    assert get_doc(doc_id).status == "queued"                 # left alone: the running attempt finishes the run
+
+
+async def test_retry_that_cannot_be_published_fails_the_run_retryable(
+    client: AsyncClient, fake: FakeProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def retry_with_broker_down(**_: Any) -> None:
+        # What Celery's Task.retry raises when it cannot publish the delayed copy: the message would be dropped.
+        raise Reject(BrokerError("Connection refused."), requeue=False)
+
+    monkeypatch.setattr(ingest_document, "retry", retry_with_broker_down)
+    fake.fail_next.append(ProviderError("transient", "OpenAI server error (503)."))
+    r = await upload(client, "a.txt", TEXT)
+    doc_id = r.json()["document"]["id"]
+
+    assert get_doc(doc_id).status == "failed"                 # not 'processing' with no retry coming
+    error = await _error(client, doc_id)
+    assert error["code"] == "QUEUE_UNAVAILABLE" and error["retryable"] is True
+    assert [(r.status, r.error_code) for r in runs_of(doc_id)] == [("failed", "QUEUE_UNAVAILABLE")]
+
+
+# --- transient storage errors --------------------------------------------------------------------------------------
+
+
+class _FlakyS3:
+    """The real S3 client, except that the next `failures` downloads fail the way an S3 outage does."""
+
+    def __init__(self, real: Any, failures: int) -> None:
+        self.real, self.failures = real, failures
+
+    def download_fileobj(self, *args: Any, **kwargs: Any) -> None:
+        if self.failures:
+            self.failures -= 1
+            raise EndpointConnectionError(endpoint_url="http://s3.invalid")
+        self.real.download_fileobj(*args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.real, name)
+
+
+def _flaky_storage(monkeypatch: pytest.MonkeyPatch, failures: int) -> None:
+    flaky = _FlakyS3(storage._client(), failures)
+    monkeypatch.setattr(storage, "_client", lambda: flaky)
+
+
+async def test_storage_outage_during_download_is_retried_then_succeeds(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    doc_id = await _ready_doc(client)
+    run = requeue(doc_id)
+    _flaky_storage(monkeypatch, failures=1)
+
+    _run_ingest(doc_id, run)
+
+    assert get_doc(doc_id).status == "ready"
+    attempts = [(r.attempt, r.status, r.error_code) for r in runs_of(doc_id) if r.run_id == run]
+    assert attempts == [(1, "retrying", "TRANSIENT"), (2, "succeeded", None)]
+
+
+async def test_storage_outage_that_outlasts_the_retries_fails_retryable(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(ingest_document, "max_retries", 1)
+    doc_id = await _ready_doc(client)
+    run = requeue(doc_id)
+    _flaky_storage(monkeypatch, failures=5)
+
+    _run_ingest(doc_id, run)
+
+    error = await _error(client, doc_id)
+    assert error["code"] == "STORAGE_ERROR" and error["retryable"] is True
+    attempts = [(r.status, r.error_code) for r in runs_of(doc_id) if r.run_id == run]
+    assert attempts == [("retrying", "TRANSIENT"), ("failed", "STORAGE_ERROR")]
+
+
+# --- lost insights hand-off ----------------------------------------------------------------------------------------
+
+
+def _ready_but_insights_never_published(doc_id: str, monkeypatch: pytest.MonkeyPatch) -> uuid.UUID:
+    """A run that committed 'ready' (insights pending) and then lost its worker before publishing insights."""
+    from app.ingestion import pipeline
+
+    run = requeue(doc_id)
+    monkeypatch.setattr(pipeline, "_enqueue_insights", lambda attempt: None)
+    _run_ingest(doc_id, run)
+    doc = get_doc(doc_id)
+    assert (doc.status, doc.insights_status) == ("ready", "pending")
+    return run
+
+
+async def test_redelivered_ingest_publishes_the_insights_its_crashed_run_never_published(
+    client: AsyncClient, fake: FakeProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    doc_id = await _ready_doc(client)
+    run = _ready_but_insights_never_published(doc_id, monkeypatch)
+
+    _run_ingest(doc_id, run)                  # Celery redelivers the unacked ingest message
+
+    assert get_doc(doc_id).insights_status == "ready"
+    assert [r.status for r in runs_of(doc_id, "insights") if r.run_id == run] == ["succeeded"]
+
+    # Re-publishing is safe because duplicates are no-ops: neither a second insights task nor a further ingest
+    # redelivery starts an attempt or calls the model again.
+    calls = len(fake.calls)
+    generate_insights.apply(kwargs={"document_id": doc_id, "run_id": str(run)})
+    _run_ingest(doc_id, run)
+    assert [r.status for r in runs_of(doc_id, "insights") if r.run_id == run] == ["succeeded"]
+    assert len(fake.calls) == calls
+
+
+async def test_redelivered_ingest_with_broker_down_marks_insights_failed_retryable(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    doc_id = await _ready_doc(client)
+    run = _ready_but_insights_never_published(doc_id, monkeypatch)
+
+    def broker_down(*_: Any, **__: Any) -> None:
+        raise QueueUnavailable("connection refused")
+
+    monkeypatch.setattr(attempt_module, "enqueue_insights", broker_down, raising=False)
+    _run_ingest(doc_id, run)
+
+    doc = get_doc(doc_id)
+    assert doc.status == "ready"
+    assert doc.insights_status == "failed" and doc.insights_error_code == "QUEUE_UNAVAILABLE"
 
 
 # --- insights task -------------------------------------------------------------------------------------------------
@@ -275,7 +468,8 @@ async def test_insights_crash_limit_fails_insights_only(client: AsyncClient) -> 
 def test_attempt_module_has_one_message_per_user_facing_code() -> None:
     # Every code the attempt layer can put on a document has a human message (no raw exception text leaks).
     for code in ("PROVIDER_UNAVAILABLE", "PROVIDER_BAD_REQUEST", "INSIGHTS_REFUSED", "INSIGHTS_TRUNCATED",
-                 "PROCESSING_TIMEOUT", "PROCESSING_CRASHED", "PROCESSING_ERROR"):
+                 "PROCESSING_TIMEOUT", "PROCESSING_CRASHED", "PROCESSING_ERROR", "QUEUE_UNAVAILABLE",
+                 "STORAGE_ERROR"):
         assert attempt_module._USER_MESSAGES[code]
 
 

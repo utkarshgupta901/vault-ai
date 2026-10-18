@@ -12,9 +12,31 @@ from typing import IO, Any
 
 import boto3
 from botocore.config import Config
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, HTTPClientError
+from botocore.exceptions import ConnectionError as BotoConnectionError
+from s3transfer.exceptions import RetriesExceededError
 
 from app.config import settings
+
+# Error codes that mean "busy or briefly broken, ask again later" even when the HTTP status is not 5xx.
+_TRANSIENT_CODES = frozenset({"SlowDown", "Throttling", "ThrottlingException", "RequestLimitExceeded",
+                              "TooManyRequestsException", "RequestThrottled", "RequestTimeout"})
+
+
+class StorageUnavailable(Exception):
+    """The object store did not answer (connection, timeout, 5xx, throttling), even after boto's own 3 attempts.
+    A different exception from a missing object on purpose: the worker retries this one with backoff (a later attempt
+    may well succeed), while a missing object fails at once."""
+
+
+def is_transient(exc: BaseException) -> bool:
+    if isinstance(exc, (BotoConnectionError, HTTPClientError, RetriesExceededError)):
+        return True  # could not connect, connect/read timeout, connection dropped mid-stream
+    if isinstance(exc, ClientError):
+        status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode") or 0
+        code = str(exc.response.get("Error", {}).get("Code", ""))
+        return status >= 500 or status == 429 or code in _TRANSIENT_CODES
+    return False
 
 
 @cache
@@ -60,14 +82,16 @@ def download_to_temp(key: str, suffix: str = "") -> Path:
 
     If the download fails (missing key, read timeout, soft time limit mid-transfer) the partial file is deleted here:
     the caller never got a path, so nobody else could. Every transient retry would otherwise leave up to 25 MB
-    behind in the worker's /tmp."""
+    behind in the worker's /tmp. An outage is raised as StorageUnavailable; anything else (e.g. NoSuchKey) as is."""
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
     path = Path(tmp.name)
     try:
         with tmp:
             _client().download_fileobj(settings.S3_BUCKET, key, tmp)
-    except BaseException:
+    except BaseException as exc:
         path.unlink(missing_ok=True)
+        if is_transient(exc):
+            raise StorageUnavailable(f"Object storage unavailable: {exc}") from exc
         raise
     return path
 

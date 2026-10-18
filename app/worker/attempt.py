@@ -4,13 +4,18 @@ Celery delivers a message at least once, so the same task can arrive twice, late
 Every task body runs inside `run_attempt`, which answers four questions in order:
 
   1. Is another worker on this document right now?   session-level advisory lock; if busy, re-publish in 15 s
-                                                       (contention is not a failure and does not use up retries)
+                                                       (contention is not a failure and does not use up retries);
+                                                       after 10 minutes, fail the run as retryable
   2. Is this task still the current run?              claim = UPDATE ... WHERE current_run_id = :run_id;
                                                        0 rows = superseded (reprocess/delete) or finished -> exit
+                                                       (a finished ingest whose insights were never published
+                                                       publishes them: its worker died in between)
   3. Did earlier attempts of this run kill a worker?  crash counter: 3 dead attempts -> PROCESSING_CRASHED, so one
                                                        poison file cannot loop forever
   4. What does a failure mean?                        transient -> Celery retry with backoff; permanent -> fail with
                                                        a stable error code that the API shows as error{code,...}
+
+A message that cannot be re-published (broker down) is never dropped silently: the run fails as retryable instead.
 
 Bodies (ingestion/pipeline.py, the insights task) never retry, sleep or write processing_runs themselves.
 """
@@ -25,7 +30,7 @@ from typing import Literal
 
 import structlog
 from celery import Task
-from celery.exceptions import SoftTimeLimitExceeded
+from celery.exceptions import Reject, SoftTimeLimitExceeded
 from sqlalchemy import Update, func, insert, select, text, update
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
@@ -35,6 +40,8 @@ from app.core.db import get_sync_engine, sync_session
 from app.core.errors import ErrorCode, PermanentError
 from app.models import Document, ProcessingRun
 from app.services import state
+from app.services.storage import StorageUnavailable
+from app.worker.dispatch import QueueUnavailable, enqueue_insights
 
 log = structlog.get_logger(__name__)
 
@@ -65,6 +72,8 @@ _USER_MESSAGES: dict[str, str] = {
     ErrorCode.PROCESSING_TIMEOUT: "Processing took too long and was stopped. Reprocess to try again.",
     ErrorCode.PROCESSING_CRASHED: "Processing crashed the worker 3 times, so this file was not retried again.",
     PROCESSING_ERROR: "Unexpected error while processing. Reprocess to try again.",
+    ErrorCode.QUEUE_UNAVAILABLE: "The processing queue was unavailable, so processing stopped. Reprocess to try again.",
+    ErrorCode.STORAGE_ERROR: "File storage was unavailable after several retries. Reprocess to try again.",
 }
 
 
@@ -144,6 +153,8 @@ def _run_if_unlocked(task: Task, kind: Kind, document_id: uuid.UUID, run_id: uui
         attempt = _claim_and_start(task, kind, document_id, run_id, request_id)
         if attempt is not None:
             _execute(task, attempt, body)
+        elif kind == "ingest":
+            _republish_lost_insights(document_id, run_id, request_id)
         return True
 
 
@@ -166,14 +177,64 @@ def advisory_lock(key: str) -> Iterator[bool]:
 def _republish_later(task: Task, *, kind: Kind, document_id: str, run_id: str, request_id: str | None,
                      lock_waits: int) -> None:
     if lock_waits >= MAX_LOCK_WAITS:
-        # The document stays queued/processing; after STALE_PROCESSING_MIN it is flagged stale and can be reprocessed.
+        # 40 x 15 s (plus queueing) is at least the 10-minute hard time limit: the holder is not a healthy attempt of
+        # this run, and a run with no task left must not sit in queued/processing until a human notices.
         log.warning("lock_wait_gave_up", kind=kind, document_id=document_id, lock_waits=lock_waits)
+        _fail_waiting_run(kind, document_id, run_id, ErrorCode.PROCESSING_TIMEOUT,
+                          f"Gave up after waiting {lock_waits} times for another worker to release this document.")
         return
     log.info("lock_busy_republishing", kind=kind, document_id=document_id, lock_waits=lock_waits + 1)
-    task.apply_async(
-        kwargs={"document_id": document_id, "run_id": run_id, "request_id": request_id, "lock_waits": lock_waits + 1},
-        countdown=LOCK_WAIT_COUNTDOWN_S,
-    )
+    try:
+        task.apply_async(
+            kwargs={"document_id": document_id, "run_id": run_id, "request_id": request_id,
+                    "lock_waits": lock_waits + 1},
+            countdown=LOCK_WAIT_COUNTDOWN_S,
+        )
+    except Exception as exc:  # noqa: BLE001 - kombu raises several connection error types
+        log.error("lock_wait_republish_failed", kind=kind, document_id=document_id, error=str(exc))
+        _fail_waiting_run(kind, document_id, run_id, ErrorCode.QUEUE_UNAVAILABLE, f"Re-publish failed: {exc}")
+
+
+def _fail_waiting_run(kind: Kind, document_id: str, run_id: str, code: str, detail: str) -> None:
+    """Fail (as retryable) a run whose message is about to disappear without ever getting the lock, so the user sees
+    a failed document they can reprocess instead of one that says queued/processing with no task left to run it.
+
+    Fenced like every worker write (a superseded run writes nothing). And never while an attempt of this same run is
+    'running': that attempt holds the lock we could not get and finishes or fails the run itself (if its worker
+    died, Celery redelivers its message), so failing it here would kill a healthy run because a duplicate gave up."""
+    doc_id, run = uuid.UUID(str(document_id)), uuid.UUID(str(run_id))
+    with sync_session() as s:
+        running = s.scalar(select(func.count()).select_from(ProcessingRun).where(
+            ProcessingRun.run_id == run, ProcessingRun.task == kind, ProcessingRun.status == "running"))
+        if running:
+            log.warning("waiting_duplicate_dropped", kind=kind, run_id=str(run), code=code)
+            return
+        log.warning("waiting_run_failed", kind=kind, run_id=str(run), code=code, detail=detail)
+        s.execute(_fail_document_stmt(kind, doc_id, run, code, _USER_MESSAGES[code], retryable=True))
+
+
+def _republish_lost_insights(document_id: uuid.UUID, run_id: uuid.UUID, request_id: str | None) -> None:
+    """An ingest that could not claim its run may be the redelivery of one that committed 'ready' (insights pending)
+    and then lost its worker before publishing the insights task (acks_late redelivers the ingest message, but
+    nobody would ever publish insights). Publish them now.
+
+    A duplicate insights task is harmless: its claim is fenced by run_id and only matches insights pending/processing,
+    and the insights lock runs copies one at a time, so a second copy finds them ready (or failed) and stops."""
+    with sync_session() as s:
+        lost = s.scalar(select(Document.id).where(
+            Document.id == document_id, Document.current_run_id == run_id,
+            Document.status == "ready", Document.insights_status == "pending"))
+    if lost is None:
+        return
+    log.warning("insights_handoff_republished", run_id=str(run_id))
+    try:
+        enqueue_insights(document_id, run_id, request_id)
+    except QueueUnavailable as exc:
+        log.error("insights_enqueue_failed", error=str(exc))
+        with sync_session() as s:
+            # Only while still pending: an insights task that started meanwhile must not be failed under its feet.
+            s.execute(state.insights_fail_stmt(document_id, run_id, ErrorCode.QUEUE_UNAVAILABLE)
+                      .where(Document.insights_status == "pending"))
 
 
 # --- Claim + crash counter ------------------------------------------------------------------------------------------
@@ -246,6 +307,8 @@ def _execute(task: Task, attempt: Attempt, body: Body) -> None:
         _fail(attempt, ErrorCode.PROCESSING_TIMEOUT, _USER_MESSAGES[ErrorCode.PROCESSING_TIMEOUT], retryable=True)
     except OperationalError as exc:
         _retry_or_fail(task, attempt, exc, exhausted_code=PROCESSING_ERROR, retry_after=None)
+    except StorageUnavailable as exc:
+        _retry_or_fail(task, attempt, exc, exhausted_code=ErrorCode.STORAGE_ERROR, retry_after=None)
     except Exception as exc:
         log.exception("attempt_unexpected_error", kind=attempt.kind, run_id=str(attempt.run_id))
         _fail(attempt, PROCESSING_ERROR, _USER_MESSAGES[PROCESSING_ERROR], detail=repr(exc), retryable=True)
@@ -267,8 +330,13 @@ def _retry_or_fail(task: Task, attempt: Attempt, exc: Exception, *, exhausted_co
         log.warning("attempt_bookkeeping_failed", run_id=str(attempt.run_id))
     log.warning("attempt_retrying", kind=attempt.kind, retries=retries + 1, countdown_s=round(countdown, 1),
                 error=str(exc))
-    # The Retry exception tells the worker to ack this message; Celery has already published the delayed copy.
-    raise task.retry(countdown=countdown)
+    try:
+        # The Retry exception tells the worker to ack this message; Celery has already published the delayed copy.
+        raise task.retry(countdown=countdown)
+    except Reject as rejected:
+        # Celery could not publish the delayed copy (broker down) and would drop this message: fail the run instead.
+        _fail(attempt, ErrorCode.QUEUE_UNAVAILABLE, _USER_MESSAGES[ErrorCode.QUEUE_UNAVAILABLE], retryable=True,
+              detail=f"Retry could not be published: {rejected.reason}")
 
 
 def _finish_stmt(attempt: Attempt, status: str, code: str | None, detail: str | None) -> Update:

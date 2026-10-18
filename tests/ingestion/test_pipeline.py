@@ -1,14 +1,20 @@
 """End to end through the API (eager Celery runs the real tasks inline): upload -> extract -> chunk -> embed -> ready,
-resumable embedding, and failure codes surfacing on GET /documents/{id}."""
+resumable embedding, the cost ledger for superseded runs, and failure codes surfacing on GET /documents/{id}."""
+
+import uuid
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy import delete, select
 
 from app.ai.fake_provider import FakeProvider
-from app.ai.provider import ProviderError
+from app.ai.provider import ProviderError, Usage
 from app.config import settings
+from app.core.db import sync_session
+from app.models import Document, ProcessingRun
 from app.services import storage
 from app.worker.dispatch import QueueUnavailable
+from app.worker.tasks import ingest_document
 from tests.conftest import DEMO, upload
 from tests.ingestion.helpers import (
     chunks_of,
@@ -19,6 +25,7 @@ from tests.ingestion.helpers import (
     make_image_only_pdf,
     make_mixed_pdf,
     make_pdf,
+    requeue,
     runs_of,
 )
 from tests.insights.helpers import canned_insights
@@ -150,6 +157,66 @@ async def test_missing_original_file_is_storage_error(client: AsyncClient) -> No
     assert (await client.post(f"/api/v1/documents/{doc_id}/reprocess", headers=DEMO, json={})).status_code == 202
     doc = await _get(client, doc_id)
     assert doc["status"] == "failed" and doc["error"]["code"] == "STORAGE_ERROR"
+
+
+async def test_document_deleted_during_download_is_superseded_not_a_storage_error(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    doc_id = await _upload_id(client, "a.txt", b"Employees receive 18 PTO days per year.")
+    run = requeue(doc_id)
+    real_download = storage.download_to_temp
+
+    def user_deletes_then_download(key: str, suffix: str = ""):
+        # DELETE /documents/{id}: the row goes first (committed), then the stored object.
+        with sync_session() as s:
+            s.execute(delete(Document).where(Document.id == uuid.UUID(doc_id)))
+        storage.delete(key)
+        return real_download(key, suffix=suffix)            # -> NoSuchKey
+
+    monkeypatch.setattr(storage, "download_to_temp", user_deletes_then_download)
+    ingest_document.apply(kwargs={"document_id": doc_id, "run_id": str(run)})
+
+    with sync_session() as s:   # the attempt row outlives the document (document_id is set to NULL)
+        attempts = s.execute(select(ProcessingRun.status, ProcessingRun.error_code)
+                             .where(ProcessingRun.run_id == run)).all()
+    assert [tuple(a) for a in attempts] == [("failed", "SUPERSEDED")]   # not a STORAGE_ERROR in /metrics
+
+
+async def test_embedding_paid_for_by_a_superseded_run_is_still_in_the_ledger(
+    client: AsyncClient, fake: FakeProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_embed = fake.embed
+    newer = {}
+
+    def embed_then_user_clicks_reprocess(texts: list[str]):
+        result = real_embed(texts)                  # billed
+        (doc,) = _docs_named("a.txt")
+        newer["run"] = requeue(doc)                 # a reprocess takes over before the batch is saved
+        return result
+
+    monkeypatch.setattr(fake, "embed", embed_then_user_clicks_reprocess)
+    doc_id = await _upload_id(client, "a.txt", b"Employees receive 18 PTO days per year.")
+
+    assert get_doc(doc_id).current_run_id == newer["run"]
+    assert [(r.status, r.error_code) for r in runs_of(doc_id)] == [("failed", "SUPERSEDED")]
+    assert count("SELECT count(*) FROM ai_usage WHERE operation = 'embed_chunks' AND document_id = :d AND success",
+                 d=doc_id) == 1                     # the paid call is in the ledger even though its vectors are not
+
+
+async def test_billed_embedding_failure_is_in_the_ledger(client: AsyncClient, fake: FakeProvider) -> None:
+    # The provider answered (and billed) but the answer is unusable, e.g. vectors of the wrong dimension.
+    usage = Usage(model=settings.EMBED_MODEL, input_tokens=42)
+    fake.fail_next.append(ProviderError("bad_request", "Embedding has 3072 dimensions, expected 1536.", usage=usage))
+    doc_id = await _upload_id(client, "a.txt", b"Employees receive 18 PTO days per year.")
+
+    assert (await _get(client, doc_id))["error"]["code"] == "PROVIDER_BAD_REQUEST"
+    assert count("SELECT count(*) FROM ai_usage WHERE operation = 'embed_chunks' AND document_id = :d "
+                 "AND NOT success AND error_code = 'PROVIDER_BAD_REQUEST' AND input_tokens = 42", d=doc_id) == 1
+
+
+def _docs_named(filename: str) -> list[uuid.UUID]:
+    with sync_session() as s:
+        return list(s.scalars(select(Document.id).where(Document.filename == filename)))
 
 
 async def test_insights_enqueue_failure_keeps_document_ready(

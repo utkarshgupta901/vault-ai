@@ -21,6 +21,8 @@ from app.models import Document
 IN_FLIGHT = ("queued", "processing")             # Document.status values a worker is (supposedly) working on
 INSIGHTS_IN_FLIGHT = ("pending", "processing")   # the same for Document.insights_status
 
+# The state machine as data (source -> targets). Documentation that cannot drift: tests/ingestion/
+# test_state_transitions.py runs every *_stmt below from every state and requires exactly these transitions.
 TRANSITIONS: dict[str, set[str]] = {
     "queued": {"processing", "failed", "queued"},
     "processing": {"processing", "ready", "failed", "queued"},
@@ -28,7 +30,7 @@ TRANSITIONS: dict[str, set[str]] = {
     "failed": {"queued"},
 }
 INSIGHTS_TRANSITIONS: dict[str, set[str]] = {
-    "pending": {"processing", "failed"},
+    "pending": {"processing", "failed", "pending"},   # pending -> pending: a new run while still pending (requeue)
     "processing": {"processing", "ready", "failed", "pending"},
     "ready": {"pending"},
     "failed": {"pending"},

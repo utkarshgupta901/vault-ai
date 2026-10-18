@@ -10,6 +10,7 @@ The database is the checkpoint, so any stage can be re-run safely after a crash,
 Every write transaction starts with a run_id-fenced UPDATE of the document row (state.progress_stmt/ready_stmt).
 It does two jobs: zero rows back means a reprocess or delete took over (raise RunSuperseded and stop), and the row
 lock it takes makes the rest of the transaction atomic with respect to a concurrent reprocess.
+One write is kept even then: the ai_usage row of an embedding batch, billed whether or not the run is still current.
 No transaction is open while a file downloads or the embedding API is called.
 
 Progress: `stage` names the stage being worked on, `progress_pct` the work completed (extract 0-20, chunk 20-30,
@@ -25,6 +26,7 @@ from sqlalchemy import delete, func, insert, select, update
 from sqlalchemy.orm import Session
 
 from app.ai import get_provider
+from app.ai.provider import EmbedResult, LLMProvider, ProviderError
 from app.ai.usage import usage_row
 from app.config import settings
 from app.core.db import sync_session
@@ -92,7 +94,7 @@ def _load_source(attempt: Attempt) -> _Source:
 
 def _download_and_extract(attempt: Attempt, source: _Source) -> ExtractedDoc:
     with attempt.timed("download"):
-        path = _download(source.storage_key)
+        path = _download(attempt, source.storage_key)
     try:
         with attempt.timed("extract"):
             extracted = extract(path, source.mime_type)
@@ -102,13 +104,21 @@ def _download_and_extract(attempt: Attempt, source: _Source) -> ExtractedDoc:
     return extracted
 
 
-def _download(storage_key: str) -> Path:
+def _download(attempt: Attempt, storage_key: str) -> Path:
     try:
         return storage.download_to_temp(storage_key, suffix=PurePath(storage_key).suffix)
     except ClientError as exc:
         if exc.response.get("Error", {}).get("Code") in ("404", "NoSuchKey"):
+            if not _still_current(attempt):
+                raise RunSuperseded() from exc  # deleted while we downloaded (row first, then file): not a fault
             raise PermanentError(ErrorCode.STORAGE_ERROR, "The original file is missing from storage.") from exc
         raise
+
+
+def _still_current(attempt: Attempt) -> bool:
+    with sync_session() as s:
+        return s.scalar(select(Document.id).where(Document.id == attempt.document_id,
+                                                  Document.current_run_id == attempt.run_id)) is not None
 
 
 def _save_pages(attempt: Attempt, pages: list[PageText]) -> None:
@@ -198,23 +208,44 @@ def batches(items: list[_Pending], *, max_items: int, max_tokens: int) -> list[l
 
 def _embed_pending(attempt: Attempt) -> None:
     """Embed every chunk that has no vector yet. Each batch commits its vectors AND its ai_usage row together, so
-    after a crash the finished batches are kept (and paid for exactly once) and only the rest is redone."""
+    after a crash the finished batches are kept (and paid for exactly once) and only the rest is redone.
+    A batch whose run was superseded meanwhile still commits its ai_usage row (the call was billed; as in
+    insights._write), just not its vectors."""
     provider = get_provider(for_worker=True)
     total, pending = _pending_chunks(attempt)
     done = total - len(pending)
     for batch in batches(pending, max_items=settings.EMBED_BATCH_SIZE, max_tokens=settings.EMBED_BATCH_MAX_TOKENS):
-        result = provider.embed([item.text for item in batch])  # no transaction is open during the API call
+        result = _embed(provider, attempt, [item.text for item in batch])  # no transaction is open during the call
         done += len(batch)
+        pct = CHUNK_DONE_PCT + (100 - CHUNK_DONE_PCT) * done // total
         with sync_session() as s:
-            _advance(s, attempt, "embedding", CHUNK_DONE_PCT + (100 - CHUNK_DONE_PCT) * done // total)
-            s.execute(update(Chunk), [
-                {"id": item.chunk_id, "embedding": vector, "embedding_model": settings.EMBED_MODEL}
-                for item, vector in zip(batch, result.vectors, strict=True)
-            ])
+            current = s.execute(state.progress_stmt(attempt.document_id, attempt.run_id, "embedding", pct)).first()
+            if current is not None:
+                s.execute(update(Chunk), [
+                    {"id": item.chunk_id, "embedding": vector, "embedding_model": settings.EMBED_MODEL}
+                    for item, vector in zip(batch, result.vectors, strict=True)
+                ])
             s.add(usage_row(operation="embed_chunks", usage=result.usage, owner_id=attempt.owner_id,
                             document_id=attempt.document_id, task_id=attempt.task_id,
                             request_id=attempt.request_id))
+        if current is None:
+            raise RunSuperseded()  # after the commit above, so the usage row is kept
     log.info("embedded", chunks=total, embedded_now=len(pending), reused=total - len(pending))
+
+
+def _embed(provider: LLMProvider, attempt: Attempt, texts: list[str]) -> EmbedResult:
+    """provider.embed, plus the ledger row for a reply that was billed but is unusable (ProviderError with usage,
+    e.g. vectors of the wrong dimension). It gets its own transaction because the error stops the run."""
+    try:
+        return provider.embed(texts)
+    except ProviderError as exc:
+        if exc.usage is not None:
+            code = ErrorCode.PROVIDER_UNAVAILABLE if exc.kind == "transient" else ErrorCode.PROVIDER_BAD_REQUEST
+            with sync_session() as s:
+                s.add(usage_row(operation="embed_chunks", usage=exc.usage, owner_id=attempt.owner_id,
+                                document_id=attempt.document_id, success=False, error_code=code,
+                                task_id=attempt.task_id, request_id=attempt.request_id))
+        raise
 
 
 # --- Ready + hand-off -------------------------------------------------------------------------------------------------
