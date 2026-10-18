@@ -57,7 +57,7 @@ async def set_cached_vector(text: str, vector: list[float]) -> None:
 @dataclass(frozen=True)
 class QueryEmbedding:
     vector: list[float] | None      # None = embedding failed or timed out -> keyword-only retrieval
-    usage: Usage                    # zero tokens on a cache hit or failure
+    usage: Usage                    # zero tokens on a cache hit or failure, unless the failed call was billed
     cache_hit: bool = False
     error: str | None = None        # error code for the ai_usage row when the call failed
     ms: int = 0
@@ -65,8 +65,10 @@ class QueryEmbedding:
 
 async def embed_query(provider: LLMProvider, text: str) -> QueryEmbedding:
     """Cache lookup, then the embeddings API, all inside EMBED_QUERY_TIMEOUT_S. Never raises: on failure the caller
-    falls back to keyword-only retrieval and adds the 'keyword_only' warning."""
+    falls back to keyword-only retrieval and adds the 'keyword_only' warning. A failure the provider billed (a vector
+    of the wrong size: its ProviderError carries the usage) keeps that usage, so the ledger records what was spent."""
     started = time.perf_counter()
+    billed: Usage | None = None
 
     def elapsed() -> int:
         return int((time.perf_counter() - started) * 1000)
@@ -85,4 +87,6 @@ async def embed_query(provider: LLMProvider, text: str) -> QueryEmbedding:
     except Exception as exc:  # noqa: BLE001 - ProviderError or anything else: degrade, don't fail the answer
         log.warning("embed_query_failed", error=str(exc))
         code = "UPSTREAM_AI_ERROR"
-    return QueryEmbedding(None, Usage(model=settings.EMBED_MODEL, latency_ms=elapsed()), error=code, ms=elapsed())
+        billed = getattr(exc, "usage", None)
+    usage = billed or Usage(model=settings.EMBED_MODEL, latency_ms=elapsed())
+    return QueryEmbedding(None, usage, error=code, ms=elapsed())

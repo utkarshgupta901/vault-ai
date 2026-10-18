@@ -2,6 +2,7 @@
 
 Never raises. On timeout or error the raw question is used (warning 'condense_fallback'); if the raw question is
 very short ("and contractors?"), the previous turn's query is prepended so retrieval still has a topic to work with.
+A failed call the provider billed (refused, truncated, unparsable, or an empty query) keeps its usage for the ledger.
 """
 
 import asyncio
@@ -53,6 +54,7 @@ async def condense_question(provider: LLMProvider, history: History, question: s
     if not history.messages:
         return Condensed(query=question, rewritten=None, called=False)
     started = time.perf_counter()
+    billed: Usage | None = None
     try:
         async with asyncio.timeout(settings.CONDENSE_TIMEOUT_S):
             result, usage = await provider.acomplete_json(
@@ -62,7 +64,7 @@ async def condense_question(provider: LLMProvider, history: History, question: s
             )
         query = " ".join(result.query.split())
         if not query:
-            raise ProviderError("bad_request", "Condense returned an empty query.")
+            raise ProviderError("bad_request", "Condense returned an empty query.", usage=usage)
         ms = int((time.perf_counter() - started) * 1000)
         return Condensed(query=query, rewritten=None if _same(query, question) else query, called=True,
                          usage=usage, ms=ms)
@@ -71,6 +73,7 @@ async def condense_question(provider: LLMProvider, history: History, question: s
     except Exception as exc:  # noqa: BLE001 - any failure degrades to the raw question
         log.warning("condense_failed", error=str(exc))
         error = "UPSTREAM_AI_ERROR"
+        billed = getattr(exc, "usage", None)
     query = fallback_query(question, history.previous_query)
-    return Condensed(query=query, rewritten=None if _same(query, question) else query, called=True,
+    return Condensed(query=query, rewritten=None if _same(query, question) else query, called=True, usage=billed,
                      fallback=True, error=error, ms=int((time.perf_counter() - started) * 1000))

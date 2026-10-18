@@ -9,6 +9,7 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.fake_provider import FakeProvider, fake_vector
+from app.ai.provider import ProviderError, Usage
 from app.config import settings
 from app.core.redis import get_async_cache
 from app.rag import cache
@@ -91,3 +92,19 @@ def test_cache_key_includes_model_and_dims(monkeypatch: pytest.MonkeyPatch) -> N
         other_dims = cache_key("q")
     assert len({base, other_model, other_dims}) == 3
     assert cache_key("q") == base
+
+
+async def test_a_billed_but_unusable_embedding_keeps_its_usage(db: AsyncSession) -> None:
+    """Rule 7: a wrong-size embedding is billed even though it is unusable (the provider attaches its usage to the
+    ProviderError). It was recorded at 0 tokens, so the ledger and the daily quota under-counted every such turn."""
+    billed = Usage(model="text-embedding-3-large", input_tokens=7)
+    provider = FakeProvider()
+    provider.fail_next.append(ProviderError("bad_request", "Embedding model returned [3072] dimensions.", usage=billed))
+    result = await embed_query(provider, "how many PTO days?")
+    assert result.vector is None and result.error == "UPSTREAM_AI_ERROR"
+    assert result.usage == billed
+
+    provider.fail_next.append(ProviderError("transient", "OpenAI request timed out."))     # nothing billed
+    unbilled = await embed_query(provider, "how many PTO days?")
+    assert unbilled.error == "UPSTREAM_AI_ERROR"
+    assert (unbilled.usage.model, unbilled.usage.input_tokens) == (settings.EMBED_MODEL, 0)

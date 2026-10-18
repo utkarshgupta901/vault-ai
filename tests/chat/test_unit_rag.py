@@ -4,7 +4,9 @@ import uuid
 
 import pytest
 
+from app.ai.fake_provider import FakeProvider
 from app.ai.prompts import answer as answer_prompt
+from app.ai.provider import Msg, ProviderError, Usage
 from app.config import settings
 from app.rag.citations import (
     Source,
@@ -15,12 +17,12 @@ from app.rag.citations import (
     split_sentences,
     strip_citations,
 )
-from app.rag.condense import fallback_query
+from app.rag.condense import condense_question, fallback_query
 from app.rag.confidence import confidence, gate_reply, should_gate
-from app.rag.followups import clean_questions
-from app.rag.history import cap_tokens
+from app.rag.followups import clean_questions, suggest_followups
+from app.rag.history import History, cap_tokens
 from app.rag.query_terms import MAX_TERMS, extract_terms
-from app.rag.retrieval import RetrievalResult, effective_mode
+from app.rag.retrieval import RetrievalResult, RetrievedChunk, effective_mode
 from app.rag.tokens import count_tokens, truncate_tokens
 from app.services.chat import Scope, ScopeDoc
 
@@ -228,6 +230,44 @@ def test_condense_fallback_prepends_previous_query_for_short_followups() -> None
     assert fallback_query("What is the notice period for termination?", "PTO days") == \
         "What is the notice period for termination?"
     assert fallback_query("and contractors?", None) == "and contractors?"
+
+
+# --- a failed fast-model call that was billed --------------------------------------------------------------------
+# Rule 7: a refused, truncated or unparsable reply is billed, and the provider attaches that usage to the ProviderError.
+# Condense and follow-ups dropped it, so chat recorded those calls at 0 tokens and the daily quota under-counted.
+BILLED = Usage(model=settings.FAST_MODEL, input_tokens=900, output_tokens=40)
+HISTORY = History(messages=[Msg(role="user", content="How many PTO days do employees get?"),
+                            Msg(role="assistant", content="Employees get 18 PTO days per year.")],
+                  previous_query="How many PTO days do employees get?")
+CHUNK = RetrievedChunk(chunk_id=1, document_id=uuid.uuid4(), filename="handbook.txt", title=None, document_date=None,
+                       label="part 1", page_start=1, page_end=1, header="handbook.txt", content="18 PTO days.",
+                       rrf=0.03, sem_rank=1, lex_rank=1, sem_dist=0.2, id_hit=False)
+
+
+@pytest.mark.parametrize("kind", ["refusal", "incomplete", "bad_request"])
+async def test_a_billed_condense_failure_keeps_its_usage(kind: str) -> None:
+    fake = FakeProvider()
+    fake.fail_next.append(ProviderError(kind, "unusable reply", usage=BILLED))      # type: ignore[arg-type]
+    condensed = await condense_question(fake, HISTORY, "and contractors?")
+    assert condensed.fallback and condensed.error == "UPSTREAM_AI_ERROR"
+    assert condensed.usage == BILLED
+
+
+async def test_an_empty_condensed_query_keeps_the_usage_of_its_call() -> None:
+    fake = FakeProvider()
+    fake.json_responses["CondensedQuery"] = {"query": "   "}
+    condensed = await condense_question(fake, HISTORY, "and contractors?")
+    assert condensed.fallback and condensed.error == "UPSTREAM_AI_ERROR"
+    assert condensed.usage is not None and condensed.usage.input_tokens > 0     # the call answered and was billed
+
+
+async def test_a_billed_followups_failure_keeps_its_usage() -> None:
+    fake = FakeProvider()
+    fake.fail_next.append(ProviderError("refusal", "Model refused.", usage=BILLED))
+    result = await suggest_followups(fake, question="How many PTO days?", answer="18 days [S1].", chunks=[CHUNK],
+                                     cited_chunk_ids=set())
+    assert result.questions == [] and result.error == "UPSTREAM_AI_ERROR"
+    assert result.usage == BILLED
 
 
 def test_history_cap_drops_oldest_first() -> None:

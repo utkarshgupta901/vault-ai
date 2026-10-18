@@ -1,7 +1,8 @@
 """Follow-up suggestions: best effort, after the answer is already saved.
 
 Never raises and never delays the answer: it runs after `citations` (and the DB save), under FOLLOWUPS_TIMEOUT_S, and
-on any failure the chips are simply omitted.
+on any failure the chips are simply omitted. A failed call the provider billed (refused, truncated, unparsable) keeps
+its usage for the ledger.
 """
 
 import asyncio
@@ -66,6 +67,7 @@ async def suggest_followups(
     if not chunks:
         return Followups([])
     started = time.perf_counter()
+    billed: Usage | None = None
     try:
         async with asyncio.timeout(settings.FOLLOWUPS_TIMEOUT_S):
             result, usage = await provider.acomplete_json(
@@ -80,4 +82,5 @@ async def suggest_followups(
     except Exception as exc:  # noqa: BLE001 - best effort
         log.warning("followups_failed", error=str(exc))
         error = "UPSTREAM_AI_ERROR"
-    return Followups([], None, error, int((time.perf_counter() - started) * 1000))
+        billed = getattr(exc, "usage", None)
+    return Followups([], billed, error, int((time.perf_counter() - started) * 1000))
