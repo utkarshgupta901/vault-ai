@@ -91,12 +91,18 @@ def render_retrieval(retrieval: dict[str, Any]) -> list[str]:
     return lines + _table(["tag"] + modes, tag_rows) + [""]
 
 
-def render_answers(answers: dict[str, Any]) -> list[str]:
+def render_answers(answers: dict[str, Any], retrieval_ran: bool = True) -> list[str]:
     lines = ["## Answers (POST /chat/sessions/{id}/messages)", ""]
     if "skipped" in answers:
         return lines + [f"Skipped: {answers['skipped']}.", ""]
     checks = answers["checks"]
-    lines += [f"- Cases passed (first run): **{frac(answers['passed'])}**",
+    # The pass, check, by-tag, refusal and reliability numbers use each case's first run (so a demo case repeated 3x
+    # weighs the same as any other); latency, cost and the demo table count every run, repeats included. With
+    # --repeat the all-runs count shows whether a repeat failed (older reports don't have it).
+    all_runs = answers.get("passed_all_runs")
+    repeats = all_runs is not None and all_runs["n"] != answers["passed"]["n"]
+    lines += [f"- First-run pass rate: **{frac(answers['passed'])}**"
+              + (f" (all runs incl. demo repeats: {frac(all_runs)})" if repeats else ""),
               f"- not_found correct: {frac(checks['not_found'])} | citations valid (0 invalid ids): "
               f"{frac(checks['citations_valid'])} | gold citation: {frac(checks['gold_citation'])} | "
               f"grounded (0 ungrounded facts): {frac(checks['grounded'])}"]
@@ -104,7 +110,7 @@ def render_answers(answers: dict[str, Any]) -> list[str]:
         lines.append(f"- Errors: {', '.join(answers['errors'])}")
     lines += ["", *_table(["tag", "passed"], [[t, frac(s)] for t, s in answers["by_tag"].items()]), ""]
     return lines + render_refusals(answers["refusals"]) + render_demo(answers["demo"]) + \
-        render_reliability(answers["reliability"]) + render_latency_cost(answers)
+        render_reliability(answers["reliability"]) + render_latency_cost(answers, retrieval_ran)
 
 
 def render_refusals(r: dict[str, Any]) -> list[str]:
@@ -135,17 +141,32 @@ def render_reliability(rows: list[dict[str, Any]]) -> list[str]:
             *_table(["confidence", "answers", "correct", "accuracy"], body), ""]
 
 
-def render_latency_cost(answers: dict[str, Any]) -> list[str]:
+def ttft_cache_caveat(retrieval_ran: bool) -> str:
+    """Printed under every latency table, because the numbers above it can't show it: the retrieval phase (when it
+    runs; it needs /search) embeds the same questions first and the query-embedding cache keeps them 24 h, so an
+    answer's own embedding call is usually a hit (during the 2026-10-14 full run all 105 embed_query calls were, per
+    ai_usage.cache_hit). Without that phase only earlier runs can have warmed the cache."""
+    warmed = ("mostly already cached: the retrieval phase above embeds the same questions, and so did earlier runs"
+              if retrieval_ran else
+              "possibly already cached by earlier runs of the same questions (this run had no retrieval phase)")
+    return (f"TTFT here is measured with query embeddings {warmed} (cache TTL 24 h). A question the stack has never "
+            "seen also pays the embedding call, about 0.5 s at the median (uncached `embed_query` rows in "
+            "`ai_usage`).")
+
+
+def render_latency_cost(answers: dict[str, Any], retrieval_ran: bool = True) -> list[str]:
     """TTFT is shown twice: over the answers the model generated (the number to quote) and over all answers, where
-    gate refusals (~10 ms, no model call) pull the percentiles down. Older reports only have `ttft` (= all)."""
+    gate refusals (~10 ms, no model call) pull the percentiles down. Older reports only have `ttft` (= all), and no
+    `max`. Unlike the first-run rates above, these count every run, which the report says (n is runs, not cases)."""
     lat, cost = answers["latency_ms"], answers["cost_usd"]
     ttft = [("TTFT (server, all answers incl. gate refusals)", lat.get("ttft_all", lat["ttft"]))]
     if "ttft_model" in lat:
         ttft.insert(0, ("TTFT (server, model-generated answers only)", lat["ttft_model"]))
-    rows = [[name, str(s["n"]), ms(s["p50"]), ms(s["p95"])] for name, s in
+    rows = [[name, str(s["n"]), ms(s["p50"]), ms(s["p95"]), ms(s.get("max"))] for name, s in
             (*ttft, ("total (server)", lat["server_total"]), ("total (client)", lat["client_total"]))]
     per = "n/a" if cost["per_answer"] is None else f"${cost['per_answer']:.4f}"
-    return ["### Latency and cost", "", *_table(["ms", "n", "p50", "p95"], rows), "",
+    return ["### Latency and cost", "", "Latency and cost count every run, demo repeats included (n is runs, not "
+            "cases).", "", *_table(["ms", "n", "p50", "p95", "max"], rows), "", ttft_cache_caveat(retrieval_ran), "",
             f"Answer-call cost: ${cost['total']:.4f} over {cost['answers']} answers ({per} per answer).", ""]
 
 
@@ -164,6 +185,7 @@ def render_failures(report: dict[str, Any]) -> list[str]:
 
 
 def render_markdown(report: dict[str, Any]) -> str:
-    lines = render_meta(report) + render_retrieval(report["retrieval"]) + render_answers(report["answers"]) + \
-        render_failures(report)
+    retrieval_ran = "skipped" not in report["retrieval"]
+    lines = render_meta(report) + render_retrieval(report["retrieval"]) + \
+        render_answers(report["answers"], retrieval_ran) + render_failures(report)
     return "\n".join(lines).rstrip() + "\n"

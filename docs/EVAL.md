@@ -30,15 +30,32 @@ demo.
 
 - **hit@k**: share of cases whose gold chunk is in the top k results (k = 8 is what the model sees). **MRR**: mean of
   1/rank of the gold chunk (1.0 = always first). Reported per mode (hybrid / vector / keyword) and per tag.
-- **Pass**: all expectations met. **Refusal precision / recall**: of the refusals, how many were right / of the
-  must-refuse cases, how many were refused; split by path (gate vs model).
+- **Pass**: all expectations met. The headline is the **first-run pass rate**: the pass, per-check, per-tag, refusal
+  and reliability numbers use each case's first run, so a demo case repeated 3 times weighs the same as any other
+  case. Latency and cost use every run, demo repeats included (under `make eval-demo` each demo case counts 3 times,
+  so their `n` is runs, not cases), as does the demo stability table. With `--repeat` the report also prints the pass
+  count over all runs (`answers.passed_all_runs`), and demo cases must pass every run. **Refusal precision / recall**:
+  of the refusals, how many were right / of the must-refuse cases, how many were refused; split by path (gate vs model).
 - **Citation validity**: no cited id that wasn't provided. **Gold citation**: cites the expected document.
   **Grounded**: every number and code in a cited sentence appears in its cited chunk, is a shown calculation result,
   or is a date the model was shown, presented as that date: a cited source's document date right after "dated", or
-  today's date right after "today" / "as of" (answer.v2 rule 5 asks for both).
+  today's date right after "today" / "as of" (answer.v2 rule 5 asks for both). Since 2026-10-18 every answerable case
+  sets `expect.grounded: true`, so an ungrounded answer fails its case (before, grounding was only reported).
+- Citation validity, grounding and the starters' `min_citations` read the server's per-answer `signals`
+  (`invalid_citations`, `ungrounded_facts`, `valid_citations`). Since 2026-10-18 a signal the answer doesn't carry
+  fails its check, and the runner fails the run with the reason ("answer lacks signals [...]"); before, a missing
+  signal read as 0 and passed.
 - **Reliability**: accuracy per confidence badge. **Latency**: server TTFT over model-generated answers (gate refusals
   reply in ~10 ms without a model call and would flatter it; the report also shows TTFT over all answers), server and
-  client total. **Cost**: answer calls' cost from the `ai_usage` ledger.
+  client total, each as p50 / p95 / **max** (`max` since 2026-10-18: with ~40 answers p95 skips the slowest one or
+  two, so a one-off outlier such as a cold start only shows there). **Cost**: answer calls' cost from the `ai_usage`
+  ledger.
+- **TTFT caveat: it is measured with query embeddings (almost always) already cached.** The retrieval phase (when it
+  runs: it needs `/search`) embeds the same questions just before the answers, and earlier runs did too (the cache
+  keeps them 24 h): all 105 `embed_query` calls during the 2026-10-14 full run were cache hits (`ai_usage.cache_hit`).
+  A question the stack has never seen also pays the embedding call, about 0.5 s at the median (uncached `embed_query`
+  rows in `ai_usage`), so a user's first-time question is slower than the TTFT quoted here. Reports print this caveat
+  under their latency table (without the retrieval-phase clause when the run skipped retrieval).
 
 ## Results: final run (2026-10-14, demo corpus of 6 documents)
 
@@ -46,6 +63,13 @@ demo.
 `d51d3a2` with a clean tree, after the date-grounding fix (DECISIONS D-06). The comparison tables further down are
 from 2026-10-13 and name their own reports. Commit ids in the reports and these docs are the ids after the
 2026-10-14 history rewrite ([AI_USAGE.md](../AI_USAGE.md) §7); the code at each commit is unchanged.
+
+**Pending re-run.** On 2026-10-18 the spec was tightened after these runs: every answerable case now gates on
+`expect.grounded: true`, and a missing signal fails its check instead of passing (see Metrics). The real eval has not
+been re-run since (no OpenAI key was available), so the numbers below are the 2026-10-14 ones, unchanged. Re-scoring
+the answers stored in both reports offline with the new expectations passes 43/43 and 30/30 runs, but that is a
+re-score of old answers, not a new run. `make pre-demo` scores Backup sessions against the same golden cases, so a
+stored Backup answer with an ungrounded number now fails there too.
 
 ### Retrieval
 
@@ -71,6 +95,9 @@ real users paraphrase more, which is what the vector leg is for. A paraphrased r
 | TTFT p50 / p95 (server, 34 model-generated answers) | **1.4 s / 3.2 s** (all 43 answers incl. 9 gate refusals: 1.4 s / 2.7 s); max 23.4 s: the first follow-up after a restart downloaded the tokenizer, fixed in D-07 |
 | Cost per answer | $0.0042 with a cold prompt cache (averaged over all 43 incl. the 9 gate refusals at $0; ~$0.0053 per model-generated answer) |
 | AI spend for the whole run | $0.21 (answers plus condense, follow-ups and query embeddings) |
+
+"Cases passed" is the first-run pass rate (this run had no repeats, so it is also every run). Its TTFTs were measured
+with every query embedding already cached; a never-seen question adds about 0.5 s at the median (see Metrics).
 
 Sol's latency varies by day: on 2026-10-13 the same 43 cases gave 2.6 s / 4.7 s over the model-generated answers
 (20261013T165934Z), with the same pass, grounding and refusal results. Cost depends on OpenAI prompt caching, not on

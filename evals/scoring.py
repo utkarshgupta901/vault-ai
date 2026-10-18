@@ -11,7 +11,7 @@ Matching rules (the same for answers and for retrieved chunks):
 
 import math
 import re
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from typing import Any
 
 from app.core.textnorm import normalize as base_normalize
@@ -87,13 +87,33 @@ def check_gold_citation(citations: Sequence[dict[str, Any]], must_cite: str | Se
     return all(name in cited for name in required)
 
 
-def _signal(answer: dict[str, Any], name: str, default: Any = 0) -> Any:
-    return (answer.get("signals") or {}).get(name, default)
+# The server signals the checks and the refusal split read (app/schemas/chat.Signals always sends all of them).
+SCORED_SIGNALS = ("valid_citations", "invalid_citations", "ungrounded_facts", "gate")
+
+
+def missing_signals(answer: dict[str, Any]) -> list[str]:
+    """Which of SCORED_SIGNALS the answer doesn't carry (all of them when `signals` itself is absent)."""
+    signals = answer.get("signals")
+    if not isinstance(signals, dict):
+        return list(SCORED_SIGNALS)
+    return [name for name in SCORED_SIGNALS if name not in signals]
+
+
+def _signal(answer: dict[str, Any], name: str) -> Any:
+    """One server-side signal, or None when the answer doesn't carry it. Never a default of 0: a missing or renamed
+    `signals` would then read as "0 invalid citations, 0 ungrounded facts" and pass checks nothing ran."""
+    return (answer.get("signals") or {}).get(name)
+
+
+def _count_is(answer: dict[str, Any], name: str, test: Callable[[int], bool]) -> bool:
+    """`test` on a count signal; False when the signal is missing, so a check that gates on it fails closed."""
+    value = _signal(answer, name)
+    return value is not None and test(int(value))
 
 
 def model_generated(answer: dict[str, Any]) -> bool:
     """False for a gate refusal: the server replied without calling the answer model (signals.gate)."""
-    return not _signal(answer, "gate", False)
+    return not _signal(answer, "gate")
 
 
 def refusal_path(answer: dict[str, Any]) -> str | None:
@@ -101,7 +121,7 @@ def refusal_path(answer: dict[str, Any]) -> str | None:
     'I couldn't find this...'). None when the answer is not a refusal."""
     if answer.get("answer_type") != "not_found":
         return None
-    return "gate" if _signal(answer, "gate", False) else "model"
+    return "gate" if _signal(answer, "gate") else "model"
 
 
 def score_answer(expect: dict[str, Any], answer: dict[str, Any]) -> dict[str, Any]:
@@ -109,7 +129,8 @@ def score_answer(expect: dict[str, Any], answer: dict[str, Any]) -> dict[str, An
 
     Checks that decide `passed`: any_of, all_of, forbid, forbid_start, not_found, gold_citation, citations_valid,
     plus min_citations and grounded when the case asks for them. `grounded` is always reported, but only gates the
-    pass when expect.grounded is true (number grounding is a heuristic, so it is a metric first)."""
+    pass when expect.grounded is true (number grounding is a heuristic, so it is a metric first). The last three
+    read server signals: a signal the answer doesn't carry fails its check instead of passing it vacuously."""
     content = answer.get("content") or ""
     citations = answer.get("citations") or []
     expected_not_found = bool(expect.get("not_found", False))
@@ -120,10 +141,10 @@ def score_answer(expect: dict[str, Any], answer: dict[str, Any]) -> dict[str, An
         "forbid_start": check_forbid_start(content, expect.get("forbid_start")),
         "not_found": (answer.get("answer_type") == "not_found") == expected_not_found,
         "gold_citation": check_gold_citation(citations, expect.get("must_cite")),
-        "citations_valid": int(_signal(answer, "invalid_citations", 0)) == 0,
-        "min_citations": (int(_signal(answer, "valid_citations", len(citations))) >= int(expect["min_citations"])
+        "citations_valid": _count_is(answer, "invalid_citations", lambda n: n == 0),
+        "min_citations": (_count_is(answer, "valid_citations", lambda n: n >= int(expect["min_citations"]))
                           if expect.get("min_citations") else None),
-        "grounded": int(_signal(answer, "ungrounded_facts", 0)) == 0,
+        "grounded": _count_is(answer, "ungrounded_facts", lambda n: n == 0),
     }
     gating = [k for k in checks if k != "grounded"] + (["grounded"] if expect.get("grounded") else [])
     failed = [k for k in gating if checks[k] is False]
@@ -233,6 +254,8 @@ def percentile(values: Sequence[float], p: float) -> float | None:
 
 
 def latency_summary(values: Sequence[float | None]) -> dict[str, float | None]:
+    """p50/p95 plus the max: with ~40 answers p95 skips the slowest one or two, so an outlier (a cold start) that
+    a user would still feel only shows up in `max`."""
     present = [float(v) for v in values if v is not None]
     return {"n": len(present), "p50": percentile(present, 50), "p95": percentile(present, 95),
-            "avg": sum(present) / len(present) if present else None}
+            "avg": sum(present) / len(present) if present else None, "max": max(present) if present else None}

@@ -44,7 +44,7 @@ from evals.demo_library import (
     title_test_reason,
     user_docs_warning,
 )
-from tests.evals.fake_api import FakeVaultApi, users_transport
+from tests.evals.fake_api import SIGNALS, FakeVaultApi, users_transport
 from tests.evals.test_scripts import load_script
 
 NIST = "NIST.AI.100-1.pdf"                  # the approved public document, known by its pinned hash
@@ -88,6 +88,7 @@ def answer(cites: Sequence[dict[str, Any]] = (), retrieved: Sequence[dict[str, A
     return {"role": "assistant", "status": "complete", "answer_type": answer_type, "content": content,
             "citations": [{"ref": f"S{i}", "document_id": d["id"], "filename": d["filename"]}
                           for i, d in enumerate(cites, start=1)],
+            "signals": {**SIGNALS, "valid_citations": len(cites)},
             "retrieval": {"candidates": [{"document_id": d["id"], "filename": d["filename"]}
                                          for d in [*cites, *retrieved]]}}
 

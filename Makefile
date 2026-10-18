@@ -20,7 +20,7 @@ QUOTA_USER ?= demo
 QUOTA_USD ?= 100
 
 .DEFAULT_GOAL := help
-.PHONY: help up demo demo-luna raise-quota down reset logs ps migrate seed test test-fast lint fmt smoke smoke-llm eval eval-demo eval-retrieval doctor pre-demo workers web-dev web-build psql redis-cli snapshot-demo restore-demo freeze-starters
+.PHONY: help up demo demo-luna raise-quota down reset logs ps migrate seed test test-fast lint fmt ci smoke smoke-llm eval eval-demo eval-retrieval doctor pre-demo workers web-dev web-build psql redis-cli snapshot-demo restore-demo freeze-starters
 
 help: ## Show targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
@@ -86,6 +86,13 @@ lint: ## Ruff lint
 
 fmt: ## Ruff format + autofix
 	uv run ruff format app tests scripts evals && uv run ruff check --fix app tests scripts evals
+
+# The same three jobs as .github/workflows/ci.yml, one after the other; stops at the first failure. The tests need the
+# stack's Postgres/Valkey/S3 running (make up), as `make test` does.
+ci: ## What CI runs: lint, the full test suite, frontend lint + build + tests
+	@$(MAKE) --no-print-directory lint
+	@$(MAKE) --no-print-directory test
+	cd frontend && pnpm install --frozen-lockfile && pnpm lint && pnpm build && pnpm test
 
 smoke: ## End-to-end smoke against the running stack
 	uv run python scripts/smoke.py --api $(API) --key $(KEY)

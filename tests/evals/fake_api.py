@@ -19,6 +19,11 @@ import httpx
 ALL_ROUTES = {"/api/v1/documents", "/api/v1/search", "/api/v1/chat/sessions", "/api/v1/metrics/ai-usage",
               "/api/v1/metrics/documents"}
 
+# What every real answer carries (app/schemas/chat.Signals, all keys always present). An answer_fn's own `signals`
+# replaces it whole, so a test can drop or rename it to see the eval fail closed.
+SIGNALS = {"top_similarity": 0.6, "id_hit": False, "lexical_match": True, "valid_citations": 0,
+           "invalid_citations": 0, "uncited_claims": 0, "ungrounded_facts": 0, "gate": False}
+
 AnswerFn = Callable[[str, list[str], list[str]], dict[str, Any]]      # (question, prior questions, scope ids)
 SearchFn = Callable[[str, str, list[str]], list[dict[str, Any]]]      # (query, mode, document ids) -> hits
 
@@ -239,9 +244,10 @@ class FakeVaultApi:
         question = json.loads(request.content)["content"]
         prior = list(self.questions[sid])
         self.questions[sid].append(question)
+        reply = self.answer_fn(question, prior, self.sessions[sid]["document_ids"])
         answer = {"answer_type": "answered", "confidence": "medium", "model": "fake-answer", "prompt_version": "v2",
                   "ttft_ms": 100, "latency_ms": 900, "cost_usd": "0.010000",
-                  **self.answer_fn(question, prior, self.sessions[sid]["document_ids"])}
+                  "signals": {**SIGNALS, "valid_citations": len(reply.get("citations") or [])}, **reply}
         self.spend += float(answer.get("cost_usd") or 0)
         user_message, answer_message = self._append(sid, question, answer)
         return httpx.Response(200, json={"user_message": user_message, "answer": answer_message})

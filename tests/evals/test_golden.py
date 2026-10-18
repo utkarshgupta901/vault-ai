@@ -69,6 +69,15 @@ def test_public_doc_cases_target_the_nist_document(gold: golden.Golden) -> None:
     assert NIST not in gold.corpus          # gitignored and optional: never part of the base corpus
 
 
+def test_every_answerable_case_gates_on_grounding(gold: golden.Golden) -> None:
+    """The spec says an answer's numbers must be traceable to its sources. Without expect.grounded the check was only
+    reported, so an ungrounded answer still counted as a pass. Refusals have nothing to ground."""
+    answerable = [c for c in gold.cases if not c.not_found]
+    assert len(answerable) == 28
+    assert [c.id for c in answerable if c.expect.get("grounded") is not True] == []
+    assert not any("grounded" in c.expect for c in gold.cases if c.not_found)
+
+
 def test_multiturn_cases_have_a_standalone_query_for_retrieval(gold: golden.Golden) -> None:
     for case in gold.cases:
         if case.turns and case.expect.get("gold_chunk"):
@@ -116,6 +125,7 @@ def _with_case(raw: dict, **changes: object) -> dict:
     ({"expect": {"not_found": True, "any_of": ["x"]}}, "only unanswerable_*"),
     ({"expect": {"any_of": ["x"], "gold_chunk": ["x"], "must_cit": "a"}}, "unknown expect key 'must_cit'"),
     ({"expect": {"any_of": "18 days", "gold_chunk": ["x"]}}, "expect.any_of must be a non-empty list"),
+    ({"expect": {"any_of": ["x"], "gold_chunk": ["x"], "grounded": "yes"}}, "expect.grounded must be true or false"),
     ({"scope": ["Missing.pdf"]}, "scope file 'Missing.pdf' is not in the corpus"),
     ({"scope": ["Q3_2026_Board_Update.pdf"]}, "must_cite 'Larkspur_Employee_Handbook_2026.pdf' is not in the case"),
     ({"tags": ["multiturn"]}, "multiturn cases need prior turns"),

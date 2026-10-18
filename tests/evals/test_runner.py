@@ -12,7 +12,7 @@ import pytest
 
 from evals import run_eval
 from evals.report import render_markdown
-from tests.evals.fake_api import FakeVaultApi, transport
+from tests.evals.fake_api import ALL_ROUTES, SIGNALS, FakeVaultApi, transport
 
 DOCS = {"A.txt": "Employees get 18 days of PTO per year.", "B.txt": "Incident LRK-4471 cost $120k in total."}
 
@@ -47,7 +47,7 @@ cases:
 def _cited(content: str, filename: str, **extra: Any) -> dict[str, Any]:
     return {"content": content, "answer_type": "answered", "confidence": "high",
             "citations": [{"ref": "S1", "filename": filename, "label": "p. 1", "page_start": 1}],
-            "signals": {"valid_citations": 1, "invalid_citations": 0, "ungrounded_facts": 0}, **extra}
+            "signals": {**SIGNALS, "valid_citations": 1}, **extra}
 
 
 def answer(question: str, prior: list[str], ids: list[str]) -> dict[str, Any]:
@@ -58,7 +58,7 @@ def answer(question: str, prior: list[str], ids: list[str]) -> dict[str, Any]:
     if "LRK-4471" in question:
         return _cited("An outage [S1].", "B.txt")
     return {"content": "I couldn't find this in your documents.", "answer_type": "not_found", "confidence": "low",
-            "citations": [], "signals": {"gate": True}, "cost_usd": "0", "model": None, "ttft_ms": 8}
+            "citations": [], "signals": {**SIGNALS, "gate": True}, "cost_usd": "0", "model": None, "ttft_ms": 8}
 
 
 def search(query: str, mode: str, ids: list[str]) -> list[dict[str, Any]]:
@@ -104,7 +104,8 @@ def test_full_run_scores_everything(setup: dict[str, Path], capsys: pytest.Captu
     assert lrk["query"] == "LRK-4471 cost" and lrk["gold_id_hit"] is True
 
     answers = report["answers"]
-    assert answers["passed"] == {"ok": 3, "n": 3, "rate": 1.0}
+    assert answers["passed"] == {"ok": 3, "n": 3, "rate": 1.0}                 # first run of each case
+    assert answers["passed_all_runs"] == {"ok": 5, "n": 5, "rate": 1.0}        # + the demo case's 2 repeats
     assert answers["demo"] == [{"id": "f-pto", "passes": 3, "runs": 3, "stable": True, "flaky": False}]
     assert answers["refusals"]["by_path"]["gate"]["correct"] == 1
     assert answers["refusals"]["expected_path"] == {"matched": 1, "n": 1}
@@ -112,7 +113,8 @@ def test_full_run_scores_everything(setup: dict[str, Path], capsys: pytest.Captu
     assert answers["cost_usd"]["answers"] == 5
     # TTFT twice: the gate refusal (8 ms, no model call) is left out of the model-only numbers
     latency = answers["latency_ms"]
-    assert latency["ttft_model"] == {"n": 4, "p50": 100.0, "p95": 100.0, "avg": 100.0}
+    assert latency["ttft_model"] == {"n": 4, "p50": 100.0, "p95": 100.0, "avg": 100.0, "max": 100.0}
+    assert latency["server_total"]["max"] == 900.0
     assert latency["ttft_all"]["n"] == 5 and latency["ttft_all"]["avg"] == (4 * 100 + 8) / 5
     assert latency["ttft"] == latency["ttft_all"]                       # the old key keeps its old meaning
     assert "git_dirty" in meta                                          # next to git_sha; see test_git_dirty_flag
@@ -121,9 +123,26 @@ def test_full_run_scores_everything(setup: dict[str, Path], capsys: pytest.Captu
     assert sessions == [["What happened with LRK-4471?", "How much did it cost?"]]   # prior turn asked first
     printed = capsys.readouterr().out
     assert "| hybrid | 2 | 2/2 (100%)" in printed and "Skipped (document not present): p-public" in printed
-    assert "| TTFT (server, model-generated answers only) | 4 | 100 | 100 |" in printed
-    assert "| TTFT (server, all answers incl. gate refusals) | 5 | 100 | 100 |" in printed
+    assert "| TTFT (server, model-generated answers only) | 4 | 100 | 100 | 100 |" in printed
+    assert "| TTFT (server, all answers incl. gate refusals) | 5 | 100 | 100 | 100 |" in printed
+    assert "| total (server) | 5 | 900 | 900 | 900 |" in printed
+    assert "- First-run pass rate: **3/3 (100%)** (all runs incl. demo repeats: 5/5 (100%))" in printed
+    assert "query embeddings mostly already cached" in printed         # the TTFT caveat travels with the numbers
+    assert "the retrieval phase above embeds" in printed
+    # latency n (5) is runs, not cases (3): the report has to say so next to the first-run headline
+    assert "Latency and cost count every run, demo repeats included" in printed
     assert len(list(setup["out"].glob("*.md"))) == 1
+
+
+def test_ttft_caveat_only_cites_a_retrieval_phase_that_ran(setup: dict[str, Path]) -> None:
+    """Regression: the caveat said "the retrieval phase above embeds the same questions" even when /search was not
+    deployed and the run skipped retrieval, so nothing above had warmed the query-embedding cache."""
+    api = FakeVaultApi(answer_fn=answer, search_fn=search, routes=ALL_ROUTES - {"/api/v1/search"})
+    code, report = run(setup, api)
+    assert code == 0 and "skipped" in report["retrieval"]
+    md = render_markdown(report)
+    assert "retrieval phase above" not in md
+    assert "this run had no retrieval phase" in md and "about 0.5 s at the median" in md
 
 
 def test_flaky_demo_case_fails_the_run(setup: dict[str, Path]) -> None:
@@ -176,12 +195,34 @@ def test_a_failed_answer_is_recorded_not_fatal(setup: dict[str, Path]) -> None:
     assert report["answers"]["errors"] == ["o-fifa"]
 
 
+@pytest.mark.parametrize(("signals", "missing"), [
+    (None, "['valid_citations', 'invalid_citations', 'ungrounded_facts', 'gate']"),
+    ({k: v for k, v in SIGNALS.items() if k != "ungrounded_facts"}, "['ungrounded_facts']"),
+])
+def test_an_answer_without_signals_fails_and_says_why(setup: dict[str, Path], signals: dict | None,
+                                                      missing: str) -> None:
+    """Regression: an answer without `signals` (dropped or renamed on the server) used to score as 0 invalid
+    citations and 0 ungrounded facts. The runner now fails that run and names the cause."""
+    def unsignalled(question: str, prior: list[str], ids: list[str]) -> dict[str, Any]:
+        reply = answer(question, prior, ids)
+        return {**reply, "signals": signals} if "PTO" in question else reply
+
+    code, report = run(setup, FakeVaultApi(answer_fn=unsignalled, search_fn=search), "--case", "f-pto,o-fifa")
+    pto = next(c for c in report["cases"] if c["id"] == "f-pto")["runs"][0]
+    assert not pto["passed"] and pto["failed"][0] == "signals"
+    assert f"answer lacks signals {missing}" in pto["error"]
+    assert report["answers"]["errors"] == ["f-pto"] and report["answers"]["passed"]["ok"] == 1
+    assert code == 1                                   # f-pto is a demo case
+
+
 def test_reports_written_before_the_ttft_split_still_render() -> None:
     """Older reports have only latency_ms.ttft (all answers) and no git_dirty; the renderer must still read them."""
     old = json.loads((Path(run_eval.ROOT) / "evals" / "reports" / "20261013T170823Z.json").read_text())
     assert "ttft_model" not in old["answers"]["latency_ms"] and "git_dirty" not in old["meta"]
     md = render_markdown(old)
     assert "| TTFT (server, all answers incl. gate refusals) | 30 |" in md and "model-generated" not in md
+    assert "| total (server) | 30 | 4,035 | 9,068 | n/a |" in md                # no max recorded before 2026-10-18
+    assert "- First-run pass rate: **10/10 (100%)**\n" in md                  # no all-runs count either
     assert "git `b8985a3` |" in md
     old["meta"]["git_dirty"] = True
     assert "git `b8985a3` (dirty: uncommitted changes) |" in render_markdown(old)

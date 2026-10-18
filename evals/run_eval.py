@@ -11,7 +11,8 @@ What it does, in order:
      per mode x tag, with raw counts.
   4. Answers: a NEW chat session per case run (scope from the case), prior turns asked first, then the question via
      the JSON endpoint. Each answer is scored by evals/scoring.score_answer. Cases tagged `demo` run --repeat times
-     and must pass every run (pass^N); quality metrics use each case's first run so every case weighs the same.
+     and must pass every run (pass^N); quality metrics use each case's first run so every case weighs the same,
+     while latency and cost count every run.
   5. Report: evals/reports/<UTC timestamp>.json (everything, including answers) and .md (the readable summary the
      README quotes), and the markdown is printed.
 
@@ -219,6 +220,17 @@ def answer_record(answer: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def score_run(case: Case, answer: dict[str, Any]) -> dict[str, Any]:
+    """score_answer plus the runner's guard on the contract it relies on: an answer without the signals the checks
+    read fails as such, with the reason, so a server that dropped or renamed `signals` cannot look clean."""
+    scored = scoring.score_answer(case.expect, answer)
+    missing = scoring.missing_signals(answer)
+    if not missing:
+        return {**scored, "error": None}
+    return {**scored, "passed": False, "failed": ["signals", *scored["failed"]],
+            "error": f"answer lacks signals {missing}: the citation and grounding checks had nothing to read"}
+
+
 def run_case_once(client: VaultClient, case: Case, ids: list[str] | None) -> dict[str, Any]:
     """One fresh session: prior turns first (so condensation has history), then the scored question."""
     try:
@@ -233,8 +245,8 @@ def run_case_once(client: VaultClient, case: Case, ids: list[str] | None) -> dic
         client_ms = int((time.perf_counter() - started) * 1000)
     except (ApiError, httpx.HTTPError) as exc:      # one slow or failed answer must not sink the whole run
         return {"passed": False, "failed": ["error"], "checks": {}, "error": str(exc), "answer": None, "turns": []}
-    return {**scoring.score_answer(case.expect, answer), "error": None, "answer": answer_record(answer),
-            "client_ms": client_ms, "session_id": session["id"], "turns": turns}
+    return {**score_run(case, answer), "answer": answer_record(answer), "client_ms": client_ms,
+            "session_id": session["id"], "turns": turns}
 
 
 def run_answers(client: VaultClient, cases: list[Case], doc_ids: dict[str, str], repeat: int) -> dict[str, list]:
@@ -274,7 +286,8 @@ def summarize_answers(cases: list[Case], results: dict[str, list[dict[str, Any]]
     ttft_all = scoring.latency_summary([run["answer"]["ttft_ms"] for run in all_runs])
     return {
         "cases": len(first),
-        "passed": _rate([r["passed"] for r in first.values()]),
+        "passed": _rate([r["passed"] for r in first.values()]),          # the headline: first run of each case
+        "passed_all_runs": _rate([run["passed"] for runs in results.values() for run in runs]),
         "by_tag": {t: _rate([first[c.id]["passed"] for c in cases if t in c.tags and c.id in first]) for t in tags},
         "checks": {name: check_rate(name) for name in ("not_found", "citations_valid", "gold_citation", "grounded")},
         "errors": [cid for cid, r in first.items() if r["error"]],

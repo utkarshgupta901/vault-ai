@@ -140,6 +140,8 @@ def _validate_expect(cid: str, tags: set[str], expect: Any, scope_files: list[st
         if not isinstance(groups, list) or not groups or not all(
                 (isinstance(g, str) and g.strip()) or _is_str_list(g) for g in groups):
             problems.append(f"{cid}: expect.all_of must be a list of strings or lists of strings")
+    if "grounded" in expect and not isinstance(expect["grounded"], bool):      # "no" would be truthy and gate
+        problems.append(f"{cid}: expect.grounded must be true or false")
     must = expect.get("must_cite")
     must_list = [must] if isinstance(must, str) else (must or [])
     if must is not None and not _is_str_list(must_list):

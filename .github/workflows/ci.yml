@@ -1,0 +1,109 @@
+# CI: the same checks as `make ci` locally. Python lint, the full pytest suite against service containers that mirror
+# compose.yaml (same images, credentials and host ports, so tests/conftest.py's defaults work unchanged), and the
+# React dashboard's lint, build and tests. No job talks to OpenAI: the suite always runs on the FakeProvider.
+# Actions are on their current majors, which run on the Node 24 action runtime.
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:                       # a newer push to the same branch or PR supersedes a run still in progress
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Python lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.8.22"        # the uv the Dockerfile copies in
+          python-version: "3.13"
+          enable-cache: true
+      - run: uv sync --frozen
+      - run: uv run ruff check app tests scripts evals
+
+  test:
+    name: Python tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # Where tiktoken keeps its encodings. Ingestion's chunker has no offline fallback, so the files are fetched once
+      # below (as the Dockerfile bakes them) and cached, instead of downloaded by whichever test needs them first.
+      TIKTOKEN_CACHE_DIR: ${{ github.workspace }}/.cache/tiktoken
+    services:
+      # Host ports are compose.yaml's defaults (PG_PORT 5433, VALKEY_PORT 6380, S3_PORT 9200): conftest reads those.
+      # Service containers cannot take a `command`, so compose's tuning flags (shared_buffers, AOF, maxmemory) are
+      # left at the images' defaults; nothing in the suite depends on them.
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: vault
+          POSTGRES_PASSWORD: vault
+          POSTGRES_DB: vault
+        ports: ["5433:5432"]
+        options: >-
+          --health-cmd "pg_isready -U vault -d vault"
+          --health-interval 3s --health-timeout 3s --health-retries 30
+      valkey:
+        image: valkey/valkey:8-alpine
+        ports: ["6380:6379"]
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 3s --health-timeout 3s --health-retries 30
+      s3:
+        image: rustfs/rustfs:1.0.1
+        env:
+          RUSTFS_ACCESS_KEY: vaultlocal
+          RUSTFS_SECRET_KEY: vaultlocalsecret
+        ports: ["9200:9000"]
+        volumes: ["s3data:/data"]  # as in compose.yaml: the server stores objects under /data
+        options: >-
+          --health-cmd "nc -z localhost 9000 || exit 1"
+          --health-interval 3s --health-timeout 3s --health-retries 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.8.22"
+          python-version: "3.13"
+          enable-cache: true
+      - run: uv sync --frozen
+      - name: Cache tokenizer files
+        uses: actions/cache@v6
+        with:
+          path: ${{ env.TIKTOKEN_CACHE_DIR }}
+          key: tiktoken-o200k_base-cl100k_base-v1
+      - name: Fetch tokenizer files (encodings of app/rag/tokens.py and app/ingestion/chunking.py)
+        run: uv run python -c "import tiktoken; [tiktoken.get_encoding(e) for e in ('o200k_base', 'cl100k_base')]"
+      - run: uv run pytest -q
+
+  frontend:
+    name: Frontend
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6                     # v6 is the first major that supports pnpm 11
+        with:
+          package_json_file: frontend/package.json     # its "packageManager" pins the pnpm version
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"       # the Dockerfile builds the SPA on node:24; `pnpm test` runs .ts files natively
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm lint
+      - run: pnpm build
+      - run: pnpm test

@@ -121,6 +121,30 @@ def test_min_citations_for_starters() -> None:
     assert scoring.score_answer(expect, uncited)["failed"] == ["min_citations"]
 
 
+@pytest.mark.parametrize("signals", [None, {}, {"signal": {"invalid_citations": 0}}])
+def test_missing_signals_fail_the_checks_that_read_them(signals: dict | None) -> None:
+    """Regression: a missing (or renamed) `signals` used to read as 0 invalid citations and 0 ungrounded facts, so
+    citations_valid and grounded passed without anything being checked, and min_citations counted raw citations."""
+    answer = _answer("You get 18 days [S1].")
+    answer["signals"] = signals
+    expect = {"any_of": ["18 days"], "min_citations": 1, "grounded": True}
+    result = scoring.score_answer(expect, answer)
+    assert not result["passed"]
+    assert set(result["failed"]) == {"citations_valid", "min_citations", "grounded"}
+    del answer["signals"]                                               # absent altogether: the same
+    assert set(scoring.score_answer(expect, answer)["failed"]) == {"citations_valid", "min_citations", "grounded"}
+
+
+def test_each_missing_signal_fails_only_its_own_check() -> None:
+    answer = _answer("You get 18 days [S1].")
+    del answer["signals"]["ungrounded_facts"]
+    reported = scoring.score_answer({"any_of": ["18 days"]}, answer)
+    assert reported["passed"] and reported["checks"]["grounded"] is False      # reported as not verified
+    assert scoring.score_answer({"any_of": ["18 days"], "grounded": True}, answer)["failed"] == ["grounded"]
+    del answer["signals"]["invalid_citations"]
+    assert scoring.score_answer({"any_of": ["18 days"]}, answer)["failed"] == ["citations_valid"]
+
+
 # --- retrieval --------------------------------------------------------------------------------------------------
 def test_first_relevant_rank_is_one_based() -> None:
     contents = ["holiday policy", "Employees get 18 days of paid time off", "18 days of paid time off again"]
@@ -197,4 +221,5 @@ def test_percentile_is_nearest_rank() -> None:
     assert scoring.percentile([7], 95) == 7
     assert scoring.percentile([], 50) is None
     summary = scoring.latency_summary([100, None, 300])
-    assert summary == {"n": 2, "p50": 100.0, "p95": 300.0, "avg": 200.0}
+    assert summary == {"n": 2, "p50": 100.0, "p95": 300.0, "avg": 200.0, "max": 300.0}
+    assert scoring.latency_summary([None])["max"] is None
