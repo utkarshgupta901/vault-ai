@@ -66,6 +66,10 @@ _PERCENT_RE = re.compile(r"(?<![\w.])" + _NUM + r"\s?(?:%|percent\b)", re.IGNORE
 _DOTTED_RE = re.compile(r"(?<![\w.])\d+(?:\.\d+)+(?!\w)")
 _NUMBER_RE = re.compile(r"(?<![\w.])" + _NUM + _SUFFIX, re.IGNORECASE)
 _WORD_RE = re.compile(r"[a-z0-9]+")
+# A calculation's result ends where its clause does: ';', a comma that is not a thousands separator, the next '=', a
+# line break, or a joining word. An operator between two numbers marks an expression, not a result.
+_RESULT_END_RE = re.compile(r";|,(?!\d)|=|\n|\s(?:and|but|so|which|while|whereas|assuming|if)\s", re.IGNORECASE)
+_ARITHMETIC_RE = re.compile(r"[\d%)]\s*[-+−×x*/÷]\s*[$€£(]?\s?\d")
 
 # Dates as the model writes them. Day precision first, so "15 January 2026" is one date, not "January 2026" + "15".
 # Abbreviations are matched without a period: split_sentences already cuts "Jan. 15" after "Jan.", so such a date
@@ -181,16 +185,25 @@ def source_facts(text: str) -> set[str]:
 
 
 def derived_facts(answer: str) -> set[str]:
-    """Results of calculations shown anywhere in the answer (the part after the last '=' of each sentence).
+    """Results of calculations shown anywhere in the answer: what follows each '=', up to the end of its clause.
 
     A derived value inherits its grounding from the calculation that produced it, whose inputs ARE checked. So it may
     be stated before its calculation ("20 days: 18 + 2 = 20") or reused as an input later ("$665k - $600k = $65k")
-    without being mistaken for a fact the sources should contain."""
+    without being mistaken for a fact the sources should contain.
+
+    Every '=' counts, not just a sentence's last one: a bullet like "$380k + 3 × $95k = $665k, assuming ...; $665k −
+    $600k = $65k" holds two results. Only the clause right after the '=' is the result ("= $665,000, valid for 1,200
+    seats" derives $665,000, not 1,200), and a clause that is itself arithmetic ("= 18 + 2 = 20") is an intermediate
+    step whose numbers are inputs, so it derives nothing."""
     derived: set[str] = set()
     for sentence in split_sentences(answer):
         body = strip_citations(sentence)
-        if "=" in body:
-            derived |= extract_facts(body[body.rindex("=") + 1:])
+        for equals in re.finditer("=", body):
+            rest = body[equals.end():]
+            end = _RESULT_END_RE.search(rest)
+            result = rest[:end.start()] if end else rest
+            if not _ARITHMETIC_RE.search(result):
+                derived |= extract_facts(result)
     return derived
 
 

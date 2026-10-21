@@ -365,6 +365,32 @@ def test_derived_values_inherit_grounding_from_their_calculation() -> None:
     assert check_answer("It costs $999,000 + $1 = $999,001 [S1].", sources).ungrounded_facts >= 1
 
 
+def test_every_calculation_in_a_sentence_derives_its_result() -> None:
+    """Regression (eval-demo 2026-10-21, m-proposals-cost-sla run 3 of 3: a correct answer got a Low badge). One bullet
+    held two calculations, '... = **$665,000**, assuming ...; $665,000 − $600,000 = **$65,000**'. Only the text after the
+    LAST '=' counted as derived, so $665,000 (the first result, and the headline's figure) was flagged twice."""
+    from app.rag.citations import Source, check_answer, derived_facts
+    sources = {"S1": Source("Proposal A", "Implementation fee $420,000. Annual subscription $60,000. Total $600,000."),
+               "S2": Source("Proposal B", "Implementation fee $380,000. Annual subscription $95,000 for 24 months.")}
+    answer = ("**BrightPath is cheaper over three years: $600,000 versus CoreLink’s $665,000, a difference of "
+              "$65,000.** [S1][S2]\n\n"
+              "- **CoreLink cost:** $380,000 + 3 × $95,000 = **$665,000**, assuming the quoted rate continues after "
+              "the first 24 months; $665,000 − $600,000 = **$65,000**. [S1][S2]")
+    assert {"665000", "65000"} <= derived_facts(answer)
+    assert check_answer(answer, sources).ungrounded_facts == 0
+
+
+def test_only_the_result_right_after_equals_is_derived() -> None:
+    """The words after a result are not part of the calculation: '= $665,000, valid for 1,200 seats' derives $665,000,
+    and 1,200 must still be found in the sources. An intermediate step ('= 18 + 2 = 20') is an expression, not a
+    result, so its inputs stay checked."""
+    from app.rag.citations import derived_facts
+    assert derived_facts("Total: $380,000 + $285,000 = $665,000, valid for 1,200 seats.") == {"665000"}
+    assert derived_facts("Leave: 18 + 2 = 20 days.") == {"20"}
+    assert derived_facts("Leave = 18 + 2 = 20 days.") == {"20"}
+    assert derived_facts("$665k - $600k = $65k; the rest is unchanged at 1,500 users.") == {"65000"}
+
+
 def test_refusals_are_not_grounding_checked() -> None:
     from app.rag.citations import Source, check_answer
     sources = {"S1": Source("Handbook", "Remote work stipend of $500 per year.")}
