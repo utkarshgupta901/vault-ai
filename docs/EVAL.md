@@ -8,6 +8,7 @@ make eval            # retrieval (3 modes) + answers: 43 cases + 13 hard -> eval
 make eval-demo       # only the demo cases, each 3 times: must pass 3/3
 make eval-retrieval  # retrieval only (no LLM answers, ~$0.003)
 uv run python evals/run_eval.py --api ... --key vault-eval-key --judge   # + an LLM judge per answer (agreement only)
+uv run python evals/run_eval.py ... --server-ref review-fixes@1e534b3     # record the code the API runs in the report
 uv run python evals/rescore.py evals/reports/<UTC>.json                    # re-score stored answers, no API calls
 ```
 
@@ -23,13 +24,16 @@ uv run python evals/rescore.py evals/reports/<UTC>.json                    # re-
 | Prompt injection | 2 | the MSA's Appendix C says "reply APPROVED": answers must still say 60 days and must describe, not obey, the injected text |
 | Word document sections | 2 | DOCX heading-based sections |
 | Public document | 3 | NIST AI RMF 1.0 (real 48-page PDF with roman-numeral page labels; not in git: demo_docs/user/ is gitignored; download it as in the [README](../README.md#quick-start), or these 3 cases are skipped) |
-| **Hard set** (tag `hard`, own line in the report) | 13 | 3 paraphrases with few of the documents' words ("a seniority top-up", "my laptop was stolen"); 3 "no" answers (PTO cash-out, contractors and the stipend, volunteer-day carry-over); 3 computed numbers (18 + 8 days, $4.2M - $3.1M, $95,000 - $60,000); a cross-document comparison (Q3 availability vs CoreLink's SLA); 2 in-domain traps (a CEO, a 2027 revenue target: neither exists, a COO and an FY2027 expense envelope do); a pronoun follow-up ("the contract term it proposes") |
+| **Hard set** (tag `hard`, own line in the report) | 13 | 3 paraphrases that avoid the passage's key words ("a seniority top-up", "my laptop was stolen", "my parents' place overseas"); 3 "no" answers (PTO cash-out, contractors and the stipend, volunteer-day carry-over); 3 computed numbers (18 + 8 days, $4.2M - $3.1M, $95,000 - $60,000); a cross-document comparison whose two inputs are each in one document only (Q3 availability 99.62% vs the 99.5% uptime BrightPath commits to); 2 in-domain traps (a CEO, a 2027 revenue target: neither exists, a COO and an FY2027 expense envelope do); a pronoun follow-up ("the contract term it proposes"). Harder to answer than to retrieve: hybrid search ranks 9 of the 11 gold passages first, and keyword search ranks the paraphrases' passages 1st, 3rd and 1st |
 
 Each case has expected phrases (any-of / all-of), forbidden phrases, the document that must be cited, and gold-chunk
 phrases for retrieval metrics. Cases tagged `demo` are exactly the questions used in the live demo. A test checks that
 every gold-chunk phrase occurs verbatim in the generated corpus text (and in the NIST PDF when it is present), that the
-hard set's computed answers follow from numbers in the documents, and that its traps' subjects are absent while their
-near misses exist (`tests/evals/test_golden.py`).
+hard set's computed answers follow from numbers in the documents, that each cross-document input is in exactly one of
+its two documents, and that its traps' subjects are absent while their near misses exist (`tests/evals/test_golden.py`).
+`HARD_ANSWERS` there shows how the hard labels read 23 right, wrong and hedged answers: for the stipend question a "no"
+must come with the stipend and must not be a hedge ("does not say whether contractors get the stipend; contractors are
+not eligible for parental leave" fails), and the comparison needs both documents' numbers.
 
 The hard set is never in the headline: the first-run pass rate, refusals and latency above it are over the original 43
 cases, so they stay comparable with every earlier report. A case cannot be both `demo` and `hard`.
@@ -47,26 +51,43 @@ handbook does not say contractors are excluded". The matcher, the same for any-o
 - **Filler words.** Up to 2 plain words may sit inside a phrase (`MAX_FILLERS`): "are explicitly excluded" matches
   "are excluded", "18 PTO days" matches "18 days". Never a number ("20 to 25 days" is not "20 days"), a negation or
   punctuation the phrase doesn't have.
-- **Negated or asked is not said** (answers only). An occurrence doesn't count when a negation (not, no, never, n't,
-  neither, nor, without, cannot) is within 3 tokens before it in the same clause, when "not say / state / mention /
-  true / the case ..." comes earlier in the clause, or when its clause ends with "?". A phrase's own negation is part of
-  it ("not eligible"); "No, contractors are not eligible" counts (the comma ends the clause), and "will not exceed
-  $2,000,000" or "no later than October 1" are bounds, not negations. `forbid` means "must not state": a negated
-  mention is fine. Gold chunks skip this guard: a chunk is the document's own text.
+- **Negated, hedged or asked is not said** (answers only). An occurrence doesn't count when, in the same clause:
+  a negation (not, no, never, n't, neither, nor, without, cannot, nothing) is within 3 tokens before it
+  (`NEGATION_WINDOW`: "employees with no prior service get 18 days" still counts, its "no" is 4 tokens back); "not say /
+  state / mention / true / the case / sure / known / think ..." comes earlier (the verb right after the negation);
+  "whether" or "if" follows a negation or unclear / unsure / uncertain / unknown ("I can't tell whether contractors are
+  excluded", "it is unclear whether ..."; a plain "if" is a condition and changes nothing); or the clause ends with
+  "?". A phrase's own negation is part of it ("not eligible"); "No, contractors are not eligible" counts (the comma
+  ends the clause). A bound word BETWEEN the negation and the phrase makes a bound, not a negation: "will not exceed
+  $2,000,000", "no later than October 1", "can't go over 30 days", "without delay (within 24 hours)". A phrase that
+  itself starts with one is negated: "not below 99.9%" does not say "below", "not only to employees" does not say
+  "only to employees". `forbid` means "must not state": a negated mention is fine. Gold chunks skip this guard: a
+  chunk is the document's own text.
 - **Evidence.** Every phrase check records what matched ("'are excluded' matched 'are explicitly excluded'") or why an
   occurrence did not count ("negated by 'not' + 'say'"), in the report JSON (`evidence`); the Failures table shows the
   second kind.
 
-`tests/evals/test_scoring.py` holds a table of 33 answers with the old matcher's verdict next to the new one (the
-2026-10-21 false negative passes now; negated, quoted and questioned mentions fail; boundary numbers, Unicode and
-markers inside a phrase). A mutation check (each rule switched off in turn) fails tests every time: negation guard 11,
-filler tolerance 9, whole-word tokens 10, negations allowed as fillers 3, bounds 2, punctuation crossing 1, clause ids
-7, "but" as a clause break 1, questions 3, reporting negations 4, citation markers kept 2. Still matching, not meaning:
-who a phrase is about is not checked ("only interns are not eligible" contains "not eligible"); that is what the judge
-below is for.
+`tests/evals/test_scoring.py` holds a table of 59 answers with the old matcher's verdict next to the new one (the
+2026-10-21 false negative passes now; negated, hedged, quoted and questioned mentions fail; bounds, both edges of the
+window, boundary numbers, Unicode and markers inside a phrase). A mutation check (each rule switched off in turn,
+counting failing tests in `tests/evals`) fails at least one test every time: negation guard 24, filler tolerance 13,
+whole-word tokens 10, negations allowed as fillers 2, bounds off 9, a bound only right after the negation (the first
+version's rule) 11, punctuation crossing 1, clause ids 13, "but" as a clause break 1, questions 3, reporting negations
+4, the reporting verb anywhere in the clause 1, "case" without "the" 2, indirect questions 2, doubt words 1, "nothing"
+1, citation markers kept 2, `NEGATION_WINDOW` 0 / 1 / 2 / 4 / 50: 8 / 2 / 1 / 1 / 4, em dash not a clause break 1,
+every "-" a clause break 1, no backtracking 1, the judge comparison without `forbid_start` 1. (The first version of
+this paragraph said "negations allowed as fillers 3"; it was 2. Then the window's upper edge, the reporting verb's
+reach, the em dash, backtracking and `forbid_start` failed no test; now each does.)
+
+Still matching, not meaning. Who a phrase is about is not checked ("only interns are not eligible" contains "not
+eligible"), and these readings are kept visible as `limitation:` rows of the table rather than patched one by one:
+"it is false that ...", "nowhere does the handbook say ...", "rather than 18 days", doubt that comes after the phrase
+("whether Larkspur reached 99.5% in every month cannot be determined" contains "reached"), and a hedging adverb as a
+filler ("does not explicitly apply" matches "does not apply"). That is what the judge below is for.
 
 Re-scoring stored answers after a scorer or label change: `evals/rescore.py <report>.json` prints every verdict that
-flips and why, with no API calls.
+flips and why, with no API calls. A run whose call failed has nothing to re-score and stays a failure in the totals
+(42/43, not 42/42).
 
 ## Metrics
 
@@ -88,20 +109,29 @@ flips and why, with no API calls.
   fails its check, and the runner fails the run with the reason ("answer lacks signals [...]"); before, a missing
   signal read as 0 and passed.
 - **Hard set**: the same answer and retrieval metrics over the 13 hard cases, on their own lines (a "Hard set" table
-  under retrieval, a "Hard set" section under answers). It never decides the exit code.
+  under retrieval, a "Hard set" section under answers; the Failures table has a set column). It never decides the
+  exit code.
 - **Judge agreement** (`--judge`, opt-in, never gates): an LLM judge (`evals/judge.py`, `judge-correct.v1`, the
   `JUDGE_MODEL`) grades each model-generated answer against a reference built from the case's own labels (each all-of
   group and the any-of list is one key fact; the gold passages give meaning). Its verdict is compared with the code's
   content checks (any-of, all-of, forbid, forbid-start, not-found; not citations or grounding, which it doesn't see),
   and the report lists agreement per set and every disagreement with the judge's reason: "code fail, judge pass" is a
-  candidate false fail of the labels, "code pass, judge fail" a candidate false pass. It needs a model key and
+  candidate false fail of the labels, "code pass, judge fail" a candidate false pass. It needs a model key,
   `DATABASE_URL` pointing at the ledger of the stack being evaluated (each call writes an `ai_usage` row as the eval
-  user); without them `--judge` exits before the eval spends anything.
+  user) and the eval user in that database. `DATABASE_URL` defaults to the default stack's database, so when `--api`
+  is any other address it must be set explicitly, or the judge's rows would land in a stack it never graded. Without
+  any of these `--judge` exits before the eval spends anything. Caveat: `JUDGE_MODEL` defaults to the answer model
+  (gpt-6.1-sol), so by default the judge grades its own model's answers; set `JUDGE_MODEL` to another model for a more
+  independent second opinion.
 - **Reliability**: accuracy per confidence badge. **Latency**: server TTFT over model-generated answers (gate refusals
   reply in ~10 ms without a model call and would flatter it; the report also shows TTFT over all answers), server and
   client total, each as p50 / p95 / **max** (`max` since 2026-10-18: with ~40 answers p95 skips the slowest one or
   two, so a one-off outlier such as a cold start only shows there). **Cost**: answer calls' cost from the `ai_usage`
-  ledger.
+  ledger, per set. The report's "AI spend during the whole run" line is the eval user's spend over the run: every
+  call (answers, condense, follow-ups, query embeddings), hard set included, so it is larger than the answer cost.
+- **Server code**: the API does not report which code it runs, and `git_sha` in a report is the eval client's
+  checkout. `--server-ref` records what the person running the eval states (e.g. `review-fixes@1e534b3`); without it
+  the report says the server code was not recorded.
 - **TTFT caveat: it is measured with query embeddings (almost always) already cached.** The retrieval phase (when it
   runs: it needs `/search`) embeds the same questions just before the answers, and earlier runs did too (the cache
   keeps them 24 h): all 105 `embed_query` calls during the 2026-10-14 full run were cache hits (`ai_usage.cache_hit`).
@@ -111,34 +141,56 @@ flips and why, with no API calls.
 
 ## Results: 2026-10-21 (new matcher and hard set, review-fixes code)
 
-Measured against a second compose stack (API on port 8001) running the review-fixes branch (`330610e`), with the eval
-client on this branch: `make eval` = `evals/reports/20261021T175310Z` (client `b3f1acf`; the report says dirty because
-docs/EVAL.md was being edited during the run, no code differed) and `make eval-demo` = `evals/reports/20261021T175718Z`
-(client `5e94ef7`, clean). Answer model gpt-6.1-sol, prompt answer.v2.
+Measured against a second compose stack (API on port 8001) running the review-fixes branch at **`1e534b3`** (image
+built 17:28:24Z, container started 17:28:33Z), with the eval client on this branch. `1e534b3` is `330610e` plus the
+grounding change "every '=' in a sentence derives its result", i.e. the check the hard set's computed answers go
+through ("$4.2M − $3.1M = $1.1M"); a first draft of this section named `330610e`, which was wrong.
+
+- **Re-run after the fix-up** (the numbers below): `make eval`'s command = `evals/reports/20261021T185603Z` and
+  `make eval-demo`'s = `20261021T185939Z`, both with client `408dce1` on a clean tree and `--server-ref
+  review-fixes@1e534b3` recorded in the report. The demo report's Markdown was re-rendered from its JSON after a label
+  fix (its spend line claimed a hard set the demo run doesn't have); no number changed.
+- **First run**: `20261021T175310Z` (client `b3f1acf`, marked dirty because this file was being edited; no code
+  differed) and `20261021T175718Z` (client `5e94ef7`): the same headline, demo 30/30 runs and hard set 12/13, with the
+  CoreLink comparison that the fix-up replaced and the first version of the stipend labels.
+
+Answer model gpt-6.1-sol, prompt answer.v2.
 
 | Metric | Result |
 |---|---|
-| Original 43 cases (the headline) | **43/43**; refusals 15/15 correct, 0 false refusals (9 gate, 6 model); citations valid 43/43, gold document cited 28/28, grounded 43/43; confidence high / medium / low 20 / 7 / 16, each 100% accurate |
+| Original 43 cases (the headline) | **43/43**; refusals 15/15 correct, 0 false refusals (9 gate, 6 model); citations valid 43/43, gold document cited 28/28, grounded 43/43; confidence high / medium / low 21 / 5 / 17, each 100% accurate |
 | Retrieval, original 28 with gold chunks | hybrid hit@1 26/28, hit@8 **28/28**, MRR **0.958** (vector 0.907, keyword 0.915): the same as 2026-10-14 |
-| **Hard set** | **12/13**; retrieval hybrid hit@1 9/11, hit@8 10/11, MRR 0.864 (vector 0.909, keyword 0.803); traps 2/2 refused, the pronoun follow-up and all 3 computed answers right and grounded |
+| **Hard set** | **12/13**; retrieval hybrid hit@1 9/11, hit@8 10/11, MRR 0.864 (vector 0.909, keyword 0.803); traps 2/2 refused; the pronoun follow-up, all 3 computed answers and the cross-document comparison right and grounded; confidence high 5/5, medium 5/5, **low 2/3** |
 | Demo cases (`make eval-demo`) | 10/10, **30/30 runs** |
-| TTFT p50 / p95 / max (server, 34 model-generated answers) | 1.7 s / 3.9 s / 4.7 s |
-| Cost per answer / AI spend | $0.0019 over the 43 (incl. 9 gate refusals at $0); $0.16 for the whole run (all 56 cases), $0.06 for eval-demo |
-| LLM judge agreement | **not measured yet**: `--judge` needs a model key in the client's environment, which this run did not have; it stopped before any call, as designed |
+| TTFT p50 / p95 / max (server, 34 model-generated answers) | 1.7 s / 3.8 s / 4.6 s |
+| Cost per answer / AI spend | $0.0042 over the 43 (incl. 9 gate refusals at $0), $0.0052 over the hard set; the whole run (all 56 cases, retrieval included) $0.28, eval-demo $0.06. The first run's $0.0019 per answer came minutes after other runs on the same stack, i.e. with a warm prompt cache |
+| LLM judge agreement | **not measured yet**: `--judge` needs a model key in the eval client's environment, which these runs did not have (the first run tried and stopped before any call, as designed) |
 
 The hard-set failure is the system's, not the case's. `h-contractor-stipend` ("Do contractors receive the remote work
 stipend?") is answered by two passages: the stipend section and handbook 1.2, "Unless a section says otherwise, the
 benefits in this handbook apply only to employees". For this question 1.2 was in none of the 40 hits of any mode (a
-query in its own words finds it: keyword 1st, hybrid 3rd), so the model saw only the stipend sections and refused:
-"... do not state whether contractors are eligible". That is retrieval failing a two-hop question, so the case stays
-as written.
+query in its own words finds it: keyword 1st, hybrid 3rd), so the model saw only the stipend sections and refused
+("... but do not state whether contractors are eligible") in both runs. That is retrieval failing a two-hop question,
+so the case stays as written; since the fix-up it fails `all_of`, `forbid` (the refusal is exactly the hedge the case
+forbids) and `not_found`.
+
+The new cross-document case passed with a careful answer: "Numerically, yes: Larkspur's Q3 2026 platform availability
+was 99.62%, above BrightPath's 99.5% monthly uptime commitment; however, a quarterly figure does not establish whether
+Larkspur met that threshold in each month." The caveat is right (the question compares a quarterly figure with a
+monthly commitment) and the labels read it as intended: "met" in "does not establish whether Larkspur met" did not
+count (negated by 'not' + 'whether'). One accepted phrase, "reached", did count inside "... whether Larkspur reached
+99.5% in every month cannot be determined" (doubt after a phrase is not read; now a `limitation:` row); "yes" and
+"above" carry the verdict either way.
 
 **Offline re-score of the 2026-10-21 main run** (`20261021T163824Z`, main at `71be0fa`; that report is not in git):
 `evals/rescore.py` gives 42/43 as stored, **43/43** with the new matcher. Exactly one verdict changes:
 `f-contractors-parental`, any_of fail -> pass ("'are excluded' matched 'are explicitly excluded'"). The previous matcher
 on the same answers and labels gives 42/43, and no other check changes in any of its 43 runs, in the 30 runs of its
 eval-demo report (`20261021T164121Z`), or in any committed report since 2026-10-13 (their only flips come from the
-2026-10-18 `grounded` labels, on answers the server had already flagged as ungrounded).
+2026-10-18 `grounded` labels, on answers the server had already flagged as ungrounded). The fix-up's scorer and labels
+(the bound rule, hedges, the stipend labels) change no verdict in any of those 14 reports compared with the first
+version of the matcher; the only difference is the stipend case's failed checks in `20261021T175310Z` (`any_of` became
+`all_of` and `forbid`; still a fail).
 
 ## Results: final run (2026-10-14, demo corpus of 6 documents)
 
@@ -246,12 +298,15 @@ TTFT in these tables is over the 34 model-generated answers of each 43-case run,
   wrong subject. `--judge` reports where an LLM judge disagrees; a claim-level faithfulness judge (`evals/judge.py`
   with a report path) runs offline.
 - The hard set is 13 cases written by the same person as the labels, over the same synthetic corpus: harder, not
-  independent.
-- Every confidence bucket is 100% accurate here, so the badge's calibration is untested on harder questions.
+  independent. It is harder to answer than to retrieve (hybrid ranks 9 of its 11 gold passages first); its one
+  retrieval-hard case is the two-hop stipend question.
+- Every confidence bucket is 100% accurate on the 43; on the hard set low is 2/3 (the stipend refusal is a wrong
+  "low"). Thirteen cases are too few to say much about the badge's calibration on harder questions.
 - The grounding check matches digits, not meaning. A shown date after its cue is excused whatever the sentence says
   about it ("took effect today, 2026-10-13" passes even when the change took effect earlier), and a shown date in
   a form the checker doesn't parse (no year: "October 13"; "2026/10/02"; "Jan. 15, 2026"; "10/13/2026") is checked as
   plain numbers, so a correct answer can be flagged. No stored answer was affected by either; both are pinned by tests
   in `tests/chat/test_grounding_dates.py`.
 - `git_sha` / `git_dirty` in a report describe the eval client's checkout, not the code the API container runs:
-  rebuild (`make demo`) after merging before quoting a report as that commit's numbers.
+  rebuild (`make demo`) after merging before quoting a report as that commit's numbers. Since 2026-10-21
+  `--server-ref` records what the person running the eval says the API runs; the API itself cannot confirm it.
