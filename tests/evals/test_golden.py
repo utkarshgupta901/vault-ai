@@ -161,6 +161,84 @@ def test_hard_traps_are_not_in_the_corpus_but_look_close(gold: golden.Golden, co
         assert _flat(near_miss) in _flat(everything), cid
 
 
+# Cross-document hard cases: each input is stated in exactly one of the two scoped documents, so neither document
+# answers the question alone (the board update restates CoreLink's 99.9% as its own target, so that comparison could
+# be answered from one sentence; BrightPath's 99.5% appears only in its proposal).
+CROSS_DOC = {
+    "h-availability-vs-brightpath": {BOARD: "99.62%", BRIGHTPATH: "99.5%"},
+    "h-subscription-gap": {BRIGHTPATH: "$60,000 per year", CORELINK: "$95,000 per year"},
+}
+
+
+def test_hard_cross_document_cases_need_both_documents(gold: golden.Golden, corpus_text: dict[str, str]) -> None:
+    by_id = {c.id: c for c in gold.cases}
+    for cid, facts in CROSS_DOC.items():
+        assert sorted(by_id[cid].scope_files) == sorted(facts), cid
+        for name, fact in facts.items():
+            other = next(f for f in facts if f != name)
+            assert fact in _flat(corpus_text[name]) and fact not in _flat(corpus_text[other]), (cid, fact)
+
+
+def _score(case: golden.Case, content: str) -> dict:
+    """A cited, grounded answer with this text, so only the content checks can fail."""
+    files = case.expect["must_cite"]
+    files = [files] if isinstance(files, str) else files
+    answer = {"content": content, "answer_type": "answered",
+              "citations": [{"ref": f"S{i}", "filename": f} for i, f in enumerate(files, start=1)],
+              "signals": {"valid_citations": len(files), "invalid_citations": 0, "ungrounded_facts": 0, "gate": False}}
+    return scoring.score_answer(case.expect, answer)
+
+
+# (case, answer, passes): how the hard set's labels read real-looking answers. A "no" must be about the stipend and
+# must not be a hedge; a comparison must use both documents' numbers; natural bounds and spellings must pass.
+HARD_ANSWERS = [
+    ("h-contractor-stipend", "No. Section 1.2 says that unless a section says otherwise, the benefits in this handbook "
+     "apply only to employees, and the remote work stipend section does not extend it to contractors. [S1]", True),
+    ("h-contractor-stipend", "No, contractors are not eligible for the remote work stipend; it is an employee "
+     "benefit. [S1]", True),
+    ("h-contractor-stipend", "No. Contractors don't receive the remote work stipend: section 1.2 limits the "
+     "handbook's benefits to employees. [S1]", True),
+    ("h-contractor-stipend", "The handbook does not say whether contractors get the stipend; it only says contractors "
+     "are not eligible for parental leave. [S1]", False),                     # a hedge, and another benefit's "no"
+    ("h-contractor-stipend", "Information on contractor eligibility for the stipend is not available in the "
+     "handbook. [S1]", False),                                               # a hedge
+    ("h-contractor-stipend", "Contractors may not be eligible; the handbook is unclear. [S1]", False),
+    ("h-contractor-stipend", "Yes. The remote work stipend is available not only to employees but also to "
+     "contractors, at $500 per year. [S1]", False),                          # the opposite answer
+    # limitation, kept visible: a hedge worded as an accepted "no" plus a filler passes; the judge is for this
+    ("h-contractor-stipend", "The stipend section does not explicitly apply to contractors. [S1]", True),
+    ("h-availability-vs-brightpath", "Yes. Larkspur's Q3 2026 platform availability was 99.62% [S1], above the 99.5% "
+     "monthly uptime BrightPath commits to [S2].", True),
+    ("h-availability-vs-brightpath", "Yes: 99.62% exceeds BrightPath's 99.5% commitment, although it was below "
+     "Larkspur's internal 99.9% target. [S1][S2]", True),
+    ("h-availability-vs-brightpath", "No. Platform availability was 99.62%, below the internal target of 99.9%. "
+     "[S1]", False),                                                         # one document, the wrong comparison
+    ("h-availability-vs-brightpath", "No. Larkspur's 99.62% did not exceed BrightPath's 99.5% guarantee. [S1][S2]",
+     False),
+    ("h-availability-vs-brightpath", "Availability was 99.62% and BrightPath commits to 99.5%; whether that is "
+     "enough is unclear. [S1][S2]", False),
+    ("h-stolen-laptop", "Report it to security@larkspur.example immediately, and in no case later than 24 hours. [S1]",
+     True),
+    ("h-stolen-laptop", "Report it without delay (within 24 hours). [S1]", True),
+    ("h-stolen-laptop", "Report it to security within 24h. [S1]", True),
+    ("h-work-abroad", "You can work from abroad, but you can't go over 30 days in any 12-month period. [S1]", True),
+    ("h-work-abroad", "You can't stay beyond 30 days. [S1]", True),
+    ("h-work-abroad", "You may not stay over 30 days. [S1]", True),
+    ("h-unused-pto-cash", "No. Unused PTO isn't paid out; it is lost on December 31. [S1]", True),
+    ("h-pto-plus-sick-total", "Twenty-six days in total: 18 PTO days plus 8 sick days. [S1]", True),
+    ("h-revenue-yoy", "Revenue grew by $1.10M year over year. [S1]", True),
+    ("h-subscription-gap", "CoreLink would cost 35 000 USD more per year. [S1][S2]", True),
+]
+
+
+@pytest.mark.parametrize(("case_id", "content", "passes"), HARD_ANSWERS,
+                         ids=[f"{c}-{i}" for i, (c, _, _) in enumerate(HARD_ANSWERS)])
+def test_hard_labels_read_answers_as_intended(gold: golden.Golden, case_id: str, content: str, passes: bool) -> None:
+    case = next(c for c in gold.cases if c.id == case_id)
+    result = _score(case, content)
+    assert result["passed"] is passes, (result["failed"], result["evidence"])
+
+
 def test_answer_labels_never_contradict_the_corpus(gold: golden.Golden, corpus_text: dict[str, str]) -> None:
     """Single-document factoids: at least one accepted answer phrase is literally in the cited document (multi-turn and
     multi-document cases may need arithmetic, e.g. 18 + 2 = 20, so they are exempt, as are the hard set's computed

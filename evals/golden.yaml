@@ -487,11 +487,14 @@ cases:
   # =====================================================================================================================
   # The hard set (13, tag `hard`): reported on its own line, never in the headline above, so that number stays
   # comparable with every earlier report. Written against the synthetic corpus only; every gold_chunk is verbatim in
-  # the generated text, the computed answers and the traps are checked by tests/evals/test_golden.py.
-  #   paraphrase (3): few of the documents' words in the question
+  # the generated text, the computed answers, the cross-document inputs and the traps are checked by
+  # tests/evals/test_golden.py, and HARD_ANSWERS there shows how the labels read right, wrong and hedged answers.
+  # Hard to answer more than hard to retrieve: on 2026-10-21 hybrid search ranked 9 of 11 gold passages first.
+  #   paraphrase (3): the question avoids the passage's key terms ("vacation", "stolen", "overseas"); keyword search
+  #                   still ranked all three first, so they test the answer, not retrieval
   #   "no" answers (3): the correct answer is a negation, so the negation-aware matcher matters
   #   computed (3): a total or a difference of stated numbers, never stated itself
-  #   cross-document (1, + 1 computed): the answer needs two documents
+  #   cross-document (1, + 1 computed): each input is stated in only one of the two documents
   #   traps (2): in-domain, look answerable, are not in the documents (a near miss is)
   #   pronoun follow-up (1): "it" must resolve to the vendor of the first turn, not the other one
   # =====================================================================================================================
@@ -510,7 +513,7 @@ cases:
     tags: [factoid, hard]
     scope: all
     expect:
-      any_of: ["24 hours", "twenty-four hours", "24-hour"]
+      any_of: ["24 hours", "twenty-four hours", "24-hour", "24h"]
       must_cite: Larkspur_Employee_Handbook_2026.pdf
       gold_chunk: ["immediately, and in any case within 24 hours"]
       grounded: true
@@ -530,21 +533,30 @@ cases:
     tags: [factoid, hard]
     scope: all
     expect:
-      any_of: ["forfeited", "forfeit", "not paid", "aren't paid", "won't be paid", "no payout", "not cashed out"]
+      any_of: ["forfeited", "forfeit", "not paid", "aren't paid", "isn't paid", "won't be paid", "no payout",
+               "not cashed out"]
       must_cite: Larkspur_Employee_Handbook_2026.pdf
       gold_chunk: ["forfeited on December 31 and are not paid out"]
       grounded: true
 
   # No section says contractors get the stipend, and section 1.2 says the handbook's benefits apply only to employees
-  # unless a section says otherwise: the answer is "no", from two sections, and a hedge is a miss.
+  # unless a section says otherwise: the answer is "no", from two sections, and a hedge is a miss. So the "no" has to
+  # come with the stipend (a "not eligible" about parental leave is another benefit's), and the hedges this question
+  # draws ("does not state whether contractors are eligible") are forbidden outright.
   - id: h-contractor-stipend
     question: "Do contractors receive the remote work stipend?"
     tags: [factoid, hard]
     scope: all
     expect:
-      any_of: ["only to employees", "only employees", "employees only", "only for employees", "not eligible",
-               "aren't eligible", "ineligible", "not entitled", "do not receive", "don't receive", "does not apply",
-               "doesn't apply", "do not qualify", "don't qualify", "not available"]
+      all_of:
+        - ["stipend"]
+        - ["only to employees", "only employees", "employees only", "only for employees", "not eligible",
+           "aren't eligible", "ineligible", "not entitled", "do not receive", "don't receive", "does not receive",
+           "doesn't receive", "do not get", "don't get", "does not apply", "doesn't apply", "do not qualify",
+           "don't qualify"]
+      forbid: ["not say whether", "not state whether", "not specify whether", "doesn't say whether",
+               "doesn't state whether", "doesn't specify whether", "don't say whether", "don't state whether",
+               "don't specify whether", "unclear", "not clear"]
       must_cite: Larkspur_Employee_Handbook_2026.pdf
       gold_chunk: ["the benefits in this handbook apply only to employees"]
       grounded: true
@@ -567,7 +579,7 @@ cases:
     tags: [factoid, hard]
     scope: all
     expect:
-      any_of: ["26"]
+      any_of: ["26", "twenty-six"]
       must_cite: Larkspur_Employee_Handbook_2026.pdf
       gold_chunk: ["8 paid sick days per year", "18 days of paid time off"]
       grounded: true
@@ -577,7 +589,7 @@ cases:
     tags: [factoid, table, hard]
     scope: all
     expect:
-      any_of: ["1.1m", "1.1 m", "1.1 million", "1100000"]
+      any_of: ["1.1m", "1.1 m", "1.1 million", "1100000", "1.10m", "1.10 million"]
       must_cite: Q3_2026_Board_Update.pdf
       gold_chunk: ["$3.1M"]
       grounded: true
@@ -587,23 +599,27 @@ cases:
     tags: [multi_doc, hard]
     scope: [Proposal_BrightPath.pdf, Proposal_CoreLink.pdf]
     expect:
-      any_of: ["35000", "35k", "35 thousand"]
+      any_of: ["35000", "35k", "35 thousand", "35 000"]
       must_cite: [Proposal_BrightPath.pdf, Proposal_CoreLink.pdf]
       gold_chunk: ["$60,000 per year", "$95,000 per year"]
       grounded: true
 
-  - id: h-availability-vs-corelink
-    question: "In Q3 2026, did Larkspur's own platform availability reach the uptime level that CoreLink guarantees?"
+  # 99.62% is only in the board update, 99.5% only in the BrightPath proposal, so neither document answers it alone.
+  # (It replaced a CoreLink comparison on 2026-10-22: the board update restates CoreLink's 99.9% as its own target,
+  # so that one could be answered from one sentence.) The board update's "below our internal target of 99.9%" is a
+  # distractor: the answer is "yes".
+  - id: h-availability-vs-brightpath
+    question: "In Q3 2026, did Larkspur's own platform availability reach the monthly uptime that BrightPath commits to?"
     tags: [multi_doc, hard]
-    scope: [Q3_2026_Board_Update.pdf, Proposal_CoreLink.pdf]
+    scope: [Q3_2026_Board_Update.pdf, Proposal_BrightPath.pdf]
     expect:
       all_of:
         - ["99.62%", "99.62 %", "99.62 percent"]
-        - ["99.9%", "99.9 %", "99.9 percent"]
-      any_of: ["below", "short of", "lower than", "less than", "not reach", "not meet", "didn't reach", "didn't meet",
-               "missed"]
-      must_cite: [Q3_2026_Board_Update.pdf, Proposal_CoreLink.pdf]
-      gold_chunk: ["Platform availability for the quarter was 99.62%", "CoreLink guarantees 99.9% monthly uptime"]
+        - ["99.5%", "99.5 %", "99.5 percent"]
+      any_of: ["yes", "above", "exceeds", "exceeded", "exceeding", "higher than", "greater than", "met", "meets",
+               "reached", "cleared"]
+      must_cite: [Q3_2026_Board_Update.pdf, Proposal_BrightPath.pdf]
+      gold_chunk: ["Platform availability for the quarter was 99.62%", "BrightPath commits to 99.5% monthly uptime"]
       grounded: true
 
   # Near misses in the corpus: Dana Whitfield is the Chief Operating Officer; the board update asks for an FY2027
