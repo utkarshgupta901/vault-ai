@@ -202,8 +202,9 @@ async def list_documents(
     if tag:
         stmt = stmt.where(Document.tags.contains([tag.lower()]))
     if q:
-        like = f"%{q}%"
-        stmt = stmt.where(or_(Document.filename.ilike(like), Document.title.ilike(like)))
+        # q is text from a search box: escape LIKE's wildcards so "%" or "_" matches itself, not every document.
+        like = "%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        stmt = stmt.where(or_(Document.filename.ilike(like, escape="\\"), Document.title.ilike(like, escape="\\")))
     after = decode_keyset(cursor, created_at=datetime.fromisoformat, id=uuid.UUID)  # tampered -> 400, not 500
     if after:
         ts, last_id = after
