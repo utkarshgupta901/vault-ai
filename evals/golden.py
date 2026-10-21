@@ -18,7 +18,7 @@ STARTERS_PATH = EVALS_DIR / "golden_starters.yaml"
 CATEGORY_TAGS = {"factoid", "multi_doc", "unanswerable_offtopic", "unanswerable_indomain", "multiturn", "injection",
                  "docx", "starter", "public_doc"}
 # ... plus optional modifiers.
-MODIFIER_TAGS = {"demo", "table"}
+MODIFIER_TAGS = {"demo", "table", "hard"}
 ALLOWED_TAGS = CATEGORY_TAGS | MODIFIER_TAGS
 UNANSWERABLE_TAGS = {"unanswerable_offtopic", "unanswerable_indomain"}
 # Which refusal layer we expect for each kind of unanswerable question (recorded, never failed on).
@@ -26,11 +26,19 @@ EXPECTED_REFUSAL_PATH = {"unanswerable_offtopic": "gate", "unanswerable_indomain
 # Cases over a real, public document the user drops into demo_docs/user/ (gitignored, never generated). Its file is
 # not in `corpus`, and the eval runner skips these cases when the file is absent instead of failing the whole run.
 PUBLIC_DOC_TAG = "public_doc"
+# The hard set: paraphrases, "no" answers, computed numbers, cross-document questions, in-domain traps and a pronoun
+# follow-up, all over the synthetic corpus. Scored and reported on their own line, so the headline over the original
+# cases stays comparable with every earlier report. Never `demo`: a demo case must pass every run, a hard case may not.
+HARD_TAG = "hard"
 
 CASE_KEYS = {"id", "question", "tags", "scope", "turns", "expect", "retrieval_query", "note"}
 REQUIRED_CASE_KEYS = {"id", "question", "tags", "scope", "expect"}
-EXPECT_KEYS = {"any_of", "all_of", "forbid", "forbid_start", "must_cite", "gold_chunk", "not_found",
-               "min_citations", "grounded"}
+# gold_chunk_all: the case needs every gold_chunk passage at once (18 PTO days + 8 sick days), not any one of them;
+# retrieval then also reports the rank by which the last one arrived (scoring.all_relevant_rank).
+# mentions: words the answer must contain, negated or not: the topic a "no" is about ("Contractors don't get the
+# stipend" is about the stipend, though "stipend" sits right after the negation and would not count as an any_of).
+EXPECT_KEYS = {"any_of", "all_of", "mentions", "forbid", "forbid_start", "must_cite", "gold_chunk", "gold_chunk_all",
+               "not_found", "min_citations", "grounded"}
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 
 
@@ -59,6 +67,10 @@ class Case:
     @property
     def is_public_doc(self) -> bool:
         return PUBLIC_DOC_TAG in self.tags
+
+    @property
+    def is_hard(self) -> bool:
+        return HARD_TAG in self.tags
 
     @property
     def scope_files(self) -> list[str]:
@@ -132,7 +144,7 @@ def _validate_expect(cid: str, tags: set[str], expect: Any, scope_files: list[st
     if not isinstance(expect, dict):
         return [f"{cid}: expect must be a mapping"]
     problems = [f"{cid}: unknown expect key {k!r}" for k in expect if k not in EXPECT_KEYS]
-    for key in ("any_of", "forbid", "forbid_start", "gold_chunk"):
+    for key in ("any_of", "mentions", "forbid", "forbid_start", "gold_chunk"):
         if key in expect and not _is_str_list(expect[key]):
             problems.append(f"{cid}: expect.{key} must be a non-empty list of strings")
     if "all_of" in expect:
@@ -140,8 +152,11 @@ def _validate_expect(cid: str, tags: set[str], expect: Any, scope_files: list[st
         if not isinstance(groups, list) or not groups or not all(
                 (isinstance(g, str) and g.strip()) or _is_str_list(g) for g in groups):
             problems.append(f"{cid}: expect.all_of must be a list of strings or lists of strings")
-    if "grounded" in expect and not isinstance(expect["grounded"], bool):      # "no" would be truthy and gate
-        problems.append(f"{cid}: expect.grounded must be true or false")
+    for key in ("grounded", "gold_chunk_all"):          # "no" would be truthy and switch the check on
+        if key in expect and not isinstance(expect[key], bool):
+            problems.append(f"{cid}: expect.{key} must be true or false")
+    if expect.get("gold_chunk_all") is True and len(expect.get("gold_chunk") or []) < 2:
+        problems.append(f"{cid}: expect.gold_chunk_all needs at least two gold_chunk phrases")
     must = expect.get("must_cite")
     must_list = [must] if isinstance(must, str) else (must or [])
     if must is not None and not _is_str_list(must_list):
@@ -154,8 +169,8 @@ def _validate_expect(cid: str, tags: set[str], expect: Any, scope_files: list[st
     if expect.get("not_found") and not (unanswerable or PUBLIC_DOC_TAG in tags):
         problems.append(f"{cid}: only unanswerable_* (or {PUBLIC_DOC_TAG}) cases may expect not_found: true")
     if expect.get("not_found"):
-        problems += [f"{cid}: a not_found case cannot have expect.{k}" for k in ("any_of", "all_of", "must_cite",
-                                                                                 "gold_chunk") if k in expect]
+        problems += [f"{cid}: a not_found case cannot have expect.{k}"
+                     for k in ("any_of", "all_of", "mentions", "must_cite", "gold_chunk") if k in expect]
     elif "starter" not in tags:
         if not (expect.get("any_of") or expect.get("all_of")):
             problems.append(f"{cid}: answerable cases need expect.any_of or expect.all_of")
@@ -183,6 +198,8 @@ def _validate_case(c: Any, corpus: list[str], *, check_files: bool) -> list[str]
     categories = [t for t in tags if t in CATEGORY_TAGS]
     if len(categories) != 1:
         problems.append(f"{cid}: needs exactly one category tag from {sorted(CATEGORY_TAGS)}, got {categories}")
+    if "demo" in tags and HARD_TAG in tags:
+        problems.append(f"{cid}: a case cannot be both demo and hard")
     scope = c["scope"]
     scope_files: list[str] | None = None
     if scope == "all":

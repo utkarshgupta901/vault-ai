@@ -11,7 +11,8 @@ import httpx
 import pytest
 
 from evals import run_eval
-from evals.report import render_markdown
+from evals.golden import Case
+from evals.report import render_markdown, render_retrieval
 from tests.evals.fake_api import ALL_ROUTES, SIGNALS, FakeVaultApi, transport
 
 DOCS = {"A.txt": "Employees get 18 days of PTO per year.", "B.txt": "Incident LRK-4471 cost $120k in total."}
@@ -41,6 +42,11 @@ cases:
     tags: [public_doc]
     scope: [Public.pdf]
     expect: {any_of: ["something"], must_cite: Public.pdf, gold_chunk: ["something"]}
+  - id: h-vacation
+    question: "How much yearly vacation do I get?"
+    tags: [factoid, hard]
+    scope: all
+    expect: {any_of: ["18 days"], must_cite: A.txt, gold_chunk: ["18 days of PTO"]}
 """
 
 
@@ -53,6 +59,8 @@ def _cited(content: str, filename: str, **extra: Any) -> dict[str, Any]:
 def answer(question: str, prior: list[str], ids: list[str]) -> dict[str, Any]:
     if "PTO" in question:
         return _cited("You get 18 days [S1].", "A.txt")
+    if "vacation" in question:                          # right, in words the any_of labels don't list
+        return _cited("Full-timers get eighteen paid days off [S1].", "A.txt")
     if "cost" in question and prior:                    # only answerable once the earlier turn gave the context
         return _cited("It cost $120k [S1].", "B.txt")
     if "LRK-4471" in question:
@@ -79,10 +87,10 @@ def setup(tmp_path: Path) -> dict[str, Path]:
     return {"docs": docs, "golden": golden_path, "out": tmp_path / "reports"}
 
 
-def run(setup: dict[str, Path], api: FakeVaultApi, *extra: str) -> tuple[int, dict[str, Any]]:
+def run(setup: dict[str, Path], api: FakeVaultApi, *extra: str, judge_fn: Any = None) -> tuple[int, dict[str, Any]]:
     argv = ["--api", "http://vault.test", "--key", "eval-key", "--golden", str(setup["golden"]), "--no-starters",
             "--docs-dir", str(setup["docs"]), "--out", str(setup["out"]), *extra]
-    code = run_eval.main(argv, transport=transport(api))
+    code = run_eval.main(argv, transport=transport(api), judge_fn=judge_fn)
     reports = sorted(setup["out"].glob("*.json")) if setup["out"].exists() else []
     return code, (json.loads(reports[-1].read_text()) if reports else {})
 
@@ -132,6 +140,135 @@ def test_full_run_scores_everything(setup: dict[str, Path], capsys: pytest.Captu
     # latency n (5) is runs, not cases (3): the report has to say so next to the first-run headline
     assert "Latency and cost count every run, demo repeats included" in printed
     assert len(list(setup["out"].glob("*.md"))) == 1
+    assert "judge" not in report and "LLM judge" not in printed          # --judge is opt-in
+
+
+def test_the_hard_set_is_reported_apart_from_the_headline(setup: dict[str, Path]) -> None:
+    """A hard case that fails (the answer is right, the labels miss its wording) must not move the headline, which
+    stays comparable with reports that had no hard set; it gets its own retrieval and answer lines."""
+    code, report = run(setup, FakeVaultApi(answer_fn=answer, search_fn=search), "--repeat", "3")
+    assert code == 0                                                     # hard cases never decide the exit code
+    answers = report["answers"]
+    assert answers["passed"] == {"ok": 3, "n": 3, "rate": 1.0}
+    assert answers["cost_usd"]["answers"] == 5 and "hard" not in answers["by_tag"]
+    hard = answers["hard"]
+    assert hard["passed"] == {"ok": 0, "n": 1, "rate": 0.0} and hard["cost_usd"]["answers"] == 1
+    assert report["retrieval"]["summary"]["hybrid"]["overall"]["n"] == 2
+    assert report["retrieval"]["hard"]["hybrid"]["overall"]["hit@1"] == {"hits": 0, "n": 1, "rate": 0.0}
+    md = render_markdown(report)
+    assert "- First-run pass rate: **3/3 (100%)**" in md
+    assert "## Hard set (1 case, tag `hard`, not in the headline above)" in md
+    assert "- First-run pass rate (hard set): **0/1 (0%)**" in md
+    assert "| hybrid | 1 | 0/1 (0%)" in md                                # the hard set's retrieval line
+    assert "| h-vacation #1 | hard | any_of |" in md                      # failures say which set they are in
+    # the spend line is the stack's whole bill for the run, unlike the cost lines (answers of one set each)
+    assert "AI spend during the whole run (eval user, /metrics/ai-usage; every call, hard set included)" in md
+    demo_only = run(setup, FakeVaultApi(answer_fn=answer, search_fn=search), "--tag", "demo")[1]
+    assert "AI spend during the whole run (eval user, /metrics/ai-usage; every call):" in render_markdown(demo_only)
+
+
+class _TwoHits:
+    """Just enough of VaultClient for search_case: the PTO passage ranks first, the sick-day passage second."""
+
+    def search(self, query: str, **_: Any) -> dict[str, Any]:
+        return {"hits": [{"content": "Employees get 18 days of PTO per year."},
+                         {"content": "Employees get 8 sick days per year."}]}
+
+
+def test_a_multi_passage_case_also_reports_when_its_last_passage_arrived() -> None:
+    """Regression: a case that needs two passages (18 PTO days + 8 sick days) counted as a hit@1 when either one ranked
+    first, so the cross-document difficulty the hard set advertises was not measured. With gold_chunk_all the record
+    also keeps the rank by which every gold passage was retrieved, and the report gives those cases their own line."""
+    both = Case(id="h-both", question="PTO plus sick days?", tags=["factoid", "hard"], scope="all",
+                expect={"any_of": ["26"], "gold_chunk": ["18 days of PTO", "8 sick days"], "gold_chunk_all": True})
+    one = Case(id="h-one", question="Sick days?", tags=["factoid", "hard"], scope="all",
+               expect={"any_of": ["8"], "gold_chunk": ["8 sick days"]})
+    records = [run_eval.search_case(_TwoHits(), case, None, "hybrid", 8) for case in (both, one)]
+    assert (records[0]["rank"], records[0]["rank_all"]) == (1, 2)
+    assert records[1]["rank"] == 2 and "rank_all" not in records[1]
+    hard = run_eval.summarize_retrieval(records, (1, 5, 8))["hybrid"]
+    assert hard["overall"]["hit@1"] == {"hits": 1, "n": 2, "rate": 0.5}          # either passage first counts here
+    assert hard["all_passages"]["hit@1"] == {"hits": 0, "n": 1, "rate": 0.0}      # ... but not here
+    assert hard["all_passages"]["mrr"] == 0.5
+    assert "all_passages" not in run_eval.summarize_retrieval(records[1:], (1, 5, 8))["hybrid"]
+    md = "\n".join(render_retrieval({"k": 8, "ks": [1, 5, 8], "summary": {}, "records": records,
+                                      "hard": run_eval.summarize_retrieval(records, (1, 5, 8))}))
+    assert "Hard set, every needed passage (cases with `gold_chunk_all`; the rank of the last one):" in md
+    assert "| hybrid | 1 | 0/1 (0%) | 1/1 (100%) | 1/1 (100%) | 0.500 |" in md
+
+
+def fake_judge(case: dict[str, Any], run: dict[str, Any]) -> dict[str, Any]:
+    """Grades like a careful reader: the vacation answer is right in other words; the LRK-4471 answer is called
+    wrong (as if it had confused two incidents) although the labels pass it; the PTO answer is right."""
+    if case["id"] == "t-cost":
+        return {"correct": False, "rationale": "names the wrong incident", "model": "fake-judge"}
+    if case["id"] == "f-pto":
+        assert case["expect"]["any_of"] == ["18 days"] and run["answer"]["content"] == "You get 18 days [S1]."
+    return {"correct": True, "rationale": "gives the key fact", "model": "fake-judge"}
+
+
+def test_judge_agreement_is_reported_and_never_gates(setup: dict[str, Path]) -> None:
+    code, report = run(setup, FakeVaultApi(answer_fn=answer, search_fn=search), "--judge", judge_fn=fake_judge)
+    assert code == 0
+    by_id = {c["id"]: c for c in report["cases"]}
+    assert by_id["t-cost"]["runs"][0]["passed"] and not by_id["h-vacation"]["runs"][0]["passed"]   # unchanged
+    judge = report["judge"]["summary"]
+    assert (judge["judged"], judge["agree"], judge["disagree"]) == (3, 1, 2)       # o-fifa refused: not judged
+    assert judge["code_pass_judge_fail"] == ["t-cost"] and judge["code_fail_judge_pass"] == ["h-vacation"]
+    assert judge["by_set"] == {"core": {"judged": 2, "agree": 1}, "hard": {"judged": 1, "agree": 0}}
+    assert judge["models"] == {"fake-judge": 3} and judge["errors"] == []
+    row = next(r for r in report["judge"]["rows"] if r["id"] == "h-vacation")
+    assert row == {"id": "h-vacation", "set": "hard", "code": False, "judge": True, "failed": ["any_of"],
+                   "rationale": "gives the key fact", "model": "fake-judge", "error": None}
+    md = render_markdown(report)
+    assert "## LLM judge agreement (--judge, never gates)" in md
+    assert "- Agree: 1/3 (33%) | original cases 1/2 | hard set 0/1" in md
+    assert "| t-cost | core | pass | fail | - | names the wrong incident |" in md
+    assert "| h-vacation | hard | fail | pass | any_of | gives the key fact |" in md
+
+
+def test_a_judge_error_is_recorded_not_fatal(setup: dict[str, Path]) -> None:
+    def flaky_judge(case: dict[str, Any], run: dict[str, Any]) -> dict[str, Any]:
+        if case["id"] == "t-cost":
+            raise TimeoutError("judge timed out")
+        return fake_judge(case, run)
+
+    code, report = run(setup, FakeVaultApi(answer_fn=answer, search_fn=search), "--judge", judge_fn=flaky_judge)
+    assert code == 0
+    judge = report["judge"]["summary"]
+    assert judge["errors"] == ["t-cost"] and judge["judged"] == 2
+    assert next(r for r in report["judge"]["rows"] if r["id"] == "t-cost")["error"] == "TimeoutError: judge timed out"
+    assert "- Judge errors (not counted): t-cost" in render_markdown(report)
+
+
+def test_judge_against_another_stack_needs_that_stacks_ledger(setup: dict[str, Path], monkeypatch: pytest.MonkeyPatch,
+                                                              capsys: pytest.CaptureFixture[str]) -> None:
+    """DATABASE_URL defaults to the default stack's database. Judging an API on another port with that default would
+    write the judge's ai_usage rows into a stack it never graded, so the run stops before any request or spend."""
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    api = FakeVaultApi(answer_fn=answer, search_fn=search)
+    code, report = run(setup, api, "--api", "http://localhost:8001", "--judge")
+    assert code == 1 and report == {} and api.calls == []
+    assert "DATABASE_URL is not set" in capsys.readouterr().err
+
+
+def test_judge_ledger_problem() -> None:
+    assert run_eval.judge_ledger_problem("http://localhost:8000", {}) is None             # the default stack's DB
+    assert run_eval.judge_ledger_problem("http://localhost:8000/", {}) is None
+    assert "DATABASE_URL is not set" in run_eval.judge_ledger_problem("http://localhost:8001", {})
+    url = "postgresql+psycopg://vault:vault@localhost:5434/vault"
+    assert run_eval.judge_ledger_problem("http://localhost:8001", {"DATABASE_URL": url}) is None
+
+
+def test_the_report_names_the_server_code_only_when_told(setup: dict[str, Path]) -> None:
+    """The API does not report its build, and git_sha is the eval client's checkout: the server's code is recorded
+    only when the person running the eval states it (--server-ref), and the report says so either way."""
+    code, report = run(setup, FakeVaultApi(answer_fn=answer, search_fn=search), "--server-ref", "review-fixes@1e534b3")
+    assert code == 0 and report["meta"]["server_ref"] == "review-fixes@1e534b3"
+    assert "- Server code: `review-fixes@1e534b3` (stated with --server-ref" in render_markdown(report)
+    code, report = run(setup, FakeVaultApi(answer_fn=answer, search_fn=search))
+    assert report["meta"]["server_ref"] is None
+    assert "- Server code: not recorded (" in render_markdown(report)
 
 
 def test_ttft_caveat_only_cites_a_retrieval_phase_that_ran(setup: dict[str, Path]) -> None:

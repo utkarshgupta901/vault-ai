@@ -10,9 +10,11 @@
 
 import os
 
-# Parallel agents each set TEST_DB_NAME / TEST_CACHE_DB so their test runs never truncate each other's data.
+# Parallel agents each set TEST_DB_NAME / TEST_CACHE_DB (and TEST_BROKER_DB: the health tests publish probe messages
+# and inspect workers on the broker) so their test runs never truncate or flush each other's data.
 TEST_DB = os.environ.get("TEST_DB_NAME", "vault_test")
 TEST_CACHE_DB = os.environ.get("TEST_CACHE_DB", "14")
+TEST_BROKER_DB = os.environ.get("TEST_BROKER_DB", "15")
 
 # The same host ports compose.yaml publishes on (empty or unset = its defaults, as with ${PG_PORT:-5433}), so
 # `export PG_PORT=...; make up; make test` tests the stack it started. A separate TEST_* name could be forgotten or
@@ -27,7 +29,7 @@ os.environ.update({
     "LLM_PROVIDER": "fake",
     "OPENAI_API_KEY": "",
     "DATABASE_URL": f"postgresql+psycopg://vault:vault@{TEST_PG}/{TEST_DB}",
-    "BROKER_URL": f"redis://{TEST_REDIS}/15",
+    "BROKER_URL": f"redis://{TEST_REDIS}/{TEST_BROKER_DB}",
     "CACHE_URL": f"redis://{TEST_REDIS}/{TEST_CACHE_DB}",
     "S3_ENDPOINT_URL": f"http://{TEST_S3}",
     "S3_BUCKET": "vault-test",

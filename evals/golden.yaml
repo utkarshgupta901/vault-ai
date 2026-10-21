@@ -1,24 +1,29 @@
 # Vault AI golden set: 40 hand-written cases over the synthetic Larkspur corpus (scripts/make_demo_docs.py), plus 3
-# cases over a real public document (NIST AI 100-1) that run only when demo_docs/user/NIST.AI.100-1.pdf is present.
+# cases over a real public document (NIST AI 100-1) that run only when demo_docs/user/NIST.AI.100-1.pdf is present,
+# plus a hard set of 13 (tag `hard`, at the end) that is reported separately from those 43.
 #
-# Labels are substrings, not exact answers, so they survive prompt and chunk-size changes. Matching (evals/scoring.py)
-# normalizes both sides (casefold, straight quotes, no markdown, "120,000" == "120000") and matches whole phrases only
-# ("18 days" does not match "118 days", "eligible" does not match "ineligible"), so variants are listed explicitly.
+# Labels are phrases, not exact answers, so they survive prompt and chunk-size changes. Matching (evals/scoring.py)
+# normalizes both sides (casefold, straight quotes, no markdown or [S1] markers, "120,000" == "120000") and matches
+# whole words only ("18 days" does not match "118 days" or "15-18 days", "eligible" does not match "ineligible"),
+# allowing up to 2 plain filler words inside a phrase ("are explicitly excluded" matches "are excluded"). In an answer a
+# negated or questioned occurrence does not count ("does not say contractors are excluded"). Variants are still
+# listed explicitly ("not eligible", "ineligible").
 #
 # Case fields
 #   id               unique slug
 #   question         the question that is scored (sent last)
 #   tags             exactly one category: factoid | multi_doc | unanswerable_offtopic | unanswerable_indomain |
-#                    multiturn | injection | docx | starter | public_doc;  optional modifiers: demo, table
-#                    `demo` cases run --repeat times and must pass every time (pass^N).
+#                    multiturn | injection | docx | starter | public_doc;  optional modifiers: demo, table, hard
+#                    `demo` cases run --repeat times and must pass every time (pass^N). `hard` cases are scored on
+#                    their own line, outside the headline; a case cannot be both.
 #   scope            "all" (an all-documents session) or a list of filenames (a session over just those)
 #   turns            earlier user questions, asked first in the same session (multi-turn cases)
 #   retrieval_query  standalone form used for /search metrics on multi-turn cases (a bare "And CoreLink's?" can't be
 #                    searched on its own)
 #   expect
-#     any_of         at least one phrase must appear in the answer
+#     any_of         at least one phrase must appear in the answer (stated, not negated)
 #     all_of         every entry must appear; an entry that is a list is satisfied by any one of its alternatives
-#     forbid         none of these phrases may appear
+#     forbid         none of these phrases may be stated (a negated mention is fine)
 #     forbid_start   the reply must not START with any of these (quoting them later is fine)
 #     must_cite      filename (or list) that must be among the citations ("gold citation")
 #     gold_chunk     phrases that identify the passage that answers it (retrieval hit@k / MRR)
@@ -477,4 +482,201 @@ cases:
       any_of: ["govern"]
       must_cite: NIST.AI.100-1.pdf
       gold_chunk: ["GOVERN is a cross-cutting function", "Governance is designed to be a cross-cutting function"]
+      grounded: true
+
+  # =====================================================================================================================
+  # The hard set (13, tag `hard`): reported on its own line, never in the headline above, so that number stays
+  # comparable with every earlier report. Written against the synthetic corpus only; every gold_chunk is verbatim in
+  # the generated text, the computed answers, the cross-document inputs and the traps are checked by
+  # tests/evals/test_golden.py, and HARD_ANSWERS there shows how the labels read right, wrong and hedged answers.
+  # Hard to answer more than hard to retrieve: on 2026-10-21 hybrid search ranked 9 of 11 gold passages first.
+  #   paraphrase (3): the question avoids the passage's key words ("vacation", "stolen", "overseas"); keyword search
+  #                   still ranked the passage 1st, 3rd and 1st, so they test the answer more than retrieval
+  #   "no" answers (3): the correct answer is a negation, so the negation-aware matcher matters
+  #   computed (3): a total or a difference of stated numbers, never stated itself
+  #   cross-document (1, + 1 computed): each input is stated in only one of the two documents
+  #   (the 3 cases that need two passages at once set gold_chunk_all: retrieval also reports when the last arrived)
+  #   traps (2): in-domain, look answerable, are not in the documents (a near miss is)
+  #   pronoun follow-up (1): "it" must resolve to the vendor of the first turn, not the other one
+  # =====================================================================================================================
+  - id: h-vacation-paraphrase
+    question: "Ignoring any seniority top-up, how much yearly vacation does a full-timer get?"
+    tags: [factoid, hard]
+    scope: all
+    expect:
+      any_of: ["18 days", "18 pto", "18 paid", "18-day", "eighteen days", "18 per year"]
+      forbid_start: ["20"]                    # 18 + the 2-day top-up the question says to ignore
+      must_cite: Larkspur_Employee_Handbook_2026.pdf
+      gold_chunk: ["18 days of paid time off"]
+      grounded: true
+
+  - id: h-stolen-laptop
+    question: "My work laptop was stolen at the airport. How soon must I report it?"
+    tags: [factoid, hard]
+    scope: all
+    expect:
+      any_of: ["24 hours", "twenty-four hours", "24-hour", "24h"]
+      must_cite: Larkspur_Employee_Handbook_2026.pdf
+      gold_chunk: ["immediately, and in any case within 24 hours"]
+      grounded: true
+
+  - id: h-work-abroad
+    question: "I'd like to work from my parents' place overseas for a while. How long is that allowed?"
+    tags: [factoid, hard]
+    scope: all
+    expect:
+      any_of: ["30 days", "thirty days", "30-day"]
+      must_cite: Larkspur_Employee_Handbook_2026.pdf
+      gold_chunk: ["for up to 30 days in any 12-month period"]
+      grounded: true
+
+  - id: h-unused-pto-cash
+    question: "Do I get cash for vacation days I haven't used by the end of the year?"
+    tags: [factoid, hard]
+    scope: all
+    expect:
+      any_of: ["forfeited", "forfeit", "not paid", "aren't paid", "isn't paid", "won't be paid", "no payout",
+               "not cashed out", "are lost", "is lost", "lost on december 31", "not get cash", "don't get cash",
+               "won't get cash"]
+      forbid_start: ["yes"]
+      must_cite: Larkspur_Employee_Handbook_2026.pdf
+      gold_chunk: ["forfeited on December 31 and are not paid out"]
+      grounded: true
+
+  # No section says contractors get the stipend, and section 1.2 says the handbook's benefits apply only to employees
+  # unless a section says otherwise: the answer is "no", from two sections, and a hedge is a miss. So the "no" has to
+  # come with the stipend (a "not eligible" about parental leave is another benefit's), and the hedges this question
+  # draws ("does not state whether contractors are eligible", "may not be eligible") are forbidden outright.
+  # "stipend" is a `mention`, not an any_of phrase: in "Contractors don't get the stipend" it sits right after the
+  # negation, which the negation guard would reject. Not bare "only employees", "not employees", "not contractors" or
+  # "not covered": with filler words they match the hedges "the stipend section only mentions employees", "does not
+  # mention contractors" and "contractor eligibility is not covered in the handbook", and the opposite answer "not only
+  # to employees but also to contractors"; the narrow forms below don't. Not forbidden: "contractors receive" and
+  # "couldn't find" (right answers say "contractors receive no stipend" and "I couldn't find any provision giving
+  # contractors the stipend; section 1.2 ..."), so the hedges they would catch are limitation rows in HARD_ANSWERS.
+  - id: h-contractor-stipend
+    question: "Do contractors receive the remote work stipend?"
+    tags: [factoid, hard]
+    scope: all
+    expect:
+      mentions: ["stipend"]
+      any_of: ["only to employees", "employees only", "only for employees", "limited to employees",
+               "only employees receive", "only employees get", "only employees are eligible", "only employees qualify",
+               "employee-only", "employees, not contractors", "not to contractors", "are not employees",
+               "aren't employees", "is not an employee", "isn't an employee", "excluded", "excludes", "not eligible",
+               "aren't eligible", "isn't eligible", "ineligible", "not entitled", "aren't entitled", "isn't entitled",
+               "aren't covered", "are not covered", "do not receive", "don't receive", "does not receive",
+               "doesn't receive", "cannot receive", "can't receive", "won't receive", "do not get", "don't get",
+               "does not get", "doesn't get", "cannot get", "can't get", "won't get", "does not apply",
+               "doesn't apply", "do not qualify", "don't qualify"]
+      forbid: ["silent on whether", "not say whether", "not state whether", "not stated whether",
+               "not specify whether", "not mention whether", "doesn't say whether", "doesn't state whether",
+               "doesn't specify whether", "doesn't mention whether", "don't say whether", "don't state whether",
+               "don't specify whether", "don't mention whether", "unclear", "not clear", "not certain", "uncertain",
+               "may not be", "might not", "may be excluded", "might be excluded", "it's possible", "it is possible"]
+      forbid_start: ["yes"]
+      must_cite: Larkspur_Employee_Handbook_2026.pdf
+      gold_chunk: ["the benefits in this handbook apply only to employees"]
+      grounded: true
+
+  - id: h-volunteer-day-carryover
+    question: "If I skip my volunteer day this year, can I take two next year?"
+    tags: [factoid, hard]
+    scope: all
+    expect:
+      any_of: ["not carry over", "doesn't carry over", "don't carry over", "won't carry over", "cannot carry over",
+               "can't carry over", "not be carried over", "cannot be carried over", "can't be carried over",
+               "not roll over", "doesn't roll over", "don't roll over", "won't roll over", "cannot roll over",
+               "can't roll over", "not be rolled over", "not carry forward", "doesn't carry forward",
+               "don't carry forward", "won't carry forward", "no carry-over", "no carryover", "expire", "expires",
+               "can't be carried", "cannot be carried"]
+      forbid_start: ["yes"]
+      must_cite: Larkspur_Employee_Handbook_2026.pdf
+      gold_chunk: ["The volunteer day does not carry over"]
+      grounded: true
+
+  - id: h-pto-plus-sick-total
+    question: "In total, how many PTO days and sick days does a new full-time employee get each year?"
+    tags: [factoid, hard]
+    scope: all
+    expect:
+      any_of: ["26", "twenty-six"]
+      forbid_start: ["28"]                    # 18 + 2 + 8: a new employee has no service increase
+      must_cite: Larkspur_Employee_Handbook_2026.pdf
+      gold_chunk: ["8 paid sick days per year", "18 days of paid time off"]
+      gold_chunk_all: true
+      grounded: true
+
+  - id: h-revenue-yoy
+    question: "How much more revenue did Larkspur make in Q3 2026 than in the same quarter of 2025?"
+    tags: [factoid, table, hard]
+    scope: all
+    expect:
+      any_of: ["1.1m", "1.1 m", "1.1 million", "1100000", "1.10m", "1.10 million"]
+      must_cite: Q3_2026_Board_Update.pdf
+      gold_chunk: ["$3.1M"]
+      grounded: true
+
+  - id: h-subscription-gap
+    question: "Leaving out the one-time fees, how much more would Larkspur pay per year with CoreLink than with BrightPath?"
+    tags: [multi_doc, hard]
+    scope: [Proposal_BrightPath.pdf, Proposal_CoreLink.pdf]
+    expect:
+      any_of: ["35000", "35k", "35 thousand", "35 000"]
+      # the gap the wrong way. With the number: without it these false-fail right answers that compare the one-time
+      # fees, which go the other way ("CoreLink's implementation is cheaper than BrightPath, but ...")
+      forbid: ["35000 more than corelink", "35000 less than brightpath", "35000 cheaper than brightpath"]
+      must_cite: [Proposal_BrightPath.pdf, Proposal_CoreLink.pdf]
+      gold_chunk: ["$60,000 per year", "$95,000 per year"]
+      gold_chunk_all: true
+      grounded: true
+
+  # 99.62% is only in the board update, 99.5% only in the BrightPath proposal, so neither document answers it alone.
+  # (It replaced a CoreLink comparison on 2026-10-21: the board update restates CoreLink's 99.9% as its own target,
+  # so that one could be answered from one sentence.) The board update's "below our internal target of 99.9%" is a
+  # distractor: the answer is "yes". It asks about the quarter's figure on purpose: before report 20261021T195633Z it
+  # asked whether Q3 reached "the monthly uptime that BrightPath commits to", and read monthly the corpus says no
+  # (August's 9-hour outage puts that month at most at (744 - 9) / 744 = 98.8%). A "No" start fails even when the
+  # answer also says "above".
+  - id: h-availability-vs-brightpath
+    question: "Was Larkspur's Q3 2026 platform availability higher than the uptime percentage BrightPath commits to?"
+    tags: [multi_doc, hard]
+    scope: [Q3_2026_Board_Update.pdf, Proposal_BrightPath.pdf]
+    expect:
+      all_of:
+        - ["99.62%", "99.62 %", "99.62 percent"]
+        - ["99.5%", "99.5 %", "99.5 percent"]
+      any_of: ["yes", "above", "exceeds", "exceeded", "exceeding", "higher than", "greater than", "met", "meets",
+               "reached", "cleared", "beats"]
+      forbid_start: ["no"]
+      must_cite: [Q3_2026_Board_Update.pdf, Proposal_BrightPath.pdf]
+      gold_chunk: ["Platform availability for the quarter was 99.62%", "BrightPath commits to 99.5% monthly uptime"]
+      gold_chunk_all: true
+      grounded: true
+
+  # Near misses in the corpus: Dana Whitfield is the Chief Operating Officer; the board update asks for an FY2027
+  # operating EXPENSE envelope ($19.5M). Neither a CEO nor a revenue target appears anywhere.
+  - id: h-ceo-trap
+    question: "Who is Larkspur's chief executive officer?"
+    tags: [unanswerable_indomain, hard]
+    scope: all
+    expect: {not_found: true}
+
+  - id: h-revenue-target-trap
+    question: "What revenue target did the board set for fiscal year 2027?"
+    tags: [unanswerable_indomain, hard]
+    scope: all
+    expect: {not_found: true}
+
+  # "it" is BrightPath (3-year term). CoreLink states no contract term, only that its pricing is locked for 24 months.
+  - id: h-pronoun-contract-term
+    turns: ["What annual subscription does the BrightPath proposal charge?"]
+    question: "And how long is the contract term it proposes?"
+    retrieval_query: "What contract term does the BrightPath proposal propose?"
+    tags: [multiturn, hard]
+    scope: [Proposal_BrightPath.pdf, Proposal_CoreLink.pdf]
+    expect:
+      any_of: ["3 years", "three years", "3-year", "three-year", "36 months", "3 year", "3-yr", "3 yr"]
+      must_cite: Proposal_BrightPath.pdf
+      gold_chunk: ["The proposed contract term is 3 years"]
       grounded: true

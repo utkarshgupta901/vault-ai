@@ -24,8 +24,10 @@ Numbers come from `evals/reports/20261014T105823Z` (see [docs/EVAL.md](docs/EVAL
 `/metrics/ai-usage` (docs/screenshots/metrics.png); decisions they drove are in
 [docs/DECISIONS.md](docs/DECISIONS.md). The demo questions pass 3/3 in `make eval-demo` (`20261014T110107Z`).
 On 2026-10-18 the spec was tightened (every answerable case now fails on an ungrounded number, and an answer
-missing its signals fails): the stored answers re-score 43/43, and a live re-run is pending (see
-[docs/EVAL.md](docs/EVAL.md)).
+missing its signals fails). Re-run on 2026-10-21 against the review-fixes code (`1e534b3`) with a stricter phrase
+matcher and a separate 13-case hard set: 43/43, demo 30/30 runs, hard set 12/13 (one two-hop question whose second
+passage retrieval missed); see
+[docs/EVAL.md](docs/EVAL.md#results-2026-10-21-new-matcher-and-hard-set-review-fixes-code).
 
 ---
 
@@ -258,7 +260,7 @@ app/
   worker/       Celery app, dispatch, tasks, attempt (all reliability rules)
 migrations/     hand-written SQL schema
 frontend/       React dashboard (Vite, TypeScript, Tailwind)
-evals/          golden set (43 cases), runner, scoring, reports
+evals/          golden set (43 cases + 13 hard), runner, scoring, judge, offline re-score, reports
 scripts/        demo corpus generator, seeding, smoke, doctor, snapshots, Render all-in-one start
 tests/          ~850 tests
 docs/           decisions, prompts, eval, deployment, design review, code review, AI usage log
