@@ -158,6 +158,8 @@ def reference_facts(expect: dict[str, Any]) -> str:
         facts.append(_alternatives(expect["any_of"]))
     lines = ["Key facts a correct answer gives (one per line; the alternatives on a line are equivalent):",
              *[f"- {f}" for f in facts]]
+    if expect.get("mentions"):
+        lines.append(f"Must be about: {_alternatives(expect['mentions'])}")
     if expect.get("gold_chunk"):
         lines += ["Passages that contain the answer:", *[f"- {p}" for p in expect["gold_chunk"]]]
     if expect.get("forbid"):

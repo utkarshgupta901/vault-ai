@@ -28,6 +28,8 @@ def test_reference_lists_every_fact_with_its_equivalent_wordings() -> None:
     assert "- 60 days / 60-day / sixty days / (60) days" in probe and "Must not begin with: approved" in probe
     forbid = judge.reference_facts({"any_of": ["16 weeks"], "forbid": ["12 weeks"]})
     assert forbid.endswith("Must not state: 12 weeks")
+    stipend = judge.reference_facts(_case("h-contractor-stipend")["expect"])
+    assert "Must be about: stipend\nPassages that contain the answer:" in stipend
 
 
 def test_reference_for_a_case_that_must_be_refused() -> None:

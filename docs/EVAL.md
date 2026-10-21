@@ -26,19 +26,32 @@ uv run python evals/rescore.py evals/reports/<UTC>.json                    # re-
 | Public document | 3 | NIST AI RMF 1.0 (real 48-page PDF with roman-numeral page labels; not in git: demo_docs/user/ is gitignored; download it as in the [README](../README.md#quick-start), or these 3 cases are skipped) |
 | **Hard set** (tag `hard`, own line in the report) | 13 | 3 paraphrases that avoid the passage's key words ("a seniority top-up", "my laptop was stolen", "my parents' place overseas"); 3 "no" answers (PTO cash-out, contractors and the stipend, volunteer-day carry-over); 3 computed numbers (18 + 8 days, $4.2M - $3.1M, $95,000 - $60,000); a cross-document comparison whose two inputs are each in one document only (Q3 availability 99.62% vs the 99.5% uptime BrightPath commits to; it asks about the quarter's figure, because read month by month the corpus says no: August's 9-hour outage); 2 in-domain traps (a CEO, a 2027 revenue target: neither exists, a COO and an FY2027 expense envelope do); a pronoun follow-up ("the contract term it proposes"). Harder to answer than to retrieve: hybrid search ranks 9 of the 11 gold passages first, keyword search ranks the paraphrases' passages 1st, 3rd and 1st, and the 3 cases that need two passages get both into the top 8 |
 
-Each case has expected phrases (any-of / all-of), forbidden phrases, the document that must be cited, and gold-chunk
-phrases for retrieval metrics. Cases tagged `demo` are exactly the questions used in the live demo. A test checks that
-every gold-chunk phrase occurs verbatim in the generated corpus text (and in the NIST PDF when it is present), that the
-hard set's computed answers follow from numbers in the documents, that each cross-document input is in exactly one of
-its two documents, and that its traps' subjects are absent while their near misses exist (`tests/evals/test_golden.py`).
-`HARD_ANSWERS` there shows how the hard labels read 54 right, wrong and hedged answers: for the stipend question a "no"
-must come with the stipend and must not be a hedge ("does not say whether contractors get the stipend; contractors are
-not eligible for parental leave" and "contractors may not be eligible" fail; "contractors are excluded from the
-stipend", "aren't entitled", "isn't eligible", "won't get" pass); a comparison needs both documents' numbers and must go
-the right way ("BrightPath would cost $35,000 more than CoreLink" fails, so does an availability answer that starts
-"No"); a total that adds the seniority top-up fails when it leads the answer ("20 days: 18 + 2", "28 days in total").
-Five rows are marked `limitation`: the labels read them wrongly (the same wrong totals later in the answer, a "no"
-about another benefit, "does not have to be reported within 24 hours"), and they stay visible for the judge.
+Each case has expected phrases (any-of / all-of), forbidden phrases (anywhere / at the start), the document that must
+be cited, and gold-chunk phrases for retrieval metrics; a case can also name words its answer must mention, negated or
+not (`mentions`: the stipend question's topic, since in "Contractors don't get the stipend" the word "stipend" sits
+right after a negation and would not count as an any-of phrase). Cases tagged `demo` are exactly the questions used in
+the live demo. A test checks that every gold-chunk phrase occurs verbatim in the generated corpus text (and in the
+NIST PDF when it is present), that the hard set's computed answers follow from numbers in the documents, that each
+cross-document input is in exactly one of its two documents, and that its traps' subjects are absent while their near
+misses exist (`tests/evals/test_golden.py`).
+`HARD_ANSWERS` there shows how the hard labels read 95 right, wrong and hedged answers: for the stipend question a "no"
+must mention the stipend, must not be a hedge and must not start "Yes" ("does not say whether contractors get the
+stipend; contractors are not eligible for parental leave", "contractors may not be eligible", "they may be excluded"
+fail; the short "no"s pass: "Contractors don't get the stipend", "do not receive", "can't receive", "Only employees
+receive / are eligible for the remote work stipend", "for employees, not contractors", "aren't covered", "an
+employee-only benefit", "not available to contractors"); a comparison needs both documents' numbers and must go the
+right way ("BrightPath would cost $35,000 more than CoreLink" fails, so does an availability answer that starts "No",
+while "CoreLink's implementation is cheaper than BrightPath, but its subscription is $35,000 higher" passes); a total
+that adds the seniority top-up fails when it leads the answer ("20 days: 18 + 2", "28 days in total"); "Yes" fails the
+three "no" questions. Thirteen rows are marked `limitation`: the labels read them wrongly, and they stay visible for
+the judge: the same wrong totals later in the answer, a "no" about another benefit, "does not have to be reported
+within 24 hours", a backwards subscription gap without "than" ("CoreLink is $35,000 cheaper per year", "Larkspur would
+save $35,000 a year by choosing CoreLink"), the stipend hedges "Nothing in the handbook says contractors are
+excluded", "I couldn't find anything stating that ...", "Nobody is excluded ...; contractors receive it too" and "does
+not refer to contractors", and one right answer that fails: "The stipend section doesn't mention contractors and
+section 1.2 says the handbook's benefits apply only to employees" ("doesn't mention" negates the rest of its clause,
+across the "and"). "couldn't find" and "contractors receive" are not forbidden because right answers use them ("I
+couldn't find any provision giving contractors the stipend; section 1.2 ...", "contractors receive no stipend").
 
 The hard set is never in the headline: the first-run pass rate, refusals and latency above it are over the original 43
 cases, so they stay comparable with every earlier report. A case cannot be both `demo` and `hard`.
@@ -47,7 +60,8 @@ cases, so they stay comparable with every earlier report. A case cannot be both 
 
 On 2026-10-21 a run on main failed `f-contractors-parental` on a correct answer, "Contractors are explicitly excluded
 from parental leave", because "explicitly" broke the substring "are excluded"; and a substring also passes "the
-handbook does not say contractors are excluded". The matcher, the same for any-of, all-of, forbid and gold chunks:
+handbook does not say contractors are excluded". The matcher, the same for any-of, all-of, mentions, forbid and gold
+chunks:
 
 - **Normalized** both sides: casefold, NFKC, straight quotes and dashes, zero-width characters dropped, markdown
   emphasis and `[S1]` / `[s1-3]` citation markers removed, thousands separators dropped ("$120,000" == "120000").
@@ -56,26 +70,30 @@ handbook does not say contractors are excluded". The matcher, the same for any-o
 - **Filler words.** Up to 2 plain words may sit inside a phrase (`MAX_FILLERS`): "are explicitly excluded" matches
   "are excluded", "18 PTO days" matches "18 days". Never a number ("20 to 25 days" is not "20 days"), a negation or
   punctuation the phrase doesn't have.
-- **Negated, hedged or asked is not said** (answers only). An occurrence doesn't count when, in the same clause:
-  a negation (not, no, never, n't, neither, nor, without, cannot, nothing, nowhere, and the word pairs "rather than",
-  "instead of", "fails to") is within 3 tokens before it (`NEGATION_WINDOW`: "employees with no prior service get 18
-  days" still counts, its "no" is 4 tokens back; "20 days instead of 18 days" does not say "18 days"); "not say /
-  state / mention / true / the case / sure / known / think / appear / evidence ..." comes earlier (the verb right
-  after the negation: "there is no evidence that ...", "it doesn't appear that ..."); "whether" or "if" follows a
-  negation or unclear / unsure / uncertain / unknown / silent ("I can't tell whether contractors are excluded", "the
-  documents are silent on whether ..."; a plain "if" is a condition and changes nothing); or the clause ends with "?".
-  A phrase's own negation is part of it ("not eligible"); "No, contractors are not eligible" counts (the comma ends
-  the clause). Idioms that start with a negation negate nothing: "without delay", "no doubt", "not to mention". A
-  bound word BETWEEN the negation and the phrase makes a bound, not a negation: "will not exceed $2,000,000", "no later
-  than October 1", "can't go over 30 days". Not "within": "not within 24 hours" denies the 24 hours (the first fix-up
-  had it as a bound, which counted that answer as saying "24 hours"). A phrase that itself starts with a bound word is
-  negated: "not below 99.9%" does not say "below", "not only to employees" does not say "only to employees". `forbid`
-  means "must not state": a negated mention is fine. Gold chunks skip this guard: a chunk is the document's own text.
+- **Negated, hedged or asked is not said** (answers only). An occurrence doesn't count when, in the same clause: a
+  negation (not, no, never, n't, neither, nor, without, cannot, nothing, nowhere, and the word pairs "rather than",
+  "instead of", and "fail(s/ed) to" right before a reporting verb: "fails to mention that ...", while "days you fail
+  to use are forfeited" and "if you fail to report within 24 hours" state what follows) is within 3 tokens before it
+  (`NEGATION_WINDOW`: "employees with no prior service get 18 days" still counts, its "no" is 4 tokens back; "20 days
+  instead of 18 days" does not say "18 days"); "not say / state / mention / true / the case / sure / known / think /
+  appear / evidence ..." comes earlier (the verb right after the negation: "there is no evidence that ...", "it
+  doesn't appear that ..."); "whether" or "if" follows a negation or unclear / unsure / uncertain / unknown / silent
+  ("I can't tell whether contractors are excluded", "the documents are silent on whether ..."; a plain "if" is a
+  condition and changes nothing); or the clause ends with "?". A phrase's own negation is part of it ("not eligible");
+  "No, contractors are not eligible" counts (the comma ends the clause). Idioms that start with a negation negate
+  nothing: "without delay", "without fail", "without exception", "no doubt", "not to mention" (whole idioms only: "not
+  to take 18 days" is a negation). A bound word BETWEEN the negation and the phrase makes a bound, not a negation:
+  "will not exceed $2,000,000", "no later than October 1", "can't go over 30 days", "don't wait past 24 hours". Not
+  "within": "not within 24 hours" denies the 24 hours (the first fix-up had it as a bound, which counted that answer
+  as saying "24 hours"). A phrase that itself starts with a bound word is negated: "not below 99.9%" does not say
+  "below", "not only to employees" does not say "only to employees". `forbid` means "must not state": a negated
+  mention is fine. Gold chunks and `mentions` skip this guard: a chunk is the document's own text, and a mention names
+  the topic, which a "no" negates by design.
 - **Line breaks.** In an answer a line break ends a clause like a full stop: "**No**" on one line does not negate
   "Contractors don't receive it" on the next, and a question on a later line ("Anything else I can help with?") does
   not turn the answer above it into a question. In a retrieved chunk it stays a space: PDF lines break mid-sentence.
 - **`forbid_start`** compares whole words after leading markdown, quotes and bullets: a forbidden "no" is not the
-  start of "Notably", a forbidden "20" not the start of "2026".
+  start of "Notably", a forbidden "20" not the start of "2026", and "20 days" needs both words ("20 weeks" passes).
 - **Evidence.** Every phrase check records what matched ("'are excluded' matched 'are explicitly excluded'") or why an
   occurrence did not count ("negated by 'not' + 'say'"), in the report JSON (`evidence`); the Failures table shows the
   second kind.
@@ -102,7 +120,11 @@ punctuation 1, idioms off 6, line breaks never a break 4 / a break in chunks too
 "nowhere" dropped 2, "silent" dropped 2, "within" a bound again 3, `forbid_start` as a string prefix 1, the
 all-passages rank taken from the first passage 2, no all-passages rank 1, the rescore totals mixing the sets 3. One
 mutation changed nothing because the code was redundant (`forbid_start` reading line breaks, which never change the
-words), so that code was removed.
+words), so that code was removed. A third review found 4 more survivors: an idiom compared on its first two words
+("not to take" read as "not to mention"), a `forbid_start` prefix compared on its first word, a `forbid_start` entry
+with no words flagging every answer, and a failed call counted in the original cases instead of its own set by
+`rescore.py`. Each now fails a test, as does each rule this round added (`mentions` off, "fail to" negating before any
+verb).
 
 Still matching, not meaning. Who a phrase is about is not checked ("only interns are not eligible" contains "not
 eligible"), and these readings are kept visible as the table's 13 `limitation:` rows rather than patched one by one:
@@ -150,15 +172,15 @@ before 2026-10-21's second fix-up they read "55/56").
 - **Judge agreement** (`--judge`, opt-in, never gates): an LLM judge (`evals/judge.py`, `judge-correct.v1`, the
   `JUDGE_MODEL`) grades each model-generated answer against a reference built from the case's own labels (each all-of
   group and the any-of list is one key fact; the gold passages give meaning). Its verdict is compared with the code's
-  content checks (any-of, all-of, forbid, forbid-start, not-found; not citations or grounding, which it doesn't see),
-  and the report lists agreement per set and every disagreement with the judge's reason: "code fail, judge pass" is a
-  candidate false fail of the labels, "code pass, judge fail" a candidate false pass. It needs a model key,
-  `DATABASE_URL` pointing at the ledger of the stack being evaluated (each call writes an `ai_usage` row as the eval
-  user) and the eval user in that database. `DATABASE_URL` defaults to the default stack's database, so when `--api`
-  is any other address it must be set explicitly, or the judge's rows would land in a stack it never graded. Without
-  any of these `--judge` exits before the eval spends anything. Caveat: `JUDGE_MODEL` defaults to the answer model
-  (gpt-6.1-sol), so by default the judge grades its own model's answers; set `JUDGE_MODEL` to another model for a more
-  independent second opinion.
+  content checks (any-of, all-of, mentions, forbid, forbid-start, not-found; not citations or grounding, which it
+  doesn't see), and the report lists agreement per set and every disagreement with the judge's reason: "code fail,
+  judge pass" is a candidate false fail of the labels, "code pass, judge fail" a candidate false pass. It needs a
+  model key, `DATABASE_URL` pointing at the ledger of the stack being evaluated (each call writes an `ai_usage` row as
+  the eval user) and the eval user in that database. `DATABASE_URL` defaults to the default stack's database, so when
+  `--api` is any other address it must be set explicitly, or the judge's rows would land in a stack it never graded.
+  Without any of these `--judge` exits before the eval spends anything. Caveat: `JUDGE_MODEL` defaults to the answer
+  model (gpt-6.1-sol), so by default the judge grades its own model's answers; set `JUDGE_MODEL` to another model for
+  a more independent second opinion.
 - **Reliability**: accuracy per confidence badge. **Latency**: server TTFT over model-generated answers (gate refusals
   reply in ~10 ms without a model call and would flatter it; the report also shows TTFT over all answers), server and
   client total, each as p50 / p95 / **max** (`max` since 2026-10-18: with ~40 answers p95 skips the slowest one or
@@ -206,13 +228,16 @@ Answer model gpt-6.1-sol, prompt answer.v2.
 | Cost per answer / AI spend | $0.0042 over the 43 (incl. 9 gate refusals at $0), $0.0052 over the hard set; the whole run (all 56 cases, retrieval included) $0.28, eval-demo $0.06 ($0.0018 per answer; it ran minutes after the full run, so probably with a warm prompt cache) |
 | LLM judge agreement | **not measured yet**: `--judge` needs a model key in the eval client's environment, which these runs did not have (the first run tried and stopped before any call, as designed) |
 
-The hard-set failure is the system's, not the case's. `h-contractor-stipend` ("Do contractors receive the remote work
-stipend?") is answered by two passages: the stipend section and handbook 1.2, "Unless a section says otherwise, the
-benefits in this handbook apply only to employees". For this question 1.2 was in none of the 40 hits of any mode (a
-query in its own words finds it: keyword 1st, hybrid 3rd), so the model saw only the stipend sections and refused
-("... but do not state whether contractors are eligible") in both runs. That is retrieval failing a two-hop question,
-so the case stays as written; since the fix-up it fails `all_of`, `forbid` (the refusal is exactly the hedge the case
-forbids) and `not_found`.
+The hard-set failure: `h-contractor-stipend` ("Do contractors receive the remote work stipend?") is answered by two
+passages, the stipend section and handbook 1.2, "Unless a section says otherwise, the benefits in this handbook apply
+only to employees". For this question 1.2 was in none of the 22 / 18 / 17 hits returned (hybrid / vector / keyword,
+k = 40; a query in its own words finds it: keyword 1st, hybrid 3rd), so the model saw only the stipend sections, and the
+stored answer is a hedged refusal caused by that retrieval miss ("I couldn't find this in your documents ... but do
+not state whether contractors are eligible"), in all three full runs. It fails `any_of` (`all_of` before the third
+fix-up), `forbid` (the hedge is one the case forbids) and `not_found`. The labels were not always right either: until
+the third fix-up the short correct "no"s failed them ("No. Contractors don't get the stipend": the topic word
+"stipend" sat right after the negation, and "only employees receive" was not accepted). The labels are now pinned to
+pass the short "no" forms listed above (`HARD_ANSWERS`).
 
 The cross-document case passed in all three runs, but the first fix-up's wording was wrong. It asked whether Q3
 availability reached "the monthly uptime that BrightPath commits to", and its labels expected "yes". Read monthly, the
@@ -229,8 +254,17 @@ Q3 2026 platform availability was 99.62%, higher than BrightPath's committed 99.
 labels, `fbc305d`): over the 563 stored answers of the 16 reports (the 14 committed ones and main's two uncommitted
 2026-10-21 reports) no verdict and no check value changes; the only differences are the new checks, which pass where
 they now apply (`forbid_start` on the vacation, sick-day total and availability answers, `forbid` on the subscription
-answer). The line-break rule changes nothing stored, although 182 of the 563 answers break a line after a word
-rather than after punctuation.
+answer). The line-break rule changes nothing stored: only 7 of the 563 answers have a line that ends without clause
+punctuation once markdown and citation markers are removed (all 7 a "SLA comparison" heading in
+`m-proposals-cost-sla`). The first version of this paragraph said 182; that counted lines ending in a citation marker
+or markdown, which the matcher removes before it reads the line break.
+
+**Third fix-up, offline** (`evals/rescore.py` over the 16 committed reports, compared run by run with the scorer and
+labels before it, `07d405f`): no verdict changes, on the 43 original cases or the hard set. The only check that
+changes is the stipend case's in the three 2026-10-21 full runs: it fails `any_of` where it failed `all_of` (still a
+fail, on the same hedge). The new checks pass on every stored answer they now apply to (`forbid_start` "yes" on the
+PTO cash-out and volunteer-day answers, `mentions` on the stipend answers, the number-anchored `forbid` on the
+subscription answers).
 
 **Offline re-score of the 2026-10-21 main run** (`20261021T163824Z`, main at `71be0fa`; that report is not in git):
 `evals/rescore.py` gives 42/43 as stored, **43/43** with the new matcher. Exactly one verdict changes:
@@ -352,9 +386,10 @@ TTFT in these tables is over the 34 model-generated answers of each 43-case run,
   two-passage cases get both passages into the top 8); its one retrieval-hard case is the two-hop stipend question,
   whose second passage (handbook 1.2) is its gold chunk; the stipend section itself is not labelled, so that case is
   not an all-passages case.
-- The hard labels are still phrases. A wrong total that does not lead the answer, a "no" about another benefit, and
-  "does not have to be reported within 24 hours" pass (`HARD_ANSWERS` keeps them as `limitation` rows); the judge,
-  once measured, is the check on those.
+- The hard labels are still phrases. A wrong total that does not lead the answer, a "no" about another benefit,
+  "does not have to be reported within 24 hours", a backwards subscription gap without "than" and four stipend hedges
+  pass, and one right stipend answer fails (`HARD_ANSWERS` keeps all 13 as `limitation` rows); the judge, once
+  measured, is the check on those.
 - Every confidence bucket is 100% accurate on the 43; on the hard set low is 2/3 (the stipend refusal is a wrong
   "low"). Thirteen cases are too few to say much about the badge's calibration on harder questions.
 - The grounding check matches digits, not meaning. A shown date after its cue is excused whatever the sentence says

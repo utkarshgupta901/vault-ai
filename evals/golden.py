@@ -35,8 +35,10 @@ CASE_KEYS = {"id", "question", "tags", "scope", "turns", "expect", "retrieval_qu
 REQUIRED_CASE_KEYS = {"id", "question", "tags", "scope", "expect"}
 # gold_chunk_all: the case needs every gold_chunk passage at once (18 PTO days + 8 sick days), not any one of them;
 # retrieval then also reports the rank by which the last one arrived (scoring.all_relevant_rank).
-EXPECT_KEYS = {"any_of", "all_of", "forbid", "forbid_start", "must_cite", "gold_chunk", "gold_chunk_all", "not_found",
-               "min_citations", "grounded"}
+# mentions: words the answer must contain, negated or not: the topic a "no" is about ("Contractors don't get the
+# stipend" is about the stipend, though "stipend" sits right after the negation and would not count as an any_of).
+EXPECT_KEYS = {"any_of", "all_of", "mentions", "forbid", "forbid_start", "must_cite", "gold_chunk", "gold_chunk_all",
+               "not_found", "min_citations", "grounded"}
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 
 
@@ -142,7 +144,7 @@ def _validate_expect(cid: str, tags: set[str], expect: Any, scope_files: list[st
     if not isinstance(expect, dict):
         return [f"{cid}: expect must be a mapping"]
     problems = [f"{cid}: unknown expect key {k!r}" for k in expect if k not in EXPECT_KEYS]
-    for key in ("any_of", "forbid", "forbid_start", "gold_chunk"):
+    for key in ("any_of", "mentions", "forbid", "forbid_start", "gold_chunk"):
         if key in expect and not _is_str_list(expect[key]):
             problems.append(f"{cid}: expect.{key} must be a non-empty list of strings")
     if "all_of" in expect:
@@ -167,8 +169,8 @@ def _validate_expect(cid: str, tags: set[str], expect: Any, scope_files: list[st
     if expect.get("not_found") and not (unanswerable or PUBLIC_DOC_TAG in tags):
         problems.append(f"{cid}: only unanswerable_* (or {PUBLIC_DOC_TAG}) cases may expect not_found: true")
     if expect.get("not_found"):
-        problems += [f"{cid}: a not_found case cannot have expect.{k}" for k in ("any_of", "all_of", "must_cite",
-                                                                                 "gold_chunk") if k in expect]
+        problems += [f"{cid}: a not_found case cannot have expect.{k}"
+                     for k in ("any_of", "all_of", "mentions", "must_cite", "gold_chunk") if k in expect]
     elif "starter" not in tags:
         if not (expect.get("any_of") or expect.get("all_of")):
             problems.append(f"{cid}: answerable cases need expect.any_of or expect.all_of")

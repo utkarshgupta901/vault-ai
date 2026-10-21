@@ -2,7 +2,7 @@
 precision/recall, the reliability table and latency percentiles. Kept pure so every number in a report can be
 unit-tested and re-derived by hand.
 
-Matching rules (one matcher for any_of, all_of, forbid and gold_chunk):
+Matching rules (one matcher for any_of, all_of, mentions, forbid and gold_chunk):
   - both sides are normalized: NFKC, straight quotes/dashes, casefold, collapsed whitespace (app.core.textnorm), plus
     zero-width characters, markdown emphasis and [S1]-style citation markers removed and thousands separators
     dropped, so "**$120,000** [S1]" matches "$120000";
@@ -17,7 +17,7 @@ Matching rules (one matcher for any_of, all_of, forbid and gold_chunk):
     matches normally, a negated bound is not a negation ("will not exceed $2,000,000"), and neither is an idiom that
     starts with one ("without delay"). In an answer a line break ends a clause like a full stop does. Retrieved
     chunks skip this guard and keep line breaks as spaces: they are the documents' text (PDF lines break mid-sentence),
-    not claims.
+    not claims. So does `mentions`: it names the topic an answer must be about, negated or not.
 Golden labels still list the variants they accept ("instruction", "instructions"): this is matching, not meaning.
 """
 
@@ -47,16 +47,22 @@ NEGATORS = frozenset({"not", "no", "never", "neither", "nor", "without", "cannot
 # forfeited" deny what follows; "fails to mention that ..." negates like "does not mention that ...". The negation
 # sits on the second word, so the window and the clause rule below count from there.
 NEGATOR_PAIRS = frozenset({("rather", "than"), ("instead", "of"), ("fails", "to"), ("failed", "to"), ("fail", "to")})
-# Idioms that start with a negator and negate nothing after them: "report it without delay (within 24 hours)", "no
-# doubt contractors are excluded", "not to mention 18 days".
-NOT_NEGATIONS = (("without", "delay"), ("no", "doubt"), ("not", "to", "mention"))
+# A pair that starts with one of these negates only right before a CLAUSE_NEGATING word (within 2 words): "fails to
+# mention that contractors are excluded" denies it, while "days you fail to use are forfeited" and "if you fail to
+# report within 24 hours you breach policy" state what follows.
+REPORTING_ONLY = frozenset({"fail", "fails", "failed"})
+# Idioms that start with a negator and negate nothing after them: "report it without delay (within 24 hours)", "report
+# it without fail / without exception within 24 hours", "no doubt contractors are excluded", "not to mention 18 days".
+# Matched as whole idioms: "not to take 18 days" is still a negation.
+NOT_NEGATIONS = (("without", "delay"), ("without", "fail"), ("without", "exception"), ("no", "doubt"),
+                 ("not", "to", "mention"))
 # Between a negator and an occurrence these make a bound, not a negation: "will not exceed $2,000,000", "no later than
-# October 1", "can't go over 30 days". Only BETWEEN: a phrase that itself starts with one is negated by a negator
-# right before it ("not below 99.9%" does not say "below"). Not "within": "not within 24 hours" denies the 24 hours,
-# where "not more than 24 hours" bounds them.
+# October 1", "can't go over 30 days", "don't wait past 24 hours". Only BETWEEN: a phrase that itself starts with one
+# is negated by a negator right before it ("not below 99.9%" does not say "below"). Not "within": "not within 24
+# hours" denies the 24 hours, where "not more than 24 hours" bounds them.
 BOUND_WORDS = frozenset({"more", "less", "fewer", "greater", "later", "earlier", "longer", "shorter", "sooner",
                          "exceed", "exceeds", "exceeding", "above", "below", "over", "under", "beyond", "before",
-                         "after", "until", "only"})
+                         "after", "until", "only", "past"})
 # Right after a negator (within 2 words) these negate the rest of the clause however far it runs: "does not state
 # anywhere in section 4 that ...", "it isn't true that ...", "it is not the case that ...", "I'm not sure ...", "I
 # don't think ...", "it doesn't appear that ...", "there is no evidence that ...". "case" only as "the case": "in no
@@ -188,6 +194,8 @@ def _negator(hay: tuple[_Tok, ...], n: int) -> str | None:
     ("without delay", "no doubt") is none."""
     word = hay[n].text
     if n > 0 and not hay[n].pause and (hay[n - 1].text, word) in NEGATOR_PAIRS:
+        if hay[n - 1].text in REPORTING_ONLY and not _reporting_word(hay, n, len(hay)):
+            return None
         return f"{hay[n - 1].text} {word}"
     if not _is_negator(word):
         return None
@@ -282,12 +290,12 @@ def matches_any(text: str, options: Iterable[str], *, assertive: bool = True) ->
     return any(contains(text, o, assertive=assertive) for o in options)
 
 
-def evidence(answer: str, phrases: Iterable[str]) -> list[dict[str, str]]:
+def evidence(answer: str, phrases: Iterable[str], *, assertive: bool = True) -> list[dict[str, str]]:
     """For the report: each phrase that occurs, with the words that matched, or why no occurrence counted. Phrases
     that don't occur at all are left out (the failed check already says so)."""
     out = []
     for phrase in dict.fromkeys(phrases):
-        found = occurrences(answer, phrase)
+        found = occurrences(answer, phrase, assertive=assertive)
         if found:
             out.append(next((o for o in found if o.rejected is None), found[0]).as_dict())
     return out
@@ -308,6 +316,12 @@ def check_any_of(answer: str, options: Sequence[str] | None) -> bool | None:
 def check_all_of(answer: str, groups: Sequence[str | Sequence[str]] | None) -> bool | None:
     """Every entry must be present; an entry that is a list is satisfied by any one of its alternatives."""
     return None if not groups else all(matches_any(answer, _as_group(g)) for g in groups)
+
+
+def check_mentions(answer: str, phrases: Sequence[str] | None) -> bool | None:
+    """Every phrase occurs, negated or not: the topic a "no" must be about. "Contractors don't get the stipend" is about
+    the stipend, though as an any_of phrase "stipend" would not count (a negation sits right before it)."""
+    return None if not phrases else all(contains(answer, p, assertive=False) for p in phrases)
 
 
 def check_forbid(answer: str, forbidden: Sequence[str] | None) -> bool | None:
@@ -382,17 +396,19 @@ def refusal_path(answer: dict[str, Any]) -> str | None:
 def score_answer(expect: dict[str, Any], answer: dict[str, Any]) -> dict[str, Any]:
     """Run every applicable check on one answer (an AskResponse.answer / MessageOut dict).
 
-    Checks that decide `passed`: any_of, all_of, forbid, forbid_start, not_found, gold_citation, citations_valid,
-    plus min_citations and grounded when the case asks for them. `grounded` is always reported, but only gates the
-    pass when expect.grounded is true (number grounding is a heuristic, so it is a metric first). The last three
-    read server signals: a signal the answer doesn't carry fails its check instead of passing it vacuously.
-    `evidence` records, per phrase check, which words matched each phrase or why an occurrence didn't count."""
+    Checks that decide `passed`: any_of, all_of, mentions, forbid, forbid_start, not_found, gold_citation,
+    citations_valid, plus min_citations and grounded when the case asks for them. `grounded` is always reported, but
+    only gates the pass when expect.grounded is true (number grounding is a heuristic, so it is a metric first). The
+    last three read server signals: a signal the answer doesn't carry fails its check instead of passing it vacuously.
+    `evidence` records, per phrase check, which words matched each phrase or why an occurrence didn't count (for
+    `mentions` every occurrence counts, so it only shows what matched)."""
     content = answer.get("content") or ""
     citations = answer.get("citations") or []
     expected_not_found = bool(expect.get("not_found", False))
     checks: dict[str, bool | None] = {
         "any_of": check_any_of(content, expect.get("any_of")),
         "all_of": check_all_of(content, expect.get("all_of")),
+        "mentions": check_mentions(content, expect.get("mentions")),
         "forbid": check_forbid(content, expect.get("forbid")),
         "forbid_start": check_forbid_start(content, expect.get("forbid_start")),
         "not_found": (answer.get("answer_type") == "not_found") == expected_not_found,
@@ -406,8 +422,9 @@ def score_answer(expect: dict[str, Any], answer: dict[str, Any]) -> dict[str, An
     failed = [k for k in gating if checks[k] is False]
     phrases = {"any_of": expect.get("any_of") or [],
                "all_of": [p for g in expect.get("all_of") or [] for p in _as_group(g)],
+               "mentions": expect.get("mentions") or [],
                "forbid": expect.get("forbid") or []}
-    found = {key: evidence(content, ps) for key, ps in phrases.items() if ps}
+    found = {key: evidence(content, ps, assertive=key != "mentions") for key, ps in phrases.items() if ps}
     return {"passed": not failed, "failed": failed, "checks": checks, "evidence": found}
 
 
@@ -512,7 +529,7 @@ def reliability_table(records: Sequence[dict[str, Any]]) -> list[dict[str, Any]]
 # ----------------------------------------------------------------------------------------------------------------
 # The checks about WHAT the answer says. The judge grades that against the golden facts; it doesn't see citation ids
 # or grounding signals, so citations_valid, gold_citation, min_citations and grounded stay out of the comparison.
-CONTENT_CHECKS = ("any_of", "all_of", "forbid", "forbid_start", "not_found")
+CONTENT_CHECKS = ("any_of", "all_of", "mentions", "forbid", "forbid_start", "not_found")
 
 
 def content_verdict(checks: dict[str, bool | None]) -> bool:

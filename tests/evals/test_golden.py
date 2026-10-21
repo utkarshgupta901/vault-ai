@@ -2,6 +2,7 @@
 really occur in the committed corpus (a gold phrase that isn't in any document would silently zero a metric)."""
 
 import copy
+import re
 from collections import Counter
 from pathlib import Path
 
@@ -193,6 +194,40 @@ def _score(case: golden.Case, content: str) -> dict:
 # must not be a hedge; a comparison must use both documents' numbers and go the right way; natural bounds and
 # spellings must pass. Rows marked "limitation" pass or fail wrongly and stay visible: the judge is for those.
 HARD_ANSWERS = [
+    # The short "no"s: "stipend" right after the negation is still the topic (expect.mentions, not an any_of phrase)
+    ("h-contractor-stipend", "No. Contractors don't get the stipend. [S1]", True),
+    ("h-contractor-stipend", "No, contractors do not receive the stipend. [S1]", True),
+    ("h-contractor-stipend", "No. Contractors can't receive the stipend. [S1]", True),
+    ("h-contractor-stipend", "No. Only employees receive the remote work stipend. [S1]", True),
+    ("h-contractor-stipend", "No. Only employees are eligible for the remote work stipend. [S1]", True),
+    ("h-contractor-stipend", "No. The remote work stipend is for employees, not contractors. [S1]", True),
+    ("h-contractor-stipend", "No. Contractors aren't covered by the remote work stipend. [S1]", True),
+    ("h-contractor-stipend", "No; the stipend is an employee-only benefit. [S1]", True),
+    ("h-contractor-stipend", "No. The stipend is not available to contractors. [S1]", True),
+    ("h-contractor-stipend", "No. Contractors receive no stipend; it is for employees only. [S1]", True),
+    ("h-contractor-stipend", "Yes, contractors receive the stipend; they are excluded only from parental leave. [S1]",
+     False),                                                                 # starts "Yes"
+    ("h-contractor-stipend", "The stipend section doesn't mention contractors, so they may be excluded. [S1]", False),
+    ("h-contractor-stipend", "It's possible contractors are excluded from the stipend, but the handbook doesn't say. "
+     "[S1]", False),
+    # why the labels are "employees, not contractors", "not to contractors" and "aren't covered", not "not
+    # contractors" and "not covered"
+    ("h-contractor-stipend", "The stipend section does not mention contractors. [S1]", False),          # a hedge
+    ("h-contractor-stipend", "Contractor eligibility for the stipend is not covered in the handbook. [S1]", False),
+    ("h-contractor-stipend", "Not only employees receive the stipend; contractors do too. [S1]", False),
+    ("h-contractor-stipend", "No, contractors are not eligible for parental leave. [S1]", False),  # not the stipend
+    # limitation: a correct answer fails: "doesn't mention" negates the rest of the clause, across the "and"
+    ("h-contractor-stipend", "No. The stipend section doesn't mention contractors and section 1.2 says the handbook's "
+     "benefits apply only to employees. [S1]", False),
+    # limitation: "nothing ... says" is a hedge, but "says" is 3 words after "nothing" (the clause rule reaches 2)
+    ("h-contractor-stipend", "Nothing in the handbook says contractors are excluded from the stipend. [S1]", True),
+    # limitation: "stating" is not a reporting verb the rule knows, and "couldn't find" is not forbidden (above)
+    ("h-contractor-stipend", "I couldn't find anything stating that contractors are excluded from the stipend. [S1]",
+     True),
+    # limitation: "nobody" is not a negation, and "contractors receive" is not forbidden (above)
+    ("h-contractor-stipend", "Nobody is excluded from the stipend; contractors receive it too. [S1]", True),
+    # limitation: a hedge that fits "not to contractors" with a filler
+    ("h-contractor-stipend", "The stipend section does not refer to contractors. [S1]", True),
     ("h-contractor-stipend", "No. Section 1.2 says that unless a section says otherwise, the benefits in this handbook "
      "apply only to employees, and the remote work stipend section does not extend it to contractors. [S1]", True),
     ("h-contractor-stipend", "No, contractors are not eligible for the remote work stipend; it is an employee "
@@ -236,6 +271,8 @@ HARD_ANSWERS = [
     ("h-availability-vs-brightpath", "Numerically, yes: Larkspur's Q3 2026 platform availability was 99.62%, above "
      "BrightPath's 99.5% monthly uptime commitment; however, a quarterly figure does not establish whether Larkspur "
      "met that threshold in each month. [S1][S5]", True),                   # the 2026-10-21 live answer
+    ("h-availability-vs-brightpath", "Larkspur's Q3 availability of 99.62% beats the 99.5% BrightPath commits to. "
+     "[S1][S2]", True),
     ("h-availability-vs-brightpath", "No. Platform availability was 99.62%, below the internal target of 99.9%. "
      "[S1]", False),                                                         # one document, the wrong comparison
     ("h-availability-vs-brightpath", "No. Larkspur's 99.62% did not exceed BrightPath's 99.5% guarantee. [S1][S2]",
@@ -250,19 +287,30 @@ HARD_ANSWERS = [
     ("h-stolen-laptop", "Report it without delay (within 24 hours). [S1]", True),
     ("h-stolen-laptop", "Report it to security within 24h. [S1]", True),
     ("h-stolen-laptop", "Not within 24 hours; you have 7 days to report it. [S1]", False),
+    ("h-stolen-laptop", "Report it immediately and without exception within 24 hours. [S1]", True),
+    ("h-stolen-laptop", "Report it to security without fail within 24 hours. [S1]", True),
+    ("h-stolen-laptop", "Don't wait past 24 hours: report it immediately. [S1]", True),
+    ("h-stolen-laptop", "Immediately. If you fail to report within 24 hours you breach policy. [S1]", True),
     # limitation: the "not" is 6 tokens before "24 hours", outside NEGATION_WINDOW
     ("h-stolen-laptop", "It does not have to be reported within 24 hours; report it at your next check-in. [S1]",
      True),
     ("h-work-abroad", "You can work from abroad, but you can't go over 30 days in any 12-month period. [S1]", True),
     ("h-work-abroad", "You can't stay beyond 30 days. [S1]", True),
     ("h-work-abroad", "You may not stay over 30 days. [S1]", True),
+    ("h-work-abroad", "There's a 30-day limit in any 12-month period. [S1]", True),
     ("h-unused-pto-cash", "No. Unused PTO isn't paid out; it is lost on December 31. [S1]", True),
     ("h-unused-pto-cash", "No. They are lost on December 31. [S1]", True),
     ("h-unused-pto-cash", "No, you won't get cash for them. [S1]", True),
     ("h-unused-pto-cash", "Yes, unused days are paid out at year end rather than forfeited. [S1]", False),
+    ("h-unused-pto-cash", "Yes, unused days are paid out unless they are forfeited. [S1]", False),     # starts "Yes"
+    ("h-unused-pto-cash", "No. Days you fail to use are forfeited. [S1]", True),
     ("h-volunteer-day-carryover", "No, volunteer days don't roll over. [S1]", True),
     ("h-volunteer-day-carryover", "No, the volunteer day does not carry forward. [S1]", True),
+    ("h-volunteer-day-carryover", "No. An unused volunteer day expires at the end of the year. [S1]", True),
+    ("h-volunteer-day-carryover", "No. The volunteer day can't be carried into the next year. [S1]", True),
+    ("h-volunteer-day-carryover", "Yes, if your manager agrees; otherwise it doesn't carry over. [S1]", False),
     ("h-vacation-paraphrase", "An 18-day PTO allowance per calendar year. [S1]", True),
+    ("h-vacation-paraphrase", "Full-timers get 18 per year, before any seniority top-up. [S1]", True),
     ("h-vacation-paraphrase", "20 days: 18 days of PTO plus 2 for seniority. [S1]", False),   # ignores "ignoring"
     # limitation: the same wrong total, not at the start, passes (it contains "18 days")
     ("h-vacation-paraphrase", "A full-timer gets 20 days: 18 days of PTO plus 2 for seniority. [S1]", True),
@@ -277,6 +325,18 @@ HARD_ANSWERS = [
     ("h-subscription-gap", "BrightPath is $35,000 cheaper per year than CoreLink. [S1][S2]", True),
     ("h-subscription-gap", "BrightPath would cost $35,000 more per year than CoreLink. [S1][S2]", False),  # backwards
     ("h-subscription-gap", "CoreLink would cost $35,000 less than BrightPath. [S1][S2]", False),             # backwards
+    ("h-subscription-gap", "CoreLink is $35,000 cheaper than BrightPath per year. [S1][S2]", False),        # backwards
+    # the one-time fees go the other way: a correct answer may compare them too
+    ("h-subscription-gap", "CoreLink's implementation is cheaper than BrightPath, but its subscription is $35,000 "
+     "higher per year ($95,000 vs $60,000). [S1][S2]", True),
+    ("h-subscription-gap", "CoreLink costs $35,000 more per year ($95,000 vs $60,000). Its one-time fee is lower: "
+     "$40,000 less than BrightPath. [S1][S2]", True),
+    ("h-subscription-gap", "BrightPath charges $40,000 more than CoreLink for implementation, but CoreLink's "
+     "subscription costs $35,000 more per year. [S1][S2]", True),
+    # limitation: a backwards gap without "than" passes (the forbidden phrases need the number and the other vendor)
+    ("h-subscription-gap", "CoreLink is $35,000 cheaper per year. [S1][S2]", True),
+    ("h-subscription-gap", "BrightPath would cost $35,000 more per year. [S1][S2]", True),
+    ("h-subscription-gap", "Larkspur would save $35,000 a year by choosing CoreLink. [S1][S2]", True),
     ("h-pronoun-contract-term", "A 3-yr term. [S1]", True),
 ]
 
@@ -310,8 +370,13 @@ def test_the_availability_question_asks_for_the_comparison_the_corpus_settles(go
     Only the quarter's 99.62% clears 99.5%, so the question asks about that figure, not about a month."""
     case = next(c for c in gold.cases if c.id == "h-availability-vs-brightpath")
     assert "monthly" not in case.question and "Q3 2026" in case.question
-    assert "9-hour outage" in _flat(corpus_text[BOARD]) and round((31 * 24 - 9) / (31 * 24) * 100, 1) == 98.8
-    assert 99.62 > 99.5 and case.expect["forbid_start"] == ["no"]
+    board, brightpath = _flat(corpus_text[BOARD]), _flat(corpus_text[BRIGHTPATH])
+    quarter = float(re.search(r"availability for the quarter was (\d+\.\d+)%", board).group(1))
+    commitment = float(re.search(r"BrightPath commits to (\d+\.\d+)% monthly uptime", brightpath).group(1))
+    outage_hours = int(re.search(r"a (\d+)-hour outage", board).group(1))
+    august = (31 * 24 - outage_hours) / (31 * 24) * 100
+    assert (quarter, commitment, round(august, 1)) == (99.62, 99.5, 98.8)       # the numbers the docs quote
+    assert quarter > commitment > august and case.expect["forbid_start"] == ["no"]
 
 
 def test_answer_labels_never_contradict_the_corpus(gold: golden.Golden, corpus_text: dict[str, str]) -> None:
@@ -347,6 +412,9 @@ def _with_case(raw: dict, **changes: object) -> dict:
     ({"expect": {"not_found": True, "any_of": ["x"]}}, "only unanswerable_*"),
     ({"expect": {"any_of": ["x"], "gold_chunk": ["x"], "must_cit": "a"}}, "unknown expect key 'must_cit'"),
     ({"expect": {"any_of": "18 days", "gold_chunk": ["x"]}}, "expect.any_of must be a non-empty list"),
+    ({"expect": {"any_of": ["x"], "gold_chunk": ["x"], "mentions": "stipend"}},
+     "expect.mentions must be a non-empty list"),
+    ({"expect": {"any_of": ["x"], "gold_chunk": ["x"], "mentions": [" "]}}, "expect.mentions must be a non-empty list"),
     ({"expect": {"any_of": ["x"], "gold_chunk": ["x"], "grounded": "yes"}}, "expect.grounded must be true or false"),
     ({"expect": {"any_of": ["x"], "gold_chunk": ["x"], "gold_chunk_all": "yes"}},
      "expect.gold_chunk_all must be true or false"),

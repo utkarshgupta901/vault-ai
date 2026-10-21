@@ -174,7 +174,7 @@ def render_judge(judge: dict[str, Any] | None) -> list[str]:
     stat = {"ok": s["agree"], "n": s["judged"], "rate": s["rate"]}
     lines = ["## LLM judge agreement (--judge, never gates)", "",
              "The judge grades each model-generated answer against the case's golden facts; it is compared with the "
-             "code's content checks (any_of, all_of, forbid, forbid_start, not_found), not with citations or "
+             "code's content checks (any_of, all_of, mentions, forbid, forbid_start, not_found), not with citations or "
              "grounding, which it does not see.", "",
              f"- Agree: {frac(stat)}" + (f" | {by_set}" if by_set else ""),
              f"- Code pass, judge fail (candidate false passes): {', '.join(s['code_pass_judge_fail']) or 'none'}",

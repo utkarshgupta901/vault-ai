@@ -68,6 +68,16 @@ def test_first_runs_keep_the_hard_set_out_of_the_headline(report: dict[str, Any]
     assert set(rescore.first_runs(rescore.rescore(without_hard))) == {"core"}
 
 
+def test_a_failed_call_in_the_hard_set_counts_in_the_hard_set(report: dict[str, Any]) -> None:
+    """A run without an answer keeps its case's set: a hard case's failed call is a hard-set failure, never one of
+    the original cases (the headline would read 1/4 instead of 1/3)."""
+    unanswered = {"id": "h-timed-out", "tags": ["factoid", "hard"], "expect": report["cases"][1]["expect"],
+                  "runs": [{"passed": False, "failed": ["error"], "checks": {}, "error": "timeout", "answer": None}]}
+    rows = rescore.rescore({**report, "cases": report["cases"][:3] + [unanswered]})
+    assert rescore.first_runs(rows) == {"core": {"stored": {"ok": 1, "n": 3}, "now": {"ok": 2, "n": 3}},
+                                        "hard": {"stored": {"ok": 0, "n": 1}, "now": {"ok": 0, "n": 1}}}
+
+
 def test_main_prints_the_summary_and_writes_json(report: dict[str, Any], tmp_path: Path,
                                                  capsys: pytest.CaptureFixture[str]) -> None:
     path = tmp_path / "20261021T163824Z.json"
