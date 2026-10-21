@@ -2,6 +2,7 @@
 through the LLMProvider and the usage ledger, and that it refuses to start without a model. FakeProvider stands in
 for the model (no network); the ledger write is captured instead of hitting a database."""
 
+import contextlib
 from typing import Any
 
 import pytest
@@ -71,4 +72,34 @@ def test_the_live_judge_refuses_to_start_without_a_model_key(monkeypatch: pytest
     monkeypatch.setattr(settings, "LLM_PROVIDER", "openai")
     monkeypatch.setattr(settings, "OPENAI_API_KEY", None)
     with pytest.raises(judge.JudgeUnavailable, match="OPENAI_API_KEY is not set"):
+        judge.correctness_judge()
+
+
+def test_a_billed_but_unusable_reply_is_recorded_as_a_failed_call(fake: FakeProvider,
+                                                                   monkeypatch: pytest.MonkeyPatch) -> None:
+    """The model answered (and was billed) but the reply was unusable: the ledger still gets its row, success=false,
+    or the daily quota under-counts; the error still propagates."""
+    ledger: list[dict[str, Any]] = []
+    monkeypatch.setattr(judge, "record_usage", lambda usage, owner, **kw: ledger.append({"usage": usage, **kw}))
+    billed = Usage(model=settings.JUDGE_MODEL, input_tokens=900, output_tokens=40)
+    fake.fail_next.append(ProviderError("bad_request", "reply did not match the schema", usage=billed))
+    with pytest.raises(ProviderError):
+        judge.make_correctness_judge(owner_id="eval-owner")(_case("f-pto-days"), {"answer": {"content": "18 days"}})
+    assert ledger == [{"usage": billed, "prompt_version": judge.CORRECTNESS_VERSION, "success": False}]
+
+
+class _NoEvalUserSession:
+    """A ledger database that answers but has no 'eval' user (e.g. DATABASE_URL points at another stack)."""
+    def execute(self, *_: object) -> None:
+        return None
+
+    def scalar(self, *_: object) -> None:
+        return None
+
+
+def test_the_live_judge_refuses_to_start_without_an_eval_user(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Its ai_usage rows would get a NULL owner, so the eval user's quota would never see the judge's spend."""
+    monkeypatch.setattr(settings, "LLM_PROVIDER", "fake")
+    monkeypatch.setattr(judge, "sync_session", lambda: contextlib.nullcontext(_NoEvalUserSession()))
+    with pytest.raises(judge.JudgeUnavailable, match="no 'eval' user"):
         judge.correctness_judge()

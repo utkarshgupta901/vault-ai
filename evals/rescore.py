@@ -7,7 +7,8 @@ and why (which check changed, and for phrase checks the words that matched or th
 before anyone spends a cent on a new run. It is a re-score of old answers, not a new measurement: quote it as such.
 
 Each run is scored by run_eval.score_run against the case's current expectations (the stored ones when the case is
-no longer in the golden set). Runs without an answer (a failed call) are skipped."""
+no longer in the golden set). A run without an answer (a failed call) has nothing to re-score: it stays a failure
+and stays in the totals, so a report with one failed call reads 42/43, not 42/42."""
 
 import argparse
 import json
@@ -49,8 +50,16 @@ def explain(run: dict[str, Any], scored: dict[str, Any], labels_changed: bool) -
     return why
 
 
+def _unanswered(case_id: str, i: int, run: dict[str, Any]) -> dict[str, Any]:
+    """A run whose call failed: still a failure now (there is no answer to score), so its verdict can't change."""
+    old = _verdict(bool(run.get("passed")))
+    return {"id": case_id, "run": i, "old": old, "new": "fail", "changed": old != "fail",
+            "old_failed": run.get("failed") or [], "new_failed": ["error"], "error": run.get("error") or "no answer",
+            "why": ["no answer stored: nothing to re-score"] if old != "fail" else []}
+
+
 def rescore(report: dict[str, Any], golden: golden_mod.Golden | None = None) -> list[dict[str, Any]]:
-    """One row per stored run that has an answer: stored verdict, new verdict, and why they differ."""
+    """One row per stored run: stored verdict, new verdict, and why they differ."""
     current = {c.id: c for c in (golden or golden_mod.load(starters=None)).cases}
     rows = []
     for stored in report["cases"]:
@@ -59,11 +68,13 @@ def rescore(report: dict[str, Any], golden: golden_mod.Golden | None = None) -> 
                                                   expect=stored["expect"])
         for i, run in enumerate(stored["runs"], start=1):
             if not run.get("answer"):
+                rows.append(_unanswered(stored["id"], i, run))
                 continue
             scored = score_run(case, run["answer"])
             changed = bool(run["passed"]) != scored["passed"]
             rows.append({"id": stored["id"], "run": i, "old": _verdict(run["passed"]), "new": _verdict(scored["passed"]),
                          "changed": changed, "old_failed": run.get("failed") or [], "new_failed": scored["failed"],
+                         "error": None,
                          "why": explain(run, scored, case.expect != stored["expect"]) if changed else []})
     return rows
 

@@ -43,7 +43,14 @@ def test_only_changed_verdicts_are_listed_with_the_reason(report: dict[str, Any]
     why = changed[0]["why"]
     assert "any_of: fail -> pass ('are excluded' matched 'are explicitly excluded')" in why
     assert "labels differ from the stored ones" in why                  # the current golden adds `grounded: true`
-    assert [r["id"] for r in rows] == ["f-contractors-parental", "f-pto-typo"]   # a run with no answer is skipped
+    gone = next(r for r in rows if r["id"] == "o-gone")
+    assert (gone["old"], gone["new"], gone["changed"], gone["error"]) == ("fail", "fail", False, "timeout")
+
+
+def test_a_run_whose_call_failed_counts_as_a_failure(report: dict[str, Any]) -> None:
+    """Regression: runs without an answer were left out of the totals, so a report with one failed call read 42/42
+    instead of 42/43. There is nothing to re-score, so the run stays a failure."""
+    assert rescore.first_runs(rescore.rescore(report)) == {"stored": {"ok": 1, "n": 3}, "now": {"ok": 2, "n": 3}}
 
 
 def test_main_prints_the_summary_and_writes_json(report: dict[str, Any], tmp_path: Path,
@@ -52,7 +59,7 @@ def test_main_prints_the_summary_and_writes_json(report: dict[str, Any], tmp_pat
     path.write_text(json.dumps(report), encoding="utf-8")
     assert rescore.main([str(path), "--json", str(tmp_path / "rescored.json")]) == 0
     out = capsys.readouterr().out
-    assert "First runs: 1/2 passed as stored, 2/2 now" in out
+    assert "First runs: 1/3 passed as stored, 2/3 now" in out
     assert "| f-contractors-parental #1 | fail | pass | any_of: fail -> pass" in out
     saved = json.loads((tmp_path / "rescored.json").read_text())
-    assert saved["first_runs"] == {"stored": {"ok": 1, "n": 2}, "now": {"ok": 2, "n": 2}}
+    assert saved["first_runs"] == {"stored": {"ok": 1, "n": 3}, "now": {"ok": 2, "n": 3}}

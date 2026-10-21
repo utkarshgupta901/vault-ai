@@ -56,6 +56,7 @@ def render_meta(report: dict[str, Any]) -> list[str]:
     lines = [f"# Vault eval report ({meta['started_at']})", "",
              f"- API: `{meta['api']}` | git `{meta.get('git_sha') or 'unknown'}`{dirty} | cases: {meta['cases']}"
              f" | tags: {', '.join(meta['tags']) or 'all'} | demo repeat: {meta['repeat']}",
+             *_server_code(meta),
              f"- Server models (health): {', '.join(f'{k}={v}' for k, v in models.items()) or 'n/a'}"]
     server = (report.get("answers") or {}).get("server")
     if server:
@@ -64,8 +65,19 @@ def render_meta(report: dict[str, Any]) -> list[str]:
     if meta.get("skipped_cases"):
         lines.append(f"- Skipped (document not present): {', '.join(meta['skipped_cases'])}")
     if spend.get("delta") is not None:
-        lines.append(f"- AI spend during the run (eval user, /metrics/ai-usage): ${spend['delta']:.4f}")
+        lines.append(f"- AI spend during the whole run (eval user, /metrics/ai-usage; every call, hard set included): "
+                     f"${spend['delta']:.4f}")
     return lines + [""]
+
+
+def _server_code(meta: dict[str, Any]) -> list[str]:
+    """The API's code, as stated with --server-ref. Reports before 2026-10-22 have no such key (and no line)."""
+    if "server_ref" not in meta:
+        return []
+    if meta["server_ref"]:
+        return [f"- Server code: `{meta['server_ref']}` (stated with --server-ref; `git` above is the eval client's "
+                "checkout)"]
+    return ["- Server code: not recorded (no --server-ref; `git` above is the eval client's checkout, not the API's)"]
 
 
 def _counts(counter: dict[str, int]) -> str:
@@ -239,10 +251,11 @@ def render_failures(report: dict[str, Any]) -> list[str]:
             excerpt = " ".join(answer.split())[:140].replace("|", "/")
             why = rejected_phrases(run)
             failed = ", ".join(run["failed"]) + (f" ({'; '.join(why)})" if why else "")
-            rows.append([f"{case['id']} #{i}", failed.replace("|", "/"), excerpt])
+            case_set = "hard" if "hard" in (case.get("tags") or []) else "core"
+            rows.append([f"{case['id']} #{i}", case_set, failed.replace("|", "/"), excerpt])
     if not rows:
         return []
-    return ["## Failures", "", *_table(["case", "failed checks", "answer (start)"], rows), ""]
+    return ["## Failures", "", *_table(["case", "set", "failed checks", "answer (start)"], rows), ""]
 
 
 def render_markdown(report: dict[str, Any]) -> str:

@@ -2,7 +2,7 @@
 
     uv run python evals/run_eval.py --api http://localhost:8000 --key vault-eval-key
         [--tag demo] [--repeat 3] [--retrieval-only] [--modes hybrid,vector,keyword] [--k 40] [--out evals/reports]
-        [--judge]
+        [--judge] [--server-ref <branch@sha>]
 
 What it does, in order:
   1. Preflight: /health/ready (records server model names) and which routes exist (/openapi.json).
@@ -22,15 +22,18 @@ What it does, in order:
      README quotes), and the markdown is printed.
 
 Exit code 1 when the corpus could not be prepared, a needed endpoint is missing, --judge was asked for and the judge
-cannot run, or a demo case failed any run.
+cannot run (no key, no eval user, or DATABASE_URL left at its default while --api is another stack), or a demo case
+failed any run. The API does not report which code it runs: `git_sha` in a report is this client's checkout, and
+the server's code is recorded only when --server-ref states it.
 The eval user (vault-eval-key) is separate from the demo user so eval spend never eats the demo user's quota."""
 
 import argparse
+import os
 import subprocess
 import sys
 import time
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -47,6 +50,7 @@ from evals.corpus import DEMO_DOCS, ROOT, resolve, user_files  # noqa: E402
 from evals.golden import EXPECTED_REFUSAL_PATH, Case, Golden  # noqa: E402
 from evals.report import render_markdown, write_report  # noqa: E402
 
+DEFAULT_API = "http://localhost:8000"            # the default stack, whose database DATABASE_URL defaults to
 DEFAULT_MODES = ("hybrid", "vector", "keyword")
 FALLBACK_K = 8
 SEARCH_ROUTE = f"{API_PREFIX}/search"
@@ -74,6 +78,7 @@ class Options:
     docs_dir: Path
     ingest_timeout_s: float
     judge: JudgeFn | None = None
+    server_ref: str | None = None          # what the person running the eval says the API runs (--server-ref)
 
 
 def log(msg: str) -> None:
@@ -410,7 +415,8 @@ def evaluate(client: VaultClient, golden: Golden, opts: Options) -> dict[str, An
         "meta": {
             "started_at": started.isoformat(timespec="seconds"),
             "finished_at": datetime.now(UTC).isoformat(timespec="seconds"),
-            "api": client.api, "git_sha": git_sha(), "git_dirty": git_dirty(), "tags": opts.tags,
+            "api": client.api, "server_ref": opts.server_ref, "git_sha": git_sha(), "git_dirty": git_dirty(),
+            "tags": opts.tags,
             "case_ids": opts.case_ids,
             "repeat": opts.repeat, "modes": opts.modes, "retrieval_only": opts.retrieval_only,
             "cases": len(cases), "skipped_cases": skipped, "health": health, "corpus": doc_ids,
@@ -434,7 +440,7 @@ def demo_failures(report: dict[str, Any]) -> list[str]:
 
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Evaluate Vault against the golden set over HTTP.")
-    p.add_argument("--api", default="http://localhost:8000")
+    p.add_argument("--api", default=DEFAULT_API)
     p.add_argument("--key", default="vault-eval-key", help="API key of the eval user")
     p.add_argument("--tag", default="", help="comma-separated tags; a case runs if it has any of them")
     p.add_argument("--case", default="", help="comma-separated case ids (debugging)")
@@ -450,11 +456,24 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument("--judge", action="store_true",
                    help="also grade each answer with the LLM judge and report its agreement with the code (never "
                         "gates; needs a model key and the database the API writes its ai_usage ledger to)")
+    p.add_argument("--server-ref", default=None,
+                   help="the code the API runs, e.g. review-fixes@1e534b3, recorded in the report (the API does not "
+                        "report its build, and git_sha is this client's checkout)")
     return p.parse_args(argv)
 
 
 def _csv(value: str) -> list[str]:
     return [v.strip() for v in value.split(",") if v.strip()]
+
+
+def judge_ledger_problem(api: str, environ: Mapping[str, str]) -> str | None:
+    """Why --judge must not run as configured, or None. The judge writes its ai_usage rows through DATABASE_URL,
+    whose default is the default stack's database: judging an API on any other address with that default would
+    bill the judge to a stack it never graded (on a machine with two stacks, the other one's ledger)."""
+    if api.rstrip("/") != DEFAULT_API and not environ.get("DATABASE_URL"):
+        return (f"--api is {api}, but DATABASE_URL is not set, so the judge's ai_usage rows would go to the default "
+                f"stack's database; set DATABASE_URL to the database of the stack at {api}")
+    return None
 
 
 def live_judge() -> JudgeFn:
@@ -469,6 +488,10 @@ def main(argv: list[str] | None = None, *, transport: Any = None, judge_fn: Judg
     args = parse_args(argv)
     golden = golden_mod.load(args.golden, starters=None if args.no_starters else golden_mod.STARTERS_PATH)
     if args.judge and judge_fn is None:
+        problem = judge_ledger_problem(args.api, os.environ)
+        if problem:
+            log(f"--judge cannot run: {problem}")
+            return 1
         try:
             judge_fn = live_judge()
         except Exception as exc:        # no key, no ledger database, no eval user: say so before any spend
@@ -476,7 +499,8 @@ def main(argv: list[str] | None = None, *, transport: Any = None, judge_fn: Judg
             return 1
     opts = Options(tags=_csv(args.tag), case_ids=_csv(args.case), repeat=max(1, args.repeat),
                    retrieval_only=args.retrieval_only, modes=_csv(args.modes), k=args.k, docs_dir=args.docs_dir,
-                   ingest_timeout_s=args.ingest_timeout, judge=judge_fn if args.judge else None)
+                   ingest_timeout_s=args.ingest_timeout, judge=judge_fn if args.judge else None,
+                   server_ref=args.server_ref)
     with VaultClient(args.api, args.key, timeout=120, transport=transport) as client:
         try:
             report = evaluate(client, golden, opts)

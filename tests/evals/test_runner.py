@@ -159,7 +159,9 @@ def test_the_hard_set_is_reported_apart_from_the_headline(setup: dict[str, Path]
     assert "## Hard set (1 case, tag `hard`, not in the headline above)" in md
     assert "- First-run pass rate (hard set): **0/1 (0%)**" in md
     assert "| hybrid | 1 | 0/1 (0%)" in md                                # the hard set's retrieval line
-    assert "| h-vacation #1 | any_of |" in md
+    assert "| h-vacation #1 | hard | any_of |" in md                      # failures say which set they are in
+    # the spend line is the stack's whole bill for the run, unlike the cost lines (answers of one set each)
+    assert "AI spend during the whole run (eval user, /metrics/ai-usage; every call, hard set included)" in md
 
 
 def fake_judge(case: dict[str, Any], run: dict[str, Any]) -> dict[str, Any]:
@@ -204,6 +206,36 @@ def test_a_judge_error_is_recorded_not_fatal(setup: dict[str, Path]) -> None:
     assert judge["errors"] == ["t-cost"] and judge["judged"] == 2
     assert next(r for r in report["judge"]["rows"] if r["id"] == "t-cost")["error"] == "TimeoutError: judge timed out"
     assert "- Judge errors (not counted): t-cost" in render_markdown(report)
+
+
+def test_judge_against_another_stack_needs_that_stacks_ledger(setup: dict[str, Path], monkeypatch: pytest.MonkeyPatch,
+                                                              capsys: pytest.CaptureFixture[str]) -> None:
+    """DATABASE_URL defaults to the default stack's database. Judging an API on another port with that default would
+    write the judge's ai_usage rows into a stack it never graded, so the run stops before any request or spend."""
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    api = FakeVaultApi(answer_fn=answer, search_fn=search)
+    code, report = run(setup, api, "--api", "http://localhost:8001", "--judge")
+    assert code == 1 and report == {} and api.calls == []
+    assert "DATABASE_URL is not set" in capsys.readouterr().err
+
+
+def test_judge_ledger_problem() -> None:
+    assert run_eval.judge_ledger_problem("http://localhost:8000", {}) is None             # the default stack's DB
+    assert run_eval.judge_ledger_problem("http://localhost:8000/", {}) is None
+    assert "DATABASE_URL is not set" in run_eval.judge_ledger_problem("http://localhost:8001", {})
+    url = "postgresql+psycopg://vault:vault@localhost:5434/vault"
+    assert run_eval.judge_ledger_problem("http://localhost:8001", {"DATABASE_URL": url}) is None
+
+
+def test_the_report_names_the_server_code_only_when_told(setup: dict[str, Path]) -> None:
+    """The API does not report its build, and git_sha is the eval client's checkout: the server's code is recorded
+    only when the person running the eval states it (--server-ref), and the report says so either way."""
+    code, report = run(setup, FakeVaultApi(answer_fn=answer, search_fn=search), "--server-ref", "review-fixes@1e534b3")
+    assert code == 0 and report["meta"]["server_ref"] == "review-fixes@1e534b3"
+    assert "- Server code: `review-fixes@1e534b3` (stated with --server-ref" in render_markdown(report)
+    code, report = run(setup, FakeVaultApi(answer_fn=answer, search_fn=search))
+    assert report["meta"]["server_ref"] is None
+    assert "- Server code: not recorded (" in render_markdown(report)
 
 
 def test_ttft_caveat_only_cites_a_retrieval_phase_that_ran(setup: dict[str, Path]) -> None:

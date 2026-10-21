@@ -202,7 +202,9 @@ def make_correctness_judge(owner_id: Any) -> Grader:
 
 def correctness_judge() -> Grader:
     """The live judge, checked up front so `--judge` fails before the eval spends anything: a model key (unless
-    LLM_PROVIDER=fake) and a reachable ledger database (DATABASE_URL: point it at the stack being evaluated)."""
+    LLM_PROVIDER=fake), a reachable ledger database (DATABASE_URL: point it at the stack being evaluated) and the eval
+    user in it. Without that user every judge row would have a NULL owner, so the eval user's quota would never see
+    the judge's spend; and a database without it is most likely not the evaluated stack's."""
     if settings.LLM_PROVIDER != "fake" and not settings.OPENAI_API_KEY:
         raise JudgeUnavailable("OPENAI_API_KEY is not set (the judge needs a real model)")
     try:
@@ -210,7 +212,11 @@ def correctness_judge() -> Grader:
             s.execute(text("SELECT 1"))
     except Exception as exc:              # a judge without a ledger would spend money nobody records
         raise JudgeUnavailable(f"the ai_usage ledger database is not reachable: {type(exc).__name__}") from exc
-    return make_correctness_judge(eval_user_id())
+    owner_id = eval_user_id()
+    if owner_id is None:
+        raise JudgeUnavailable("no 'eval' user in the ledger database: is DATABASE_URL the evaluated stack's "
+                               "database, and is it seeded?")
+    return make_correctness_judge(owner_id)
 
 
 def summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
