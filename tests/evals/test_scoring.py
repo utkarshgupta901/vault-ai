@@ -1,8 +1,148 @@
 """Unit tests for evals/scoring.py: every number in an eval report comes from these pure functions."""
 
+import re
+
 import pytest
 
-from evals import scoring
+from app.core.textnorm import normalize as base_normalize
+from evals import golden, scoring
+
+_LEGACY_MARKDOWN = re.compile(r"[*_`]+")
+_LEGACY_THOUSANDS = re.compile(r"(?<=\d),(?=\d{3}(?!\d))")
+
+
+def legacy_contains(haystack: str, needle: str) -> bool:
+    """The matcher this branch replaced (evals/scoring.contains up to commit 330610e): one regex per phrase, whole
+    words, no filler words, no negation guard. Kept verbatim so every row below shows the old verdict next to the
+    new one, i.e. the table proves what changed instead of only describing the new behaviour."""
+    def norm(text: str) -> str:
+        return _LEGACY_THOUSANDS.sub("", _LEGACY_MARKDOWN.sub("", base_normalize(text)))
+
+    n = norm(needle)
+    if not n:
+        return False
+    left = r"(?<![a-z0-9])(?<![0-9][.,])" if n[0].isalnum() else ""
+    right = r"(?![a-z0-9])(?![.,][0-9])" if n[-1].isalnum() else ""
+    return re.search(left + re.escape(n) + right, norm(haystack)) is not None
+
+
+CONTRACTORS = next(c for c in golden.load(starters=None).cases if c.id == "f-contractors-parental").expect["any_of"]
+TODAY = ("No. Contractors are explicitly excluded from parental leave under clause 4.1 of the Larkspur Employee "
+         "Handbook 2026. [S1]")      # f-contractors-parental in 20261021T163824Z, verbatim: a correct answer it failed
+
+# (why, answer, accepted phrases, old verdict, new verdict). The verdict is "some phrase counts" (any_of).
+MATCH_TABLE = [
+    ("today's false negative: a filler word inside 'are ... excluded'", TODAY, CONTRACTORS, False, True),
+    ("filler: a word inside a number phrase", "New hires get 18 PTO days per calendar year. [S1]",
+     ["18 days"], False, True),
+    ("filler: the number spelled out before the digits", "You may carry over up to five (5) unused days.",
+     ["up to 5"], False, True),
+    ("filler: markdown emphasis around it", "Contractors are **explicitly** _excluded_.", ["are excluded"], False,
+     True),
+    ("a citation marker inside the phrase", "Larkspur provides 16 weeks [S1] of paid parental leave.",
+     ["16 weeks of paid parental leave"], False, True),
+    ("a lower-case range marker inside the phrase", "Contractors are [s1-3] excluded.", ["are excluded"], False,
+     True),
+    ("a zero-width space between the words", "Contractors are not\u200beligible.", ["not eligible"], False, True),
+    ("negated: 'does not say' right before", "The handbook does not say contractors are excluded.",
+     ["are excluded"], True, False),
+    ("negated and quoted", 'The handbook does not say "contractors are excluded" anywhere; it lists employee benefits.',
+     ["are excluded"], True, False),
+    ("negated by a reporting verb far before it", "The handbook does not state anywhere in section 4 that contractors "
+     "are excluded.", ["are excluded"], True, False),
+    ("negated: 'never' just before", "Contractors were never excluded from parental leave.", ["excluded"], True,
+     False),
+    ("a phrase with its own negation, negated again", "It isn't true that contractors are not eligible.",
+     ["not eligible"], True, False),
+    ("negated: 'not the case that'", "It is not the case that contractors are excluded.", ["are excluded"], True,
+     False),
+    ("quoted in a question, then answered the other way", 'You asked "are contractors not eligible?" Yes, they can '
+     "take leave after 90 days.", ["not eligible"], True, False),
+    ("a negator is never a filler", "Contractors are not excluded from parental leave.", ["are excluded"], False,
+     False),
+    ("a filler cannot make a question an answer", "Are contractors excluded? The handbook lists employee benefits.",
+     ["are excluded"], False, False),
+    ("whole numbers: '10 days' is not inside '110 days'", "Employees get 110 days.", ["10 days"], False, False),
+    ("whole numbers: '5 days' is not inside '1.5 days'", "PTO accrues at 1.5 days per month.", ["5 days"], False,
+     False),
+    ("whole numbers: '4.2' is not inside '4.25'", "Revenue was $4.25M.", ["4.2"], False, False),
+    ("whole numbers: a range is not its upper end", "Employees get 15\u201318 days of PTO.", ["18 days"], True, False),
+    ("a number is never a filler", "Employees get 20 to 25 days.", ["20 days"], False, False),
+    ("a phrase never spans punctuation it doesn't have", "Interns: not applicable. Eligible after 90 days: employees.",
+     ["not eligible"], False, False),
+    ("... but may span punctuation it does have", "The stipend rises on Oct. 1, 2026.", ["oct. 1", "oct 1"], True,
+     True),
+    ("a negation in an earlier sentence does not leak", "Interns are not eligible until day 90. Contractors are "
+     "excluded.", ["are excluded"], True, True),
+    ("'No,' answering the question does not negate what follows", "No, contractors are not eligible for parental "
+     "leave.", CONTRACTORS, True, True),
+    ("'but' ends what a reporting negation covers", "The handbook does not mention interns but contractors are "
+     "excluded.", ["are excluded"], True, True),
+    ("a bound is not a negation", "Brightline's liability will not exceed $2,000,000.", ["2000000"], True, True),
+    ("a bound is not a negation (dates)", "The new stipend applies no later than October 1, 2026.", ["october 1"],
+     True, True),
+    ("curly apostrophe and a non-breaking space", "Contractors aren\u2019t\u00a0eligible.", ["aren't eligible"], True,
+     True),
+    ("an em dash separates clauses", "Contractors\u2014not eligible.", ["not eligible"], True, True),
+    ("full-width digits", "Employees get \uff11\uff18 days.", ["18 days"], True, True),
+    ("multi-sentence: the number in a later sentence", "The handbook covers PTO. After three years, employees get "
+     "**20 days** in total. [S1]", ["20 days"], True, True),
+    ("limitation, kept visible: who the phrase is about is not checked", "Only interns are not eligible; contractors "
+     "are eligible.", ["not eligible"], True, True),
+]
+
+
+@pytest.mark.parametrize(("why", "answer", "phrases", "old", "new"), MATCH_TABLE, ids=[r[0] for r in MATCH_TABLE])
+def test_match_table_old_and_new_verdicts(why: str, answer: str, phrases: list[str], old: bool, new: bool) -> None:
+    assert any(legacy_contains(answer, p) for p in phrases) is old, "old verdict"
+    assert scoring.matches_any(answer, phrases) is new, "new verdict"
+
+
+def test_todays_false_negative_now_passes_the_whole_case() -> None:
+    case = next(c for c in golden.load(starters=None).cases if c.id == "f-contractors-parental")
+    answer = {"content": TODAY, "answer_type": "answered", "citations": [
+        {"ref": "S1", "filename": "Larkspur_Employee_Handbook_2026.pdf"}],
+        "signals": {"valid_citations": 1, "invalid_citations": 0, "ungrounded_facts": 0, "gate": False}}
+    result = scoring.score_answer(case.expect, answer)
+    assert result["passed"], result["failed"]
+    assert result["evidence"]["any_of"] == [{"phrase": "are excluded", "matched": "are explicitly excluded"}]
+
+
+def test_evidence_says_why_an_occurrence_did_not_count() -> None:
+    answer = {"content": "The handbook does not say contractors are excluded. Are they not eligible?",
+              "answer_type": "answered", "citations": [], "signals": {}}
+    evidence = scoring.score_answer({"any_of": ["are excluded", "not eligible", "ineligible"]}, answer)["evidence"]
+    assert evidence["any_of"] == [
+        {"phrase": "are excluded", "rejected": "negated by 'not' + 'say'", "text": "are excluded"},
+        {"phrase": "not eligible", "rejected": "in a question", "text": "not eligible"},
+    ]
+
+
+@pytest.mark.parametrize(("answer", "forbidden", "old", "new"), [
+    ("The handbook does not say contractors are eligible.", "contractors are eligible", False, True),
+    ("Contractors are not eligible.", "contractors are eligible", True, True),
+    ("Yes, contractors are fully eligible.", "contractors are eligible", True, False),
+])
+def test_forbid_uses_the_same_matcher(answer: str, forbidden: str, old: bool, new: bool) -> None:
+    """forbid = the answer must not ASSERT the phrase, so a negated mention is fine and a filler can't hide it."""
+    assert (not legacy_contains(answer, forbidden)) is old
+    assert scoring.check_forbid(answer, [forbidden]) is new
+
+
+def test_all_of_uses_the_same_matcher() -> None:
+    answer = "Employees get 18 calendar days and may carry up to five (5) days over."
+    groups = [["18 days"], ["up to 5", "5 unused"]]
+    assert not all(any(legacy_contains(answer, p) for p in g) for g in groups)
+    assert scoring.check_all_of(answer, groups) is True
+
+
+def test_retrieval_relevance_ignores_negation_but_keeps_word_boundaries() -> None:
+    """gold_chunk phrases are document text, not claims: a chunk that says 'does not carry over' IS the passage."""
+    chunk = "Each employee may take 1 paid volunteer day per year. The volunteer day does not carry over."
+    assert scoring.is_relevant(chunk, ["carry over"])
+    assert not scoring.contains(chunk, "carry over")                        # as an answer it would be negated
+    assert scoring.is_relevant("Brightline's liability will not exceed $2,000,000 [S2].", ["exceed $2,000,000"])
+    assert not scoring.is_relevant("PTO accrues at 11.5 days.", ["1.5 days"])
 
 
 # --- text matching ----------------------------------------------------------------------------------------------

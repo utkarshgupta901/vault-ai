@@ -2,43 +2,232 @@
 precision/recall, the reliability table and latency percentiles. Kept pure so every number in a report can be
 unit-tested and re-derived by hand.
 
-Matching rules (the same for answers and for retrieved chunks):
+Matching rules (one matcher for any_of, all_of, forbid and gold_chunk):
   - both sides are normalized: NFKC, straight quotes/dashes, casefold, collapsed whitespace (app.core.textnorm), plus
-    markdown emphasis removed and thousands separators dropped, so "**$120,000**" matches "$120000";
-  - a needle matches only as a whole phrase: "18 days" does not match "118 days" or "1.18 days", "eligible" does not
-    match "ineligible". Golden labels therefore list the variants they accept ("instruction", "instructions").
+    zero-width characters, markdown emphasis and [S1]-style citation markers removed and thousands separators
+    dropped, so "**$120,000** [S1]" matches "$120000";
+  - then split into tokens: words and numbers ("4.2m", "99.9", "2026-10-01", "aren't" are one token each), symbols
+    ("$", "%", "=") and punctuation. A phrase matches as a token sequence, so "18 days" does not match "118 days",
+    "1.5 days" or "15-18 days", and "eligible" does not match "ineligible";
+  - up to MAX_FILLERS plain words may sit between two words of a phrase ("are explicitly excluded" matches "are
+    excluded"), never a number, a negation or punctuation the phrase doesn't have;
+  - in an answer, an occurrence does not count when it is negated ("the handbook does not say contractors are
+    excluded") or sits in a question ("are they not eligible?"). A phrase with its own negation ("not eligible")
+    matches normally. Retrieved chunks skip this guard: they are the documents' text, not claims.
+Golden labels still list the variants they accept ("instruction", "instructions"): this is matching, not meaning.
 """
 
 import math
 import re
-from collections.abc import Callable, Iterable, Sequence
+from collections import Counter
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from dataclasses import dataclass
+from functools import lru_cache
+from itertools import takewhile
 from typing import Any
 
 from app.core.textnorm import normalize as base_normalize
+from app.rag.citations import CITATION_GROUP_RE
 
-_MARKDOWN = re.compile(r"[*_`]+")
+# How many extra words may sit between two words of an expected phrase. Answers add adverbs and adjectives that
+# change nothing ("are explicitly excluded", "18 PTO days", "up to five (5)"); two covers those, while a longer gap
+# usually means a different statement. The gap words must be plain words: a number ("20 to 25 days") or a negation
+# ("are not excluded") in the gap means the phrase is not what the answer says.
+MAX_FILLERS = 2
+# A negation this many tokens before an occurrence, in the same clause, flips it ("were never excluded", "does not say
+# contractors are excluded"). Small on purpose: "employees with no prior service get 18 days" must still count.
+NEGATION_WINDOW = 3
+
+NEGATORS = frozenset({"not", "no", "never", "neither", "nor", "without", "cannot"})      # plus any "...n't"
+# After a negator these make a bound, not a negation: "will not exceed $2,000,000", "no later than October 1".
+BOUND_WORDS = frozenset({"more", "less", "fewer", "greater", "later", "earlier", "longer", "shorter", "sooner",
+                         "exceed", "exceeds", "exceeding", "above", "below", "over", "under", "beyond", "before",
+                         "after", "until", "only"})
+# After a negator these negate the rest of the clause however far it runs: "does not state anywhere in section 4
+# that ...", "it isn't true that ...", "it is not the case that ...".
+CLAUSE_NEGATING = frozenset({"say", "says", "said", "state", "states", "stated", "mention", "mentions", "mentioned",
+                             "specify", "specifies", "specified", "indicate", "indicates", "indicated", "confirm",
+                             "confirms", "confirmed", "true", "case", "clear"})
+# These start a new clause, like punctuation does: "employees are not excluded, but contractors are excluded".
+CONJUNCTIONS = frozenset({"but", "however", "whereas", "although", "though", "while"})
+
+# Zero-width and soft-hyphen characters: a zero-width space separates words, the others sit inside a word.
+_INVISIBLE = str.maketrans({"\u200b": " ", "\u200c": None, "\u200d": None, "\u2060": None, "\ufeff": None,
+                            "\u00ad": None})
+_EM_DASH = re.compile(r"\s*\u2014\s*")       # an em dash separates clauses; textnorm would make it a hyphen
+_MARKDOWN = re.compile(r"[*_`~]+")
 _THOUSANDS = re.compile(r"(?<=\d),(?=\d{3}(?!\d))")
+_WS = re.compile(r"\s+")
+# A word or number, with joiners inside it: digit-punctuation-digit ("4.2", "2026-10-01", "10/1/2026", "15-18",
+# "10:00") and letter-apostrophe-letter ("aren't"). Anything else is one character per token.
+_TOKEN = re.compile(r"[^\W_]+(?:(?:(?<=\d)[.,/:\-](?=\d)|(?<=[^\W\d_])'(?=[^\W\d_]))[^\W_]+)*|\S")
+_BREAKS = frozenset(".,;:!?")                  # clause punctuation (a spaced "-" too: bullets, dashes)
+_TRANSPARENT = frozenset("\"'«»()[]{}<>#|")    # quotes, brackets, markdown leftovers: ignored entirely
 
 
 def normalize(text: str | None) -> str:
-    s = base_normalize(text)
-    s = _MARKDOWN.sub("", s)
-    return _THOUSANDS.sub("", s)
+    s = _EM_DASH.sub(" - ", (text or "").translate(_INVISIBLE))
+    s = CITATION_GROUP_RE.sub(" ", base_normalize(s))
+    s = _THOUSANDS.sub("", _MARKDOWN.sub("", s))
+    return _WS.sub(" ", s).strip()
 
 
-def contains(haystack: str, needle: str) -> bool:
-    """Whole-phrase match of `needle` in `haystack` after normalizing both. Numbers are whole numbers too: "5 days"
-    does not match inside "1.5 days" and "4.2" does not match inside "4.25"."""
-    n = normalize(needle)
-    if not n:
-        return False
-    left = r"(?<![a-z0-9])(?<![0-9][.,])" if n[0].isalnum() else ""
-    right = r"(?![a-z0-9])(?![.,][0-9])" if n[-1].isalnum() else ""
-    return re.search(left + re.escape(n) + right, normalize(haystack)) is not None
+@dataclass(frozen=True)
+class _Tok:
+    text: str
+    kind: str          # "word" (letters/digits) or "symbol" ("$", "%", "=", a hyphen inside "24-month")
+    start: int         # offsets in the normalized text, for reporting what matched
+    end: int
+    pause: str         # the clause punctuation between the previous token and this one ("" = none)
+    clause: int        # increases at every pause and conjunction
 
 
-def matches_any(text: str, options: Iterable[str]) -> bool:
-    return any(contains(text, o) for o in options)
+@dataclass(frozen=True)
+class _Text:
+    normalized: str
+    tokens: tuple[_Tok, ...]
+    tail: str          # punctuation after the last token (a final "?")
+
+
+@lru_cache(maxsize=4096)
+def _tokenize(text: str) -> _Text:
+    s = normalize(text)
+    tokens: list[_Tok] = []
+    pause, clause = "", 0
+    for m in _TOKEN.finditer(s):
+        t = m.group()
+        if t in _TRANSPARENT:
+            continue
+        tight = 0 < m.start() and m.end() < len(s) and not s[m.start() - 1].isspace() and not s[m.end()].isspace()
+        if t in _BREAKS or (t == "-" and not tight):
+            pause += t
+            continue
+        if pause or t in CONJUNCTIONS:
+            clause += 1
+        kind = "word" if t[0].isalnum() else "symbol"
+        tokens.append(_Tok(t, kind, m.start(), m.end(), pause, clause))
+        pause = ""
+    return _Text(s, tuple(tokens), pause)
+
+
+def _same(token: str, wanted: str) -> bool:
+    """Whole tokens only: "10" never matches inside "110", "10.5" or "15-10"."""
+    return token == wanted
+
+
+def _is_negator(word: str) -> bool:
+    return word in NEGATORS or word.endswith("n't")
+
+
+def _boundary_before(tok: _Tok) -> bool:
+    return bool(tok.pause) or tok.text in CONJUNCTIONS
+
+
+def _is_filler(tok: _Tok) -> bool:
+    return (tok.kind == "word" and not any(c.isdigit() for c in tok.text) and not _is_negator(tok.text)
+            and tok.text not in CONJUNCTIONS)
+
+
+def _extend(hay: tuple[_Tok, ...], phrase: tuple[_Tok, ...], at: int, j: int) -> int | None:
+    """Index of the token that ends the phrase when phrase[j:] can follow hay[at], else None. Tries every allowed gap
+    (backtracking), since the first place the next word fits is not always the one the rest of the phrase fits."""
+    if j == len(phrase):
+        return at
+    gap = MAX_FILLERS if phrase[j - 1].kind == phrase[j].kind == "word" else 0
+    for k in range(at + 1, min(at + 2 + gap, len(hay))):
+        if _boundary_before(hay[k]) and not _boundary_before(phrase[j]):
+            return None                        # the gap would cross punctuation (or a "but") the phrase doesn't have
+        if _same(hay[k].text, phrase[j].text):
+            end = _extend(hay, phrase, k, j + 1)
+            if end is not None:
+                return end
+        if not _is_filler(hay[k]):
+            return None
+    return None
+
+
+def _spans(hay: tuple[_Tok, ...], phrase: tuple[_Tok, ...]) -> Iterator[tuple[int, int]]:
+    for i, tok in enumerate(hay):
+        if _same(tok.text, phrase[0].text):
+            end = _extend(hay, phrase, i, 1)
+            if end is not None:
+                yield i, end
+
+
+def _negates(hay: tuple[_Tok, ...], n: int) -> bool:
+    return _is_negator(hay[n].text) and not (n + 1 < len(hay) and hay[n + 1].text in BOUND_WORDS)
+
+
+def _pause_after(text: _Text, last: int) -> str:
+    """The first clause punctuation after token `last` (the end of the text counts)."""
+    return next((t.pause for t in text.tokens[last + 1:] if t.pause), text.tail)
+
+
+def _rejection(text: _Text, first: int, last: int) -> str | None:
+    """Why an occurrence in an answer does not count as the answer saying it, or None when it does."""
+    hay = text.tokens
+    before = list(takewhile(lambda n: hay[n].clause == hay[first].clause, range(first - 1, -1, -1)))  # nearest first
+    for n in before:
+        reporting = [t.text for t in hay[n + 1:min(n + 3, first)] if t.text in CLAUSE_NEGATING]
+        if _is_negator(hay[n].text) and reporting:
+            return f"negated by {hay[n].text!r} + {reporting[0]!r}"
+    for n in before[:NEGATION_WINDOW]:
+        if _negates(hay, n):
+            return f"negated by {hay[n].text!r}"
+    if "?" in _pause_after(text, last):
+        return "in a question"
+    return None
+
+
+@dataclass(frozen=True)
+class Occurrence:
+    phrase: str
+    text: str                   # the matched words of the normalized haystack, e.g. "are explicitly excluded"
+    start: int
+    rejected: str | None = None  # why it does not count ("negated by 'not'", "in a question"); None = it counts
+
+    def as_dict(self) -> dict[str, str]:
+        if self.rejected is None:
+            return {"phrase": self.phrase, "matched": self.text}
+        return {"phrase": self.phrase, "rejected": self.rejected, "text": self.text}
+
+
+def occurrences(haystack: str, phrase: str, *, assertive: bool = True) -> list[Occurrence]:
+    """Every place `phrase` occurs in `haystack`. assertive=True (answers): each says whether it counts as the answer
+    stating the phrase. assertive=False (retrieved chunks): every occurrence counts."""
+    text, wanted = _tokenize(haystack or ""), _tokenize(phrase or "").tokens
+    if not wanted:
+        return []
+    found = []
+    for first, last in _spans(text.tokens, wanted):
+        span = text.normalized[text.tokens[first].start:text.tokens[last].end]
+        found.append(Occurrence(phrase, span, text.tokens[first].start,
+                                _rejection(text, first, last) if assertive else None))
+    return found
+
+
+def find(haystack: str, phrase: str, *, assertive: bool = True) -> Occurrence | None:
+    """The first occurrence that counts, or None."""
+    return next((o for o in occurrences(haystack, phrase, assertive=assertive) if o.rejected is None), None)
+
+
+def contains(haystack: str, needle: str, *, assertive: bool = True) -> bool:
+    return find(haystack, needle, assertive=assertive) is not None
+
+
+def matches_any(text: str, options: Iterable[str], *, assertive: bool = True) -> bool:
+    return any(contains(text, o, assertive=assertive) for o in options)
+
+
+def evidence(answer: str, phrases: Iterable[str]) -> list[dict[str, str]]:
+    """For the report: each phrase that occurs, with the words that matched, or why no occurrence counted. Phrases
+    that don't occur at all are left out (the failed check already says so)."""
+    out = []
+    for phrase in dict.fromkeys(phrases):
+        found = occurrences(answer, phrase)
+        if found:
+            out.append(next((o for o in found if o.rejected is None), found[0]).as_dict())
+    return out
 
 
 def _as_group(entry: str | Sequence[str]) -> list[str]:
@@ -59,7 +248,7 @@ def check_all_of(answer: str, groups: Sequence[str | Sequence[str]] | None) -> b
 
 
 def check_forbid(answer: str, forbidden: Sequence[str] | None) -> bool | None:
-    """True when none of the forbidden phrases appear."""
+    """True when the answer states none of the forbidden phrases (a negated mention is not stating it)."""
     return None if not forbidden else not matches_any(answer, forbidden)
 
 
@@ -130,7 +319,8 @@ def score_answer(expect: dict[str, Any], answer: dict[str, Any]) -> dict[str, An
     Checks that decide `passed`: any_of, all_of, forbid, forbid_start, not_found, gold_citation, citations_valid,
     plus min_citations and grounded when the case asks for them. `grounded` is always reported, but only gates the
     pass when expect.grounded is true (number grounding is a heuristic, so it is a metric first). The last three
-    read server signals: a signal the answer doesn't carry fails its check instead of passing it vacuously."""
+    read server signals: a signal the answer doesn't carry fails its check instead of passing it vacuously.
+    `evidence` records, per phrase check, which words matched each phrase or why an occurrence didn't count."""
     content = answer.get("content") or ""
     citations = answer.get("citations") or []
     expected_not_found = bool(expect.get("not_found", False))
@@ -148,15 +338,20 @@ def score_answer(expect: dict[str, Any], answer: dict[str, Any]) -> dict[str, An
     }
     gating = [k for k in checks if k != "grounded"] + (["grounded"] if expect.get("grounded") else [])
     failed = [k for k in gating if checks[k] is False]
-    return {"passed": not failed, "failed": failed, "checks": checks}
+    phrases = {"any_of": expect.get("any_of") or [],
+               "all_of": [p for g in expect.get("all_of") or [] for p in _as_group(g)],
+               "forbid": expect.get("forbid") or []}
+    found = {key: evidence(content, ps) for key, ps in phrases.items() if ps}
+    return {"passed": not failed, "failed": failed, "checks": checks, "evidence": found}
 
 
 # ----------------------------------------------------------------------------------------------------------------
 # Retrieval metrics
 # ----------------------------------------------------------------------------------------------------------------
 def is_relevant(content: str, gold: Sequence[str]) -> bool:
-    """A retrieved chunk is relevant when it contains any of the case's gold substrings."""
-    return matches_any(content, gold)
+    """A retrieved chunk is relevant when it contains any of the case's gold phrases. Same matcher as answers, minus
+    the negation guard: a chunk is the document's own text, so "does not carry over" there IS the passage."""
+    return matches_any(content, gold, assertive=False)
 
 
 def first_relevant_rank(contents: Sequence[str], gold: Sequence[str]) -> int | None:
@@ -236,6 +431,37 @@ def reliability_table(records: Sequence[dict[str, Any]]) -> list[dict[str, Any]]
         rows.append({"confidence": bucket or "none", "n": len(hits), "correct": correct,
                      "accuracy": _ratio(correct, len(hits))})
     return rows
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# LLM judge agreement (opt-in, never gates)
+# ----------------------------------------------------------------------------------------------------------------
+# The checks about WHAT the answer says. The judge grades that against the golden facts; it doesn't see citation ids
+# or grounding signals, so citations_valid, gold_citation, min_citations and grounded stay out of the comparison.
+CONTENT_CHECKS = ("any_of", "all_of", "forbid", "forbid_start", "not_found")
+
+
+def content_verdict(checks: dict[str, bool | None]) -> bool:
+    return not any(checks.get(name) is False for name in CONTENT_CHECKS)
+
+
+def judge_agreement(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """Agreement between the code's content verdict and the judge's. Each row: {"id", "set": "core"|"hard", "code":
+    bool, "judge": bool | None (None = the judge call failed), "model"}. Disagreements are the point: "code fail,
+    judge pass" is a candidate false fail of the phrase labels, "code pass, judge fail" a candidate false pass."""
+    judged = [r for r in rows if r["judge"] is not None]
+    agree = [r for r in judged if r["code"] == r["judge"]]
+    sets = dict.fromkeys(r["set"] for r in rows)
+    return {
+        "judged": len(judged), "agree": len(agree), "disagree": len(judged) - len(agree),
+        "rate": _ratio(len(agree), len(judged)),
+        "code_pass_judge_fail": [r["id"] for r in judged if r["code"] and not r["judge"]],
+        "code_fail_judge_pass": [r["id"] for r in judged if not r["code"] and r["judge"]],
+        "by_set": {s: {"judged": sum(1 for r in judged if r["set"] == s),
+                       "agree": sum(1 for r in agree if r["set"] == s)} for s in sets},
+        "models": dict(Counter(r.get("model") or "unknown" for r in judged)),
+        "errors": [r["id"] for r in rows if r["judge"] is None],
+    }
 
 
 def stability(passes: Sequence[bool]) -> dict[str, Any]:
