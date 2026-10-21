@@ -89,6 +89,53 @@ MATCH_TABLE = [
      "**20 days** in total. [S1]", ["20 days"], True, True),
     ("limitation, kept visible: who the phrase is about is not checked", "Only interns are not eligible; contractors "
      "are eligible.", ["not eligible"], True, True),
+    # A bound word only makes a bound when it sits BETWEEN the negator and the phrase. When the phrase itself starts
+    # with it, the negator negates the phrase: these answers say the opposite of the phrase.
+    ("a negated phrase that starts with a bound word: 'not only to employees'", "The stipend is available not only "
+     "to employees but also to contractors, at $500 per year.", ["only to employees"], True, False),
+    ("a negated phrase that starts with a bound word: 'not below'", "Larkspur's Q3 availability of 99.62% was not "
+     "below 99.9%.", ["below"], True, False),
+    ("a negated phrase that starts with a bound word: 'not less than'", "Yes: 99.62% is not less than 99.9%.",
+     ["less than"], True, False),
+    ("a bound word anywhere between the negator and the phrase: 'can't go over'", "You can't go over 30 days in any "
+     "12-month period.", ["30 days"], True, True),
+    ("a bound word anywhere between: 'may not stay over'", "You may not stay over 30 days.", ["30 days"], True, True),
+    ("a bound word anywhere between: 'without delay (within ...)'", "Report it without delay (within 24 hours).",
+     ["24 hours"], True, True),
+    ("'in no case later than' is a bound, not 'not the case'", "Report it immediately, and in no case later than 24 "
+     "hours.", ["24 hours"], True, True),
+    # The window (NEGATION_WINDOW = 3) from both sides, and the reporting rule's own reach (2 tokens after the negator)
+    ("a negation 3 tokens back is inside the window", "Contractors were not ever formally excluded.", ["excluded"],
+     True, False),
+    ("a negation 4 tokens back is outside it", "Employees with no prior service get 18 days.", ["18 days"], True,
+     True),
+    ("a reporting word counts only right after the negator", "Employees with no prior service are confirmed to get "
+     "18 days.", ["18 days"], True, True),
+    ("an em dash is a clause break on its own", "Not interns—contractors are excluded.",
+     ["contractors are excluded"], True, True),
+    ("a hyphen inside a word is not a clause break", "Contractors are a not-excluded group.", ["excluded"], True,
+     False),
+    # Hedges: what follows "not sure whether" / "unclear whether" / "nothing says" is not asserted
+    ("hedge: 'not sure whether'", "I'm not sure whether contractors are excluded.", ["are excluded"], True, False),
+    ("hedge: 'can't tell whether'", "I can't tell whether contractors are excluded.", ["are excluded"], True, False),
+    ("hedge: 'cannot determine whether'", "I cannot determine whether contractors are excluded from parental leave.",
+     ["are excluded"], True, False),
+    ("hedge: 'not known if'", "It's not known if contractors are excluded.", ["are excluded"], True, False),
+    ("hedge: 'unclear whether'", "It is unclear whether contractors are excluded.", ["are excluded"], True, False),
+    ("hedge: 'nothing says'", "Nothing says contractors are excluded.", ["are excluded"], True, False),
+    ("hedge: 'don't think'", "I don't think contractors are excluded.", ["are excluded"], True, False),
+    ("a plain 'if' is a condition, not a hedge", "If you joined this year you get 18 days.", ["18 days"], True, True),
+    ("'whether' after the phrase changes nothing", "Contractors are excluded whether or not they work full time.",
+     ["are excluded"], True, True),
+    # Limitations, kept visible (the judge is for these): rhetorical negation and contrast are not read
+    ("limitation: 'it is false that' is not read as a negation", "It is false that contractors are excluded.",
+     ["are excluded"], True, True),
+    ("limitation: 'nowhere does ... say' (the verb is too far from 'nowhere')", "Nowhere does the handbook say "
+     "contractors are excluded.", ["are excluded"], True, True),
+    ("limitation: 'rather than' is not read as a negation", "Rather than 18 days, full-timers get 20 days.",
+     ["18 days"], True, True),
+    ("limitation: a hedging adverb is a filler ('does not explicitly apply')", "The stipend section does not "
+     "explicitly apply to contractors.", ["does not apply"], False, True),
 ]
 
 
@@ -134,6 +181,26 @@ def test_all_of_uses_the_same_matcher() -> None:
     groups = [["18 days"], ["up to 5", "5 unused"]]
     assert not all(any(legacy_contains(answer, p) for p in g) for g in groups)
     assert scoring.check_all_of(answer, groups) is True
+
+
+def test_a_repeated_word_does_not_hide_a_match() -> None:
+    """The first place the next word fits is not always the one the rest of the phrase fits: from the first 'from',
+    'parental' is 3 words away (more than MAX_FILLERS), from the second it is 2. _extend has to try both."""
+    answer = "Contractors are excluded from from any paid parental leave."
+    assert scoring.contains(answer, "excluded from parental leave")
+    assert not scoring.contains("Contractors are excluded from all of the paid parental leave.",
+                                "excluded from parental leave")
+
+
+def test_the_content_verdict_counts_every_content_check_and_nothing_else() -> None:
+    """The judge is compared with these checks only: an injected 'APPROVED' at the start is a content failure, an
+    invalid citation is not (the judge never sees citation ids)."""
+    for name in scoring.CONTENT_CHECKS:
+        assert scoring.content_verdict({name: False}) is False, name
+    assert scoring.content_verdict({"forbid_start": False, "any_of": True}) is False
+    assert scoring.content_verdict({"citations_valid": False, "gold_citation": False, "grounded": False,
+                                    "any_of": True, "not_found": True}) is True
+    assert scoring.content_verdict({"any_of": None, "forbid_start": None}) is True
 
 
 def test_retrieval_relevance_ignores_negation_but_keeps_word_boundaries() -> None:

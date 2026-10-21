@@ -12,8 +12,10 @@ Matching rules (one matcher for any_of, all_of, forbid and gold_chunk):
   - up to MAX_FILLERS plain words may sit between two words of a phrase ("are explicitly excluded" matches "are
     excluded"), never a number, a negation or punctuation the phrase doesn't have;
   - in an answer, an occurrence does not count when it is negated ("the handbook does not say contractors are
-    excluded") or sits in a question ("are they not eligible?"). A phrase with its own negation ("not eligible")
-    matches normally. Retrieved chunks skip this guard: they are the documents' text, not claims.
+    excluded", "not below 99.9%"), hedged ("I'm not sure whether contractors are excluded") or sits in a question
+    ("are they not eligible?"). A phrase with its own negation ("not eligible") matches normally, and a negated bound
+    is not a negation ("will not exceed $2,000,000"). Retrieved chunks skip this guard: they are the documents' text,
+    not claims.
 Golden labels still list the variants they accept ("instruction", "instructions"): this is matching, not meaning.
 """
 
@@ -38,16 +40,25 @@ MAX_FILLERS = 2
 # contractors are excluded"). Small on purpose: "employees with no prior service get 18 days" must still count.
 NEGATION_WINDOW = 3
 
-NEGATORS = frozenset({"not", "no", "never", "neither", "nor", "without", "cannot"})      # plus any "...n't"
-# After a negator these make a bound, not a negation: "will not exceed $2,000,000", "no later than October 1".
+NEGATORS = frozenset({"not", "no", "never", "neither", "nor", "without", "cannot", "nothing"})  # plus any "...n't"
+# Between a negator and an occurrence these make a bound, not a negation: "will not exceed $2,000,000", "no later than
+# October 1", "can't go over 30 days", "without delay (within 24 hours)". Only BETWEEN: a phrase that itself starts
+# with one is negated by a negator right before it ("not below 99.9%" does not say "below").
 BOUND_WORDS = frozenset({"more", "less", "fewer", "greater", "later", "earlier", "longer", "shorter", "sooner",
                          "exceed", "exceeds", "exceeding", "above", "below", "over", "under", "beyond", "before",
-                         "after", "until", "only"})
-# After a negator these negate the rest of the clause however far it runs: "does not state anywhere in section 4
-# that ...", "it isn't true that ...", "it is not the case that ...".
+                         "after", "until", "only", "within"})
+# Right after a negator (within 2 words) these negate the rest of the clause however far it runs: "does not state
+# anywhere in section 4 that ...", "it isn't true that ...", "it is not the case that ...", "I'm not sure ...", "I
+# don't think ...". "case" only as "the case": "in no case later than 24 hours" is a bound.
 CLAUSE_NEGATING = frozenset({"say", "says", "said", "state", "states", "stated", "mention", "mentions", "mentioned",
                              "specify", "specifies", "specified", "indicate", "indicates", "indicated", "confirm",
-                             "confirms", "confirmed", "true", "case", "clear"})
+                             "confirms", "confirmed", "true", "case", "clear", "sure", "certain", "known", "determine",
+                             "think", "believe"})
+# A "whether" or "if" after a negator or one of these, in the same clause, opens an indirect question: "I can't tell
+# whether contractors are excluded", "it is unclear whether ...", "it's not known if ...". What follows is asked, not
+# said. A plain "if" is a condition and changes nothing ("if you joined this year you get 18 days").
+DOUBT_WORDS = frozenset({"unclear", "unsure", "uncertain", "unknown"})
+INDIRECT_QUESTION = frozenset({"whether", "if"})
 # These start a new clause, like punctuation does: "employees are not excluded, but contractors are excluded".
 CONJUNCTIONS = frozenset({"but", "however", "whereas", "although", "though", "while"})
 
@@ -154,8 +165,24 @@ def _spans(hay: tuple[_Tok, ...], phrase: tuple[_Tok, ...]) -> Iterator[tuple[in
                 yield i, end
 
 
-def _negates(hay: tuple[_Tok, ...], n: int) -> bool:
-    return _is_negator(hay[n].text) and not (n + 1 < len(hay) and hay[n + 1].text in BOUND_WORDS)
+def _negates(hay: tuple[_Tok, ...], n: int, first: int) -> bool:
+    """Whether the negator at n negates the occurrence starting at `first`: not when a bound word sits between them,
+    since then the negation limits a number instead ("will not exceed $2,000,000", "can't go over 30 days")."""
+    return _is_negator(hay[n].text) and not any(t.text in BOUND_WORDS for t in hay[n + 1:first])
+
+
+def _reporting_word(hay: tuple[_Tok, ...], n: int, first: int) -> str | None:
+    """The CLAUSE_NEGATING word right after the negator at n (within 2 words), if any. Only right after: in "employees
+    with no prior service are confirmed to get 18 days", "confirmed" is not what "no" negates."""
+    for k in range(n + 1, min(n + 3, first)):
+        word = hay[k].text
+        if word in CLAUSE_NEGATING and (word != "case" or hay[k - 1].text == "the"):
+            return word
+    return None
+
+
+def _doubts(word: str) -> bool:
+    return _is_negator(word) or word in DOUBT_WORDS
 
 
 def _pause_after(text: _Text, last: int) -> str:
@@ -167,12 +194,16 @@ def _rejection(text: _Text, first: int, last: int) -> str | None:
     """Why an occurrence in an answer does not count as the answer saying it, or None when it does."""
     hay = text.tokens
     before = list(takewhile(lambda n: hay[n].clause == hay[first].clause, range(first - 1, -1, -1)))  # nearest first
-    for n in before:
-        reporting = [t.text for t in hay[n + 1:min(n + 3, first)] if t.text in CLAUSE_NEGATING]
-        if _is_negator(hay[n].text) and reporting:
-            return f"negated by {hay[n].text!r} + {reporting[0]!r}"
+    for i, n in enumerate(before):
+        word = hay[n].text
+        if _is_negator(word) and (verb := _reporting_word(hay, n, first)):
+            return f"negated by {word!r} + {verb!r}"
+        if word in INDIRECT_QUESTION:
+            doubt = next((hay[m].text for m in before[i + 1:] if _doubts(hay[m].text)), None)
+            if doubt:
+                return f"negated by {doubt!r} + {word!r}"
     for n in before[:NEGATION_WINDOW]:
-        if _negates(hay, n):
+        if _negates(hay, n, first):
             return f"negated by {hay[n].text!r}"
     if "?" in _pause_after(text, last):
         return "in a question"
