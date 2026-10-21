@@ -18,7 +18,7 @@ Nothing is written to local disk except temp files during extraction.
 
 1. **Object storage**: create an R2 bucket named `vault-uploads` and an API token with read/write on it. Note the
    endpoint `https://<account_id>.r2.cloudflarestorage.com`, access key id and secret.
-2. **Push the repo** to GitHub (already done: private repo).
+2. **Push the repo** to GitHub (already done).
 3. In Render: **New > Blueprint**, pick the repo. Render reads `render.yaml` and asks for every `sync: false` value:
    `OPENAI_API_KEY`, `S3_ENDPOINT_URL`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, and the three `SEED_*_API_KEY`
    values (choose long random strings; only their sha256 is stored). Secrets are entered for both the API and the
