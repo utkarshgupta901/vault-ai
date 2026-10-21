@@ -142,6 +142,28 @@ See `migrations/versions/0001_initial.py`.
 Every error uses one envelope: `{"error": {"code", "message", "details", "request_id"}}`. Another owner's id is a 404
 (never 403). Idempotency: uploads by content hash, questions by `client_message_id`.
 
+The whole flow in seven calls (after `make demo`; needs `jq`):
+
+```bash
+API=http://localhost:8000; K='X-API-Key: vault-demo-key'
+# 1. upload: 202 at once, the work happens in a Celery worker (the same file again returns 200, no new work)
+DOC=$(curl -s -X POST $API/api/v1/documents -H "$K" -F file=@demo_docs/Vendor_Call_Notes_2026-09-14.txt | jq -r .document.id)
+# 2. watch it: server-sent status events until ready and insights ready (Ctrl-C to stop)
+curl -N $API/api/v1/documents/$DOC/events -H "$K"
+# 3. the verified insights: summary, category, tags, entities, risk flags with quotes
+curl -s $API/api/v1/documents/$DOC/insights -H "$K" | jq .insights
+# 4. retrieval only, no model call: vector and keyword ranks, the fused score and the identifier boost
+curl -s "$API/api/v1/search?q=LRK-4471&mode=hybrid" -H "$K" | jq '.hits[:3]'
+# 5. a chat over just this document (or {"all_documents": true})
+SID=$(curl -s -X POST $API/api/v1/chat/sessions -H "$K" -H 'Content-Type: application/json' \
+  -d "{\"document_ids\": [\"$DOC\"]}" | jq -r .id)
+# 6. ask: sources first (meta), then tokens, then checked citations and follow-ups, streamed over SSE
+curl -N -X POST $API/api/v1/chat/sessions/$SID/messages/stream -H "$K" -H 'Content-Type: application/json' \
+  -d '{"content": "What discount did CoreLink offer, and until when?"}'
+# 7. what that cost: every model call has a ledger row
+curl -s $API/api/v1/metrics/ai-usage -H "$K" | jq '{today_spend_usd, cost_per_answer_usd, cost_per_document_usd}'
+```
+
 ## AI design
 
 - **Models** (env-configurable, prices in `app/ai/pricing.py`): answers on `gpt-6.1-sol` (effort `low`) with
