@@ -621,9 +621,10 @@ cases:
   # 99.62% is only in the board update, 99.5% only in the BrightPath proposal, so neither document answers it alone.
   # (It replaced a CoreLink comparison on 2026-10-21: the board update restates CoreLink's 99.9% as its own target,
   # so that one could be answered from one sentence.) The board update's "below our internal target of 99.9%" is a
-  # distractor: the answer is "yes". It asks about the quarter's figure on purpose: until 2026-10-22 it asked whether
-  # Q3 reached "the monthly uptime that BrightPath commits to", and read monthly the corpus says no (August's 9-hour
-  # outage puts that month at most at (744 - 9) / 744 = 98.8%). A "No" start fails even when the answer says "above".
+  # distractor: the answer is "yes". It asks about the quarter's figure on purpose: before report 20261021T195633Z it
+  # asked whether Q3 reached "the monthly uptime that BrightPath commits to", and read monthly the corpus says no
+  # (August's 9-hour outage puts that month at most at (744 - 9) / 744 = 98.8%). A "No" start fails even when the
+  # answer also says "above".
   - id: h-availability-vs-brightpath
     question: "Was Larkspur's Q3 2026 platform availability higher than the uptime percentage BrightPath commits to?"
     tags: [multi_doc, hard]

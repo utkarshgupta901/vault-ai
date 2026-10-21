@@ -96,7 +96,7 @@ def _retrieval_table(summary: dict[str, Any], ks: list[int], key: str = "overall
 
 def _all_passages(summary: dict[str, Any], ks: list[int], label: str) -> list[str]:
     """Cases that need two passages at once count only when the last one arrived. Reports written before
-    gold_chunk_all (2026-10-22) have no such key and get no table."""
+    gold_chunk_all (first in 20261021T195633Z) have no such key and get no table."""
     if not any("all_passages" in s for s in summary.values()):
         return []
     return [f"{label}, every needed passage (cases with `gold_chunk_all`; the rank of the last one):", "",
