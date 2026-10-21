@@ -4,7 +4,7 @@
 models, scored by code (not by another LLM) so results are reproducible and cheap.
 
 ```bash
-make eval            # retrieval (3 modes) + answers: the 43 cases and the 13-case hard set -> evals/reports/<UTC>.json + .md
+make eval            # retrieval (3 modes) + answers: 43 cases + 13 hard -> evals/reports/<UTC>.json + .md
 make eval-demo       # only the demo cases, each 3 times: must pass 3/3
 make eval-retrieval  # retrieval only (no LLM answers, ~$0.003)
 uv run python evals/run_eval.py --api ... --key vault-eval-key --judge   # + an LLM judge per answer (agreement only)
@@ -87,8 +87,8 @@ flips and why, with no API calls.
   (`invalid_citations`, `ungrounded_facts`, `valid_citations`). Since 2026-10-18 a signal the answer doesn't carry
   fails its check, and the runner fails the run with the reason ("answer lacks signals [...]"); before, a missing
   signal read as 0 and passed.
-- **Hard set**: the same answer and retrieval metrics over the 13 hard cases, on their own lines (a "Hard set" table under
-  retrieval, a "Hard set" section under answers). It never decides the exit code.
+- **Hard set**: the same answer and retrieval metrics over the 13 hard cases, on their own lines (a "Hard set" table
+  under retrieval, a "Hard set" section under answers). It never decides the exit code.
 - **Judge agreement** (`--judge`, opt-in, never gates): an LLM judge (`evals/judge.py`, `judge-correct.v1`, the
   `JUDGE_MODEL`) grades each model-generated answer against a reference built from the case's own labels (each all-of
   group and the any-of list is one key fact; the gold passages give meaning). Its verdict is compared with the code's
@@ -109,6 +109,37 @@ flips and why, with no API calls.
   rows in `ai_usage`), so a user's first-time question is slower than the TTFT quoted here. Reports print this caveat
   under their latency table (without the retrieval-phase clause when the run skipped retrieval).
 
+## Results: 2026-10-21 (new matcher and hard set, review-fixes code)
+
+Measured against a second compose stack (API on port 8001) running the review-fixes branch (`330610e`), with the eval
+client on this branch: `make eval` = `evals/reports/20261021T175310Z` (client `b3f1acf`; the report says dirty because
+docs/EVAL.md was being edited during the run, no code differed) and `make eval-demo` = `evals/reports/20261021T175718Z`
+(client `5e94ef7`, clean). Answer model gpt-6.1-sol, prompt answer.v2.
+
+| Metric | Result |
+|---|---|
+| Original 43 cases (the headline) | **43/43**; refusals 15/15 correct, 0 false refusals (9 gate, 6 model); citations valid 43/43, gold document cited 28/28, grounded 43/43; confidence high / medium / low 20 / 7 / 16, each 100% accurate |
+| Retrieval, original 28 with gold chunks | hybrid hit@1 26/28, hit@8 **28/28**, MRR **0.958** (vector 0.907, keyword 0.915): the same as 2026-10-14 |
+| **Hard set** | **12/13**; retrieval hybrid hit@1 9/11, hit@8 10/11, MRR 0.864 (vector 0.909, keyword 0.803); traps 2/2 refused, the pronoun follow-up and all 3 computed answers right and grounded |
+| Demo cases (`make eval-demo`) | 10/10, **30/30 runs** |
+| TTFT p50 / p95 / max (server, 34 model-generated answers) | 1.7 s / 3.9 s / 4.7 s |
+| Cost per answer / AI spend | $0.0019 over the 43 (incl. 9 gate refusals at $0); $0.16 for the whole run (all 56 cases), $0.06 for eval-demo |
+| LLM judge agreement | **not measured yet**: `--judge` needs a model key in the client's environment, which this run did not have; it stopped before any call, as designed |
+
+The hard-set failure is the system's, not the case's. `h-contractor-stipend` ("Do contractors receive the remote work
+stipend?") is answered by two passages: the stipend section and handbook 1.2, "Unless a section says otherwise, the
+benefits in this handbook apply only to employees". For this question 1.2 was in none of the 40 hits of any mode (a
+query in its own words finds it: keyword 1st, hybrid 3rd), so the model saw only the stipend sections and refused:
+"... do not state whether contractors are eligible". That is retrieval failing a two-hop question, so the case stays
+as written.
+
+**Offline re-score of the 2026-10-21 main run** (`20261021T163824Z`, main at `71be0fa`; that report is not in git):
+`evals/rescore.py` gives 42/43 as stored, **43/43** with the new matcher. Exactly one verdict changes:
+`f-contractors-parental`, any_of fail -> pass ("'are excluded' matched 'are explicitly excluded'"). The previous matcher
+on the same answers and labels gives 42/43, and no other check changes in any of its 43 runs, in the 30 runs of its
+eval-demo report (`20261021T164121Z`), or in any committed report since 2026-10-13 (their only flips come from the
+2026-10-18 `grounded` labels, on answers the server had already flagged as ungrounded).
+
 ## Results: final run (2026-10-14, demo corpus of 6 documents)
 
 `make eval` = `evals/reports/20261014T105823Z` and `make eval-demo` = `evals/reports/20261014T110107Z`, both at git
@@ -116,11 +147,10 @@ flips and why, with no API calls.
 from 2026-10-13 and name their own reports. Commit ids in the reports and these docs are the ids after the
 2026-10-14 history rewrite ([AI_USAGE.md](../AI_USAGE.md) §7); the code at each commit is unchanged.
 
-**Pending re-run.** On 2026-10-18 the spec was tightened after these runs: every answerable case now gates on
-`expect.grounded: true`, and a missing signal fails its check instead of passing (see Metrics). The real eval has not
-been re-run since (no OpenAI key was available), so the numbers below are the 2026-10-14 ones, unchanged. Re-scoring
-the answers stored in both reports offline with the new expectations passes 43/43 and 30/30 runs, but that is a
-re-score of old answers, not a new run. `make pre-demo` scores Backup sessions against the same golden cases, so a
+**Re-run on 2026-10-21 (above).** On 2026-10-18 the spec was tightened after these runs: every answerable case now
+gates on `expect.grounded: true`, and a missing signal fails its check instead of passing (see Metrics). Re-scoring the
+answers stored in both reports offline with the new expectations passed 43/43 and 30/30 runs; the 2026-10-21 runs
+above were scored under them. `make pre-demo` scores Backup sessions against the same golden cases, so a
 stored Backup answer with an ungrounded number now fails there too.
 
 ### Retrieval
