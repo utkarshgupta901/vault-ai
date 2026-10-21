@@ -2,8 +2,8 @@
 
 **Tool:** Claude Code (Opus 5.5) in the terminal: plan mode, multi-agent workflows, subagents working in isolated
 git worktrees, and the evaluation harness as the arbiter. **Time:** one day, plus a pre-demo pass the next day.
-**Result:** ~9.3k lines of Python in app/ (plus ~8.3k in tests), ~5.5k lines of TypeScript, ~615 tests (~850 after
-the 2026-10-18 review), a 43-case evaluation, deployment config.
+**Result:** ~9.3k lines of Python in app/ (plus ~8.3k in tests), ~5.5k lines of TypeScript, ~615 tests (~1,090 after
+the 2026-10-18 review and the eval work), a 43-case evaluation plus a 13-case hard set, deployment config.
 
 The short version: I used AI to **explore, build in parallel, and attack its own work**, and kept the decisions,
 contracts and verification with me. The chronological log with timestamps is in
@@ -90,7 +90,7 @@ The fixes are on the `review-fixes` branch, which merges only after the evals pa
 - **Frozen contracts + file ownership**: agents could not drift from the schema, SSE contract or each other.
 - **CLAUDE.md hard rules**, checked again by reviewers (e.g. a DB session held across a streaming LLM call, unescaped
   document text in a prompt, a status write not fenced by `run_id`).
-- **Offline FakeProvider**: ~615 tests (~850 since the 2026-10-18 review) run against real Postgres/pgvector with
+- **Offline FakeProvider**: ~615 tests (~1,090 since the 2026-10-18 review and the eval work) run against real Postgres/pgvector with
   zero API cost.
 - **Measure, don't assume**: model latency (TTFT p50/p95), retrieval ranks per case, cost per answer, all from real
   runs; README numbers are copied from reports, with the report id and the prompt-cache state.

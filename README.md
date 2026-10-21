@@ -8,26 +8,25 @@ and API latency.
 
 ![Chat with streamed, cited answer](docs/screenshots/chat.png)
 
-| Final run on the 43-case golden set (`make eval`, 2026-10-14) | Result |
+| Final run on the 43-case golden set (`make eval`, 2026-10-21, the code in this repo) | Result |
 |---|---|
 | Answers passing all expectations (first run of each case) | **43/43** (incl. 10 demo questions, multi-doc arithmetic, multi-turn, injection probes) |
 | Grounded answers (every number in a cited sentence is in its cited source, a shown calculation, or a date the prompt showed) | **43/43** |
 | Refusals when the answer isn't in the documents | **15/15**, zero false refusals |
 | Citations pointing at a source actually provided / at the right document | **100% / 100%** |
-| Confidence badge high / medium / low | 21 / 7 / 15 (low = the 15 refusals); every answer passed, so each bucket is 100% accurate and the badge's calibration is untested |
+| Confidence badge high / medium / low | 20 / 8 / 15 (low = the 15 refusals); every answer passed, so each bucket is 100% accurate and the badge's calibration is untested |
 | Hybrid retrieval hit@8 / MRR | **100% / 0.958** (vector-only 0.907, keyword-only 0.915) |
-| Time to first token p50 / p95 (gpt-6.1-sol, 34 model-generated answers) | 1.4 s / 3.2 s (all 43 answers: 1.4 s / 2.7 s); Sol's latency varies by day; on 2026-10-13: 2.6–2.7 s / 4.7–6.9 s (20261013T165934Z, 20261013T155343Z); query embeddings were cached, a never-seen question adds ~0.5 s |
-| Cost per answer / per ingested document | $0.0042 with a cold prompt cache, averaged over all 43 incl. 9 gate refusals ($0.0053 per model answer; $0.0014 on 20261013T155343Z, a rerun with 86% of answer input cached) / ~$0.001 |
-| AI spend for the whole 43-case run | $0.21 |
+| Demo questions, each asked 3 times (`make eval-demo`) | **30/30** runs |
+| Hard set: 13 harder cases written after the build (paraphrases, "no" answers, two-hop, cross-document), reported apart | **12/13**; the miss is a two-hop question ("Do contractors receive the remote work stipend?") whose second passage, "benefits apply only to employees", is not retrieved, so the model refuses |
+| Time to first token p50 / p95 (gpt-6.1-sol, 34 model-generated answers) | 1.7 s / 4.0 s (all 43 answers: 1.7 s / 3.8 s); Sol's latency varies by day (2.6–2.7 s / 4.7–6.9 s on 2026-10-13); query embeddings were cached, a never-seen question adds ~0.5 s |
+| Cost per answer / per ingested document | $0.0042 averaged over all 43 incl. 9 gate refusals ($0.0053 per model answer; $0.0014 on 20261013T155343Z, a rerun with 86% of answer input cached) / ~$0.001 |
+| AI spend for the whole run (43 cases + the 13-case hard set) | $0.28 |
 
-Numbers come from `evals/reports/20261014T105823Z` (see [docs/EVAL.md](docs/EVAL.md)); cost per document from
-`/metrics/ai-usage` (docs/screenshots/metrics.png); decisions they drove are in
-[docs/DECISIONS.md](docs/DECISIONS.md). The demo questions pass 3/3 in `make eval-demo` (`20261014T110107Z`).
-On 2026-10-18 the spec was tightened (every answerable case now fails on an ungrounded number, and an answer
-missing its signals fails). Re-run on 2026-10-21 against the review-fixes code (`1e534b3`) with a stricter phrase
-matcher and a separate 13-case hard set: 43/43, demo 30/30 runs, hard set 12/13 (one two-hop question whose second
-passage retrieval missed); see
-[docs/EVAL.md](docs/EVAL.md#results-2026-10-21-new-matcher-and-hard-set-review-fixes-code).
+Numbers come from `evals/reports/20261021T205542Z` and `20261021T205852Z` (eval-demo), run against this code
+(`ea90635`); see [docs/EVAL.md](docs/EVAL.md). Cost per document comes from `/metrics/ai-usage`
+(docs/screenshots/metrics.png); decisions the numbers drove are in [docs/DECISIONS.md](docs/DECISIONS.md). The
+scorer reads answers as words, not substrings: a negated, hedged or questioned phrase does not count ("does not say
+contractors are excluded" is not "are excluded"), and each matching rule has a test.
 
 ---
 
@@ -51,7 +50,7 @@ open http://localhost:8000      # dashboard (API key: vault-demo-key) · API doc
 | `make up` | dev stack with bind mounts + auto-reload; dashboard also on :8000 (`make web-dev` adds hot reload on :5173) |
 | `make demo-luna` | switch only the API's answer model to `gpt-6-luna` (fallback if the network is slow); `make demo` switches back |
 | `make raise-quota` | raise the demo user's daily AI budget (default $100) |
-| `make test` | ~850 tests (pytest, FakeProvider, real Postgres/Valkey/S3 from the stack) |
+| `make test` | ~1,090 tests (pytest, FakeProvider, real Postgres/Valkey/S3 from the stack) |
 | `make ci` | what CI runs (`.github/workflows/ci.yml`, on every push and pull request): ruff, the full test suite, frontend lint + build + tests |
 | `make smoke` / `make smoke-llm` | end-to-end smoke against the running API / verify every configured model + TTFT |
 | `make eval` / `make eval-demo` / `make eval-retrieval` | golden-set evaluation (answers, refusals, citations, latency, cost) / demo cases 3× / retrieval only |
@@ -262,7 +261,7 @@ migrations/     hand-written SQL schema
 frontend/       React dashboard (Vite, TypeScript, Tailwind)
 evals/          golden set (43 cases + 13 hard), runner, scoring, judge, offline re-score, reports
 scripts/        demo corpus generator, seeding, smoke, doctor, snapshots, Render all-in-one start
-tests/          ~850 tests
+tests/          ~1,090 tests
 docs/           decisions, prompts, eval, deployment, design review, code review, AI usage log
 .github/        CI workflow (lint, tests against service containers, frontend)
 ```

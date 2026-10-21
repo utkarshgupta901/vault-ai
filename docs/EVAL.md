@@ -197,6 +197,28 @@ before 2026-10-21's second fix-up they read "55/56").
   rows in `ai_usage`), so a user's first-time question is slower than the TTFT quoted here. Reports print this caveat
   under their latency table (without the retrieval-phase clause when the run skipped retrieval).
 
+## Results: final run on the merged code (2026-10-21, `ea90635`)
+
+The review fixes, the grounding change and the eval work above, merged: `make eval` = `evals/reports/20261021T205542Z`,
+`make eval-demo` = `20261021T205852Z`, both against a stack built from `ea90635` (`--server-ref review-fixes@ea90635`,
+client on the same commit, clean tree). These are the numbers in the README.
+
+| Metric | Result |
+|---|---|
+| Original 43 cases (the headline) | **43/43**; refusals 15/15 correct, 0 false refusals; citations valid 43/43, gold document cited 28/28, grounded 43/43; confidence high / medium / low 20 / 8 / 15, each 100% accurate |
+| Retrieval, original 28 with gold chunks | hybrid hit@1 26/28, hit@8 **28/28**, MRR **0.958** (vector 0.907, keyword 0.915) |
+| **Hard set** | **12/13**; retrieval hybrid hit@8 10/11, MRR 0.864 (vector 0.909, keyword 0.803); every needed passage within hit@8 for the 3 multi-passage cases |
+| Demo cases (`make eval-demo`) | 10/10, **30/30 runs** |
+| TTFT p50 / p95 / max (server, 34 model-generated answers) | 1.7 s / 4.0 s / 4.7 s |
+| Cost per answer / AI spend | $0.0042 over the 43 (incl. 9 gate refusals at $0; $0.0053 per model answer); the whole run (all 56 cases, retrieval included) $0.28; eval-demo $0.06 |
+| LLM judge agreement | not measured (see below) |
+
+The one failure is again `h-contractor-stipend`, for the same reason as below: handbook 1.2 ("the benefits in this
+handbook apply only to employees") is in none of the 22 / 18 / 17 hits, and this time the model refused outright ("I
+couldn't find this in your documents ...") instead of hedging. It is a retrieval miss on a two-hop question, and the
+next retrieval change to try is the one this case points at: expanding a question about a benefit with the
+handbook's eligibility section, or a second retrieval hop when the first finds the benefit but not who it covers.
+
 ## Results: 2026-10-21 (new matcher and hard set, review-fixes code)
 
 Measured against a second compose stack (API on port 8001) running the review-fixes branch at **`1e534b3`** (image
@@ -251,7 +273,7 @@ Q3 2026 platform availability was 99.62%, higher than BrightPath's committed 99.
 0.12 percentage points, though the figures cover different periods: quarterly versus monthly."
 
 **Second fix-up, offline** (`evals/rescore.py` and a check-by-check comparison with the first fix-up's scorer and
-labels, `fbc305d`): over the 563 stored answers of the 16 reports (the 14 committed ones and main's two uncommitted
+labels, `fbc305d`): over the 563 stored answers of the 16 reports (the 14 committed ones and main's two
 2026-10-21 reports) no verdict and no check value changes; the only differences are the new checks, which pass where
 they now apply (`forbid_start` on the vacation, sick-day total and availability answers, `forbid` on the subscription
 answer). The line-break rule changes nothing stored: only 7 of the 563 answers have a line that ends without clause
@@ -266,7 +288,7 @@ fail, on the same hedge). The new checks pass on every stored answer they now ap
 PTO cash-out and volunteer-day answers, `mentions` on the stipend answers, the number-anchored `forbid` on the
 subscription answers).
 
-**Offline re-score of the 2026-10-21 main run** (`20261021T163824Z`, main at `71be0fa`; that report is not in git):
+**Offline re-score of the 2026-10-21 main run** (`20261021T163824Z`, main at `71be0fa`):
 `evals/rescore.py` gives 42/43 as stored, **43/43** with the new matcher. Exactly one verdict changes:
 `f-contractors-parental`, any_of fail -> pass ("'are excluded' matched 'are explicitly excluded'"). The previous matcher
 on the same answers and labels gives 42/43, and no other check changes in any of its 43 runs, in the 30 runs of its
