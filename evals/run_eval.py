@@ -9,7 +9,8 @@ What it does, in order:
   2. Corpus: uploads the corpus files (plus any real document in demo_docs/user/) for the eval user (duplicates are
      free) and waits until they are ready. Cases tagged `public_doc` are skipped when their document is absent.
   3. Retrieval (no LLM, ~free): GET /search per mode for every case with gold_chunk labels; hit@1/5/8/40 and MRR
-     per mode x tag, with raw counts.
+     per mode x tag, with raw counts. A case that needs every one of its gold passages (expect.gold_chunk_all) also
+     gets the rank by which the last of them arrived, reported on its own line.
   4. Answers: a NEW chat session per case run (scope from the case), prior turns asked first, then the question via
      the JSON endpoint. Each answer is scored by evals/scoring.score_answer. Cases tagged `demo` run --repeat times
      and must pass every run (pass^N); quality metrics use each case's first run so every case weighs the same,
@@ -172,13 +173,17 @@ def search_case(client: VaultClient, case: Case, ids: list[str] | None, mode: st
     query = case.search_query() or ""
     resp = client.search(query, document_ids=ids, mode=mode, k=k)
     hits = resp.get("hits") or []
-    rank = scoring.first_relevant_rank([h.get("content") or h.get("snippet") or "" for h in hits],
-                                       case.expect["gold_chunk"])
+    contents = [h.get("content") or h.get("snippet") or "" for h in hits]
+    rank = scoring.first_relevant_rank(contents, case.expect["gold_chunk"])
     gold_hit = hits[rank - 1] if rank else {}
-    return {"case_id": case.id, "tags": case.tags, "mode": mode, "query": query, "rank": rank, "n_hits": len(hits),
-            "top_similarity": resp.get("top_similarity"), "gold_lex_rank": gold_hit.get("lex_rank"),
-            "gold_sem_rank": gold_hit.get("sem_rank"), "gold_id_hit": gold_hit.get("id_hit"),
-            "gold_filename": gold_hit.get("filename"), "gold_label": gold_hit.get("label")}
+    record = {"case_id": case.id, "tags": case.tags, "mode": mode, "query": query, "rank": rank, "n_hits": len(hits),
+              "top_similarity": resp.get("top_similarity"), "gold_lex_rank": gold_hit.get("lex_rank"),
+              "gold_sem_rank": gold_hit.get("sem_rank"), "gold_id_hit": gold_hit.get("id_hit"),
+              "gold_filename": gold_hit.get("filename"), "gold_label": gold_hit.get("label")}
+    if case.expect.get("gold_chunk_all"):
+        # `rank` counts a hit as soon as one of the needed passages arrives; this one only once all of them have
+        record["rank_all"] = scoring.all_relevant_rank(contents, case.expect["gold_chunk"])
+    return record
 
 
 def run_retrieval(client: VaultClient, cases: list[Case], doc_ids: dict[str, str], modes: list[str],
@@ -205,7 +210,8 @@ def is_hard(record: dict[str, Any]) -> bool:
 
 
 def summarize_retrieval(records: list[dict[str, Any]], ks: tuple[int, ...]) -> dict[str, Any]:
-    """{mode: {"overall": metrics, "by_tag": {tag: metrics}}} where metrics = hit@k counts + MRR."""
+    """{mode: {"overall": metrics, "by_tag": {tag: metrics}}} where metrics = hit@k counts + MRR, plus "all_passages"
+    (the same metrics over `rank_all`) when some case needs every one of its gold passages."""
     out: dict[str, Any] = {}
     for mode in dict.fromkeys(r["mode"] for r in records):
         rows = [r for r in records if r["mode"] == mode]
@@ -214,6 +220,9 @@ def summarize_retrieval(records: list[dict[str, Any]], ks: tuple[int, ...]) -> d
             "overall": scoring.retrieval_metrics([r["rank"] for r in rows], ks),
             "by_tag": {t: scoring.retrieval_metrics([r["rank"] for r in rows if t in r["tags"]], ks) for t in tags},
         }
+        needs_all = [r["rank_all"] for r in rows if "rank_all" in r]
+        if needs_all:
+            out[mode]["all_passages"] = scoring.retrieval_metrics(needs_all, ks)
     return out
 
 

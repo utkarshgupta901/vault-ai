@@ -190,7 +190,8 @@ def _score(case: golden.Case, content: str) -> dict:
 
 
 # (case, answer, passes): how the hard set's labels read real-looking answers. A "no" must be about the stipend and
-# must not be a hedge; a comparison must use both documents' numbers; natural bounds and spellings must pass.
+# must not be a hedge; a comparison must use both documents' numbers and go the right way; natural bounds and
+# spellings must pass. Rows marked "limitation" pass or fail wrongly and stay visible: the judge is for those.
 HARD_ANSWERS = [
     ("h-contractor-stipend", "No. Section 1.2 says that unless a section says otherwise, the benefits in this handbook "
      "apply only to employees, and the remote work stipend section does not extend it to contractors. [S1]", True),
@@ -198,36 +199,85 @@ HARD_ANSWERS = [
      "benefit. [S1]", True),
     ("h-contractor-stipend", "No. Contractors don't receive the remote work stipend: section 1.2 limits the "
      "handbook's benefits to employees. [S1]", True),
+    ("h-contractor-stipend", "No, contractors are excluded from the remote work stipend. [S1]", True),
+    ("h-contractor-stipend", "No. Contractors aren't entitled to the remote work stipend; it is an employee "
+     "benefit. [S1]", True),
+    ("h-contractor-stipend", "No. A contractor isn't eligible for the stipend. [S1]", True),
+    ("h-contractor-stipend", "No. Contractors cannot receive the remote work stipend: handbook benefits are limited "
+     "to employees. [S1]", True),
+    ("h-contractor-stipend", "No. Contractors won't get the remote work stipend. [S1]", True),
+    ("h-contractor-stipend", "No. The remote work stipend is for employees, and contractors are not employees of "
+     "Larkspur. [S1]", True),
+    ("h-contractor-stipend", "**No**\nContractors don't receive the remote work stipend. [S1]", True),
+    ("h-contractor-stipend", "No. The stipend is only available to employees. [S1]", True),
     ("h-contractor-stipend", "The handbook does not say whether contractors get the stipend; it only says contractors "
      "are not eligible for parental leave. [S1]", False),                     # a hedge, and another benefit's "no"
     ("h-contractor-stipend", "Information on contractor eligibility for the stipend is not available in the "
      "handbook. [S1]", False),                                               # a hedge
     ("h-contractor-stipend", "Contractors may not be eligible; the handbook is unclear. [S1]", False),
+    ("h-contractor-stipend", "Contractors may not be eligible for the stipend. [S1]", False),        # a hedge
+    ("h-contractor-stipend", "The documents are silent on whether contractors receive the stipend; they do not get "
+     "parental leave. [S1]", False),
+    ("h-contractor-stipend", "I'm not certain. The stipend section only mentions employees; contractors may not "
+     "qualify. [S1]", False),
+    ("h-contractor-stipend", "The handbook doesn't mention whether contractors get the stipend; contractors don't get "
+     "parental leave. [S1]", False),
     ("h-contractor-stipend", "Yes. The remote work stipend is available not only to employees but also to "
      "contractors, at $500 per year. [S1]", False),                          # the opposite answer
-    # limitation, kept visible: a hedge worded as an accepted "no" plus a filler passes; the judge is for this
+    # limitation: a hedge worded as an accepted "no" plus a filler passes
     ("h-contractor-stipend", "The stipend section does not explicitly apply to contractors. [S1]", True),
+    # limitation: who the "no" is about is not checked (here: parental leave, not the stipend)
+    ("h-contractor-stipend", "Contractors are excluded from parental leave, and the stipend section doesn't mention "
+     "them. [S1]", True),
     ("h-availability-vs-brightpath", "Yes. Larkspur's Q3 2026 platform availability was 99.62% [S1], above the 99.5% "
      "monthly uptime BrightPath commits to [S2].", True),
     ("h-availability-vs-brightpath", "Yes: 99.62% exceeds BrightPath's 99.5% commitment, although it was below "
      "Larkspur's internal 99.9% target. [S1][S2]", True),
+    ("h-availability-vs-brightpath", "Numerically, yes: Larkspur's Q3 2026 platform availability was 99.62%, above "
+     "BrightPath's 99.5% monthly uptime commitment; however, a quarterly figure does not establish whether Larkspur "
+     "met that threshold in each month. [S1][S5]", True),                   # the 2026-10-21 live answer
     ("h-availability-vs-brightpath", "No. Platform availability was 99.62%, below the internal target of 99.9%. "
      "[S1]", False),                                                         # one document, the wrong comparison
     ("h-availability-vs-brightpath", "No. Larkspur's 99.62% did not exceed BrightPath's 99.5% guarantee. [S1][S2]",
      False),
     ("h-availability-vs-brightpath", "Availability was 99.62% and BrightPath commits to 99.5%; whether that is "
      "enough is unclear. [S1][S2]", False),
+    # the monthly reading answers another question: a "no" fails even when it states "above" for the quarter
+    ("h-availability-vs-brightpath", "No. Q3 availability averaged 99.62%, above 99.5% for the quarter, but the "
+     "9-hour August outage put August near 98.8%, below BrightPath's 99.5% monthly level. [S1][S2]", False),
     ("h-stolen-laptop", "Report it to security@larkspur.example immediately, and in no case later than 24 hours. [S1]",
      True),
     ("h-stolen-laptop", "Report it without delay (within 24 hours). [S1]", True),
     ("h-stolen-laptop", "Report it to security within 24h. [S1]", True),
+    ("h-stolen-laptop", "Not within 24 hours; you have 7 days to report it. [S1]", False),
+    # limitation: the "not" is 6 tokens before "24 hours", outside NEGATION_WINDOW
+    ("h-stolen-laptop", "It does not have to be reported within 24 hours; report it at your next check-in. [S1]",
+     True),
     ("h-work-abroad", "You can work from abroad, but you can't go over 30 days in any 12-month period. [S1]", True),
     ("h-work-abroad", "You can't stay beyond 30 days. [S1]", True),
     ("h-work-abroad", "You may not stay over 30 days. [S1]", True),
     ("h-unused-pto-cash", "No. Unused PTO isn't paid out; it is lost on December 31. [S1]", True),
+    ("h-unused-pto-cash", "No. They are lost on December 31. [S1]", True),
+    ("h-unused-pto-cash", "No, you won't get cash for them. [S1]", True),
+    ("h-unused-pto-cash", "Yes, unused days are paid out at year end rather than forfeited. [S1]", False),
+    ("h-volunteer-day-carryover", "No, volunteer days don't roll over. [S1]", True),
+    ("h-volunteer-day-carryover", "No, the volunteer day does not carry forward. [S1]", True),
+    ("h-vacation-paraphrase", "An 18-day PTO allowance per calendar year. [S1]", True),
+    ("h-vacation-paraphrase", "20 days: 18 days of PTO plus 2 for seniority. [S1]", False),   # ignores "ignoring"
+    # limitation: the same wrong total, not at the start, passes (it contains "18 days")
+    ("h-vacation-paraphrase", "A full-timer gets 20 days: 18 days of PTO plus 2 for seniority. [S1]", True),
     ("h-pto-plus-sick-total", "Twenty-six days in total: 18 PTO days plus 8 sick days. [S1]", True),
+    ("h-pto-plus-sick-total", "28 days in total (18 + 2 + 8); without the service increase it would be 26. [S1]",
+     False),                                                                 # a new hire has no service increase
+    # limitation: the same wrong total, not at the start, passes (it contains "26")
+    ("h-pto-plus-sick-total", "A new full-timer gets 28 days in total (18 + 2 + 8); without the service increase it "
+     "would be 26. [S1]", True),
     ("h-revenue-yoy", "Revenue grew by $1.10M year over year. [S1]", True),
     ("h-subscription-gap", "CoreLink would cost 35 000 USD more per year. [S1][S2]", True),
+    ("h-subscription-gap", "BrightPath is $35,000 cheaper per year than CoreLink. [S1][S2]", True),
+    ("h-subscription-gap", "BrightPath would cost $35,000 more per year than CoreLink. [S1][S2]", False),  # backwards
+    ("h-subscription-gap", "CoreLink would cost $35,000 less than BrightPath. [S1][S2]", False),             # backwards
+    ("h-pronoun-contract-term", "A 3-yr term. [S1]", True),
 ]
 
 
@@ -237,6 +287,31 @@ def test_hard_labels_read_answers_as_intended(gold: golden.Golden, case_id: str,
     case = next(c for c in gold.cases if c.id == case_id)
     result = _score(case, content)
     assert result["passed"] is passes, (result["failed"], result["evidence"])
+
+
+# Hard cases that need two passages at once: retrieval reports, besides the rank of the first gold passage, the rank
+# by which every one of them was retrieved (scoring.all_relevant_rank), since one passage alone cannot answer them.
+MULTI_PASSAGE = {"h-pto-plus-sick-total", "h-subscription-gap", "h-availability-vs-brightpath"}
+
+
+def test_multi_passage_hard_cases_measure_every_passage(gold: golden.Golden) -> None:
+    flagged = {c.id for c in gold.cases if c.expect.get("gold_chunk_all")}
+    assert flagged == MULTI_PASSAGE
+    by_id = {c.id: c for c in gold.cases}
+    for cid in MULTI_PASSAGE:
+        assert by_id[cid].is_hard and len(by_id[cid].expect["gold_chunk"]) >= 2, cid
+    assert set(CROSS_DOC) <= MULTI_PASSAGE
+
+
+def test_the_availability_question_asks_for_the_comparison_the_corpus_settles(gold: golden.Golden,
+                                                                               corpus_text: dict[str, str]) -> None:
+    """Regression: it asked whether Q3 availability reached "the monthly uptime that BrightPath commits to". Read
+    monthly, the corpus says no: August had a 9-hour outage, so August was at most (744 - 9) / 744 = 98.8% < 99.5%.
+    Only the quarter's 99.62% clears 99.5%, so the question asks about that figure, not about a month."""
+    case = next(c for c in gold.cases if c.id == "h-availability-vs-brightpath")
+    assert "monthly" not in case.question and "Q3 2026" in case.question
+    assert "9-hour outage" in _flat(corpus_text[BOARD]) and round((31 * 24 - 9) / (31 * 24) * 100, 1) == 98.8
+    assert 99.62 > 99.5 and case.expect["forbid_start"] == ["no"]
 
 
 def test_answer_labels_never_contradict_the_corpus(gold: golden.Golden, corpus_text: dict[str, str]) -> None:
@@ -273,6 +348,10 @@ def _with_case(raw: dict, **changes: object) -> dict:
     ({"expect": {"any_of": ["x"], "gold_chunk": ["x"], "must_cit": "a"}}, "unknown expect key 'must_cit'"),
     ({"expect": {"any_of": "18 days", "gold_chunk": ["x"]}}, "expect.any_of must be a non-empty list"),
     ({"expect": {"any_of": ["x"], "gold_chunk": ["x"], "grounded": "yes"}}, "expect.grounded must be true or false"),
+    ({"expect": {"any_of": ["x"], "gold_chunk": ["x"], "gold_chunk_all": "yes"}},
+     "expect.gold_chunk_all must be true or false"),
+    ({"expect": {"any_of": ["x"], "gold_chunk": ["x"], "gold_chunk_all": True}},
+     "expect.gold_chunk_all needs at least two gold_chunk phrases"),
     ({"scope": ["Missing.pdf"]}, "scope file 'Missing.pdf' is not in the corpus"),
     ({"scope": ["Q3_2026_Board_Update.pdf"]}, "must_cite 'Larkspur_Employee_Handbook_2026.pdf' is not in the case"),
     ({"tags": ["multiturn"]}, "multiturn cases need prior turns"),

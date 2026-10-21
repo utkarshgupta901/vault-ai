@@ -8,7 +8,8 @@ before anyone spends a cent on a new run. It is a re-score of old answers, not a
 
 Each run is scored by run_eval.score_run against the case's current expectations (the stored ones when the case is
 no longer in the golden set). A run without an answer (a failed call) has nothing to re-score: it stays a failure
-and stays in the totals, so a report with one failed call reads 42/43, not 42/42."""
+and stays in the totals, so a report with one failed call reads 42/43, not 42/42. The totals keep the hard set apart
+from the original cases, as the report does, so the headline reads 43/43 and the hard set 12/13, not 55/56."""
 
 import argparse
 import json
@@ -50,10 +51,10 @@ def explain(run: dict[str, Any], scored: dict[str, Any], labels_changed: bool) -
     return why
 
 
-def _unanswered(case_id: str, i: int, run: dict[str, Any]) -> dict[str, Any]:
+def _unanswered(case_id: str, case_set: str, i: int, run: dict[str, Any]) -> dict[str, Any]:
     """A run whose call failed: still a failure now (there is no answer to score), so its verdict can't change."""
     old = _verdict(bool(run.get("passed")))
-    return {"id": case_id, "run": i, "old": old, "new": "fail", "changed": old != "fail",
+    return {"id": case_id, "set": case_set, "run": i, "old": old, "new": "fail", "changed": old != "fail",
             "old_failed": run.get("failed") or [], "new_failed": ["error"], "error": run.get("error") or "no answer",
             "why": ["no answer stored: nothing to re-score"] if old != "fail" else []}
 
@@ -66,32 +67,41 @@ def rescore(report: dict[str, Any], golden: golden_mod.Golden | None = None) -> 
         case = current.get(stored["id"]) or Case(id=stored["id"], question=stored.get("question", ""),
                                                   tags=stored.get("tags") or [], scope="all",
                                                   expect=stored["expect"])
+        case_set = "hard" if case.is_hard else "core"
         for i, run in enumerate(stored["runs"], start=1):
             if not run.get("answer"):
-                rows.append(_unanswered(stored["id"], i, run))
+                rows.append(_unanswered(stored["id"], case_set, i, run))
                 continue
             scored = score_run(case, run["answer"])
             changed = bool(run["passed"]) != scored["passed"]
-            rows.append({"id": stored["id"], "run": i, "old": _verdict(run["passed"]), "new": _verdict(scored["passed"]),
-                         "changed": changed, "old_failed": run.get("failed") or [], "new_failed": scored["failed"],
-                         "error": None,
+            rows.append({"id": stored["id"], "set": case_set, "run": i, "old": _verdict(run["passed"]),
+                         "new": _verdict(scored["passed"]), "changed": changed, "old_failed": run.get("failed") or [],
+                         "new_failed": scored["failed"], "error": None,
                          "why": explain(run, scored, case.expect != stored["expect"]) if changed else []})
     return rows
 
 
-def first_runs(rows: list[dict[str, Any]]) -> dict[str, dict[str, int]]:
-    first = [r for r in rows if r["run"] == 1]
-    return {"stored": {"ok": sum(r["old"] == "pass" for r in first), "n": len(first)},
-            "now": {"ok": sum(r["new"] == "pass" for r in first), "n": len(first)}}
+def first_runs(rows: list[dict[str, Any]]) -> dict[str, dict[str, dict[str, int]]]:
+    """{"core": {"stored": {ok, n}, "now": {ok, n}}, "hard": ...}: first runs per set ("hard" only when the report
+    has hard cases), the way run_eval keeps the hard set out of the headline."""
+    out = {}
+    for case_set in dict.fromkeys(["core"] + [r["set"] for r in rows]):
+        first = [r for r in rows if r["run"] == 1 and r["set"] == case_set]
+        if first or case_set == "core":
+            out[case_set] = {"stored": {"ok": sum(r["old"] == "pass" for r in first), "n": len(first)},
+                             "now": {"ok": sum(r["new"] == "pass" for r in first), "n": len(first)}}
+    return out
+
+
+SET_LABELS = {"core": "original cases", "hard": "hard set"}
 
 
 def render(rows: list[dict[str, Any]], source: str) -> str:
-    totals = first_runs(rows)
     changed = [r for r in rows if r["changed"]]
-    lines = [f"# Re-score of `{source}` (stored answers, current scorer and labels, no API calls)", "",
-             f"- First runs: {totals['stored']['ok']}/{totals['stored']['n']} passed as stored, "
-             f"{totals['now']['ok']}/{totals['now']['n']} now",
-             f"- Runs re-scored: {len(rows)}; verdicts changed: {len(changed)}", ""]
+    lines = [f"# Re-score of `{source}` (stored answers, current scorer and labels, no API calls)", ""]
+    lines += [f"- First runs, {SET_LABELS[s]}: {t['stored']['ok']}/{t['stored']['n']} passed as stored, "
+              f"{t['now']['ok']}/{t['now']['n']} now" for s, t in first_runs(rows).items()]
+    lines += [f"- Runs re-scored: {len(rows)}; verdicts changed: {len(changed)}", ""]
     if changed:
         lines += ["| run | stored | now | why |", "|---|---|---|---|"]
         lines += [f"| {r['id']} #{r['run']} | {r['old']} | {r['new']} | {'; '.join(r['why']).replace('|', '/')} |"

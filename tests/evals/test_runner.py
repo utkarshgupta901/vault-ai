@@ -11,7 +11,8 @@ import httpx
 import pytest
 
 from evals import run_eval
-from evals.report import render_markdown
+from evals.golden import Case
+from evals.report import render_markdown, render_retrieval
 from tests.evals.fake_api import ALL_ROUTES, SIGNALS, FakeVaultApi, transport
 
 DOCS = {"A.txt": "Employees get 18 days of PTO per year.", "B.txt": "Incident LRK-4471 cost $120k in total."}
@@ -164,6 +165,36 @@ def test_the_hard_set_is_reported_apart_from_the_headline(setup: dict[str, Path]
     assert "AI spend during the whole run (eval user, /metrics/ai-usage; every call, hard set included)" in md
     demo_only = run(setup, FakeVaultApi(answer_fn=answer, search_fn=search), "--tag", "demo")[1]
     assert "AI spend during the whole run (eval user, /metrics/ai-usage; every call):" in render_markdown(demo_only)
+
+
+class _TwoHits:
+    """Just enough of VaultClient for search_case: the PTO passage ranks first, the sick-day passage second."""
+
+    def search(self, query: str, **_: Any) -> dict[str, Any]:
+        return {"hits": [{"content": "Employees get 18 days of PTO per year."},
+                         {"content": "Employees get 8 sick days per year."}]}
+
+
+def test_a_multi_passage_case_also_reports_when_its_last_passage_arrived() -> None:
+    """Regression: a case that needs two passages (18 PTO days + 8 sick days) counted as a hit@1 when either one ranked
+    first, so the cross-document difficulty the hard set advertises was not measured. With gold_chunk_all the record
+    also keeps the rank by which every gold passage was retrieved, and the report gives those cases their own line."""
+    both = Case(id="h-both", question="PTO plus sick days?", tags=["factoid", "hard"], scope="all",
+                expect={"any_of": ["26"], "gold_chunk": ["18 days of PTO", "8 sick days"], "gold_chunk_all": True})
+    one = Case(id="h-one", question="Sick days?", tags=["factoid", "hard"], scope="all",
+               expect={"any_of": ["8"], "gold_chunk": ["8 sick days"]})
+    records = [run_eval.search_case(_TwoHits(), case, None, "hybrid", 8) for case in (both, one)]
+    assert (records[0]["rank"], records[0]["rank_all"]) == (1, 2)
+    assert records[1]["rank"] == 2 and "rank_all" not in records[1]
+    hard = run_eval.summarize_retrieval(records, (1, 5, 8))["hybrid"]
+    assert hard["overall"]["hit@1"] == {"hits": 1, "n": 2, "rate": 0.5}          # either passage first counts here
+    assert hard["all_passages"]["hit@1"] == {"hits": 0, "n": 1, "rate": 0.0}      # ... but not here
+    assert hard["all_passages"]["mrr"] == 0.5
+    assert "all_passages" not in run_eval.summarize_retrieval(records[1:], (1, 5, 8))["hybrid"]
+    md = "\n".join(render_retrieval({"k": 8, "ks": [1, 5, 8], "summary": {}, "records": records,
+                                      "hard": run_eval.summarize_retrieval(records, (1, 5, 8))}))
+    assert "Hard set, every needed passage (cases with `gold_chunk_all`; the rank of the last one):" in md
+    assert "| hybrid | 1 | 0/1 (0%) | 1/1 (100%) | 1/1 (100%) | 0.500 |" in md
 
 
 def fake_judge(case: dict[str, Any], run: dict[str, Any]) -> dict[str, Any]:

@@ -33,7 +33,9 @@ HARD_TAG = "hard"
 
 CASE_KEYS = {"id", "question", "tags", "scope", "turns", "expect", "retrieval_query", "note"}
 REQUIRED_CASE_KEYS = {"id", "question", "tags", "scope", "expect"}
-EXPECT_KEYS = {"any_of", "all_of", "forbid", "forbid_start", "must_cite", "gold_chunk", "not_found",
+# gold_chunk_all: the case needs every gold_chunk passage at once (18 PTO days + 8 sick days), not any one of them;
+# retrieval then also reports the rank by which the last one arrived (scoring.all_relevant_rank).
+EXPECT_KEYS = {"any_of", "all_of", "forbid", "forbid_start", "must_cite", "gold_chunk", "gold_chunk_all", "not_found",
                "min_citations", "grounded"}
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 
@@ -148,8 +150,11 @@ def _validate_expect(cid: str, tags: set[str], expect: Any, scope_files: list[st
         if not isinstance(groups, list) or not groups or not all(
                 (isinstance(g, str) and g.strip()) or _is_str_list(g) for g in groups):
             problems.append(f"{cid}: expect.all_of must be a list of strings or lists of strings")
-    if "grounded" in expect and not isinstance(expect["grounded"], bool):      # "no" would be truthy and gate
-        problems.append(f"{cid}: expect.grounded must be true or false")
+    for key in ("grounded", "gold_chunk_all"):          # "no" would be truthy and switch the check on
+        if key in expect and not isinstance(expect[key], bool):
+            problems.append(f"{cid}: expect.{key} must be true or false")
+    if expect.get("gold_chunk_all") is True and len(expect.get("gold_chunk") or []) < 2:
+        problems.append(f"{cid}: expect.gold_chunk_all needs at least two gold_chunk phrases")
     must = expect.get("must_cite")
     must_list = [must] if isinstance(must, str) else (must or [])
     if must is not None and not _is_str_list(must_list):

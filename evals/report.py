@@ -87,11 +87,20 @@ def _counts(counter: dict[str, int]) -> str:
     return ", ".join(f"`{k}` x{v}" for k, v in counter.items()) or "n/a"
 
 
-def _retrieval_table(summary: dict[str, Any], ks: list[int]) -> list[str]:
+def _retrieval_table(summary: dict[str, Any], ks: list[int], key: str = "overall") -> list[str]:
     header = ["mode", "cases"] + [f"hit@{k}" for k in ks] + ["MRR"]
-    rows = [[mode, str(s["overall"]["n"])] + [_hit(s["overall"], k) for k in ks] + [_mrr(s["overall"])]
-            for mode, s in summary.items()]
+    rows = [[mode, str(s[key]["n"])] + [_hit(s[key], k) for k in ks] + [_mrr(s[key])]
+            for mode, s in summary.items() if key in s]
     return _table(header, rows)
+
+
+def _all_passages(summary: dict[str, Any], ks: list[int], label: str) -> list[str]:
+    """Cases that need two passages at once count only when the last one arrived. Reports written before
+    gold_chunk_all (2026-10-22) have no such key and get no table."""
+    if not any("all_passages" in s for s in summary.values()):
+        return []
+    return [f"{label}, every needed passage (cases with `gold_chunk_all`; the rank of the last one):", "",
+            *_retrieval_table(summary, ks, "all_passages"), ""]
 
 
 def render_retrieval(retrieval: dict[str, Any]) -> list[str]:
@@ -109,9 +118,10 @@ def render_retrieval(retrieval: dict[str, Any]) -> list[str]:
             m = retrieval["summary"][mode]["by_tag"].get(tag)
             cells.append("n/a" if not m else f"{_hit(m, 8)} / {_mrr(m)}")
         tag_rows.append([tag] + cells)
-    lines += _table(["tag"] + modes, tag_rows) + [""]
+    lines += _table(["tag"] + modes, tag_rows) + [""] + _all_passages(retrieval["summary"], ks, "Original cases")
     if retrieval.get("hard"):
-        lines += ["Hard set (tag `hard`; not in the tables above):", "", *_retrieval_table(retrieval["hard"], ks), ""]
+        lines += ["Hard set (tag `hard`; not in the tables above):", "", *_retrieval_table(retrieval["hard"], ks), "",
+                  *_all_passages(retrieval["hard"], ks, "Hard set")]
     return lines
 
 

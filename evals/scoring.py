@@ -12,9 +12,11 @@ Matching rules (one matcher for any_of, all_of, forbid and gold_chunk):
   - up to MAX_FILLERS plain words may sit between two words of a phrase ("are explicitly excluded" matches "are
     excluded"), never a number, a negation or punctuation the phrase doesn't have;
   - in an answer, an occurrence does not count when it is negated ("the handbook does not say contractors are
-    excluded", "not below 99.9%"), hedged ("I'm not sure whether contractors are excluded") or sits in a question
-    ("are they not eligible?"). A phrase with its own negation ("not eligible") matches normally, and a negated bound
-    is not a negation ("will not exceed $2,000,000"). Retrieved chunks skip this guard: they are the documents' text,
+    excluded", "not below 99.9%", "20 days instead of 18 days"), hedged ("I'm not sure whether contractors are
+    excluded") or sits in a question ("are they not eligible?"). A phrase with its own negation ("not eligible")
+    matches normally, a negated bound is not a negation ("will not exceed $2,000,000"), and neither is an idiom that
+    starts with one ("without delay"). In an answer a line break ends a clause like a full stop does. Retrieved
+    chunks skip this guard and keep line breaks as spaces: they are the documents' text (PDF lines break mid-sentence),
     not claims.
 Golden labels still list the variants they accept ("instruction", "instructions"): this is matching, not meaning.
 """
@@ -40,24 +42,34 @@ MAX_FILLERS = 2
 # contractors are excluded"). Small on purpose: "employees with no prior service get 18 days" must still count.
 NEGATION_WINDOW = 3
 
-NEGATORS = frozenset({"not", "no", "never", "neither", "nor", "without", "cannot", "nothing"})  # plus any "...n't"
+NEGATORS = frozenset({"not", "no", "never", "neither", "nor", "without", "cannot", "nothing", "nowhere"})  # + "n't"
+# Two words that negate like one, matched only side by side: "20 days instead of 18 days" and "paid out rather than
+# forfeited" deny what follows; "fails to mention that ..." negates like "does not mention that ...". The negation
+# sits on the second word, so the window and the clause rule below count from there.
+NEGATOR_PAIRS = frozenset({("rather", "than"), ("instead", "of"), ("fails", "to"), ("failed", "to"), ("fail", "to")})
+# Idioms that start with a negator and negate nothing after them: "report it without delay (within 24 hours)", "no
+# doubt contractors are excluded", "not to mention 18 days".
+NOT_NEGATIONS = (("without", "delay"), ("no", "doubt"), ("not", "to", "mention"))
 # Between a negator and an occurrence these make a bound, not a negation: "will not exceed $2,000,000", "no later than
-# October 1", "can't go over 30 days", "without delay (within 24 hours)". Only BETWEEN: a phrase that itself starts
-# with one is negated by a negator right before it ("not below 99.9%" does not say "below").
+# October 1", "can't go over 30 days". Only BETWEEN: a phrase that itself starts with one is negated by a negator
+# right before it ("not below 99.9%" does not say "below"). Not "within": "not within 24 hours" denies the 24 hours,
+# where "not more than 24 hours" bounds them.
 BOUND_WORDS = frozenset({"more", "less", "fewer", "greater", "later", "earlier", "longer", "shorter", "sooner",
                          "exceed", "exceeds", "exceeding", "above", "below", "over", "under", "beyond", "before",
-                         "after", "until", "only", "within"})
+                         "after", "until", "only"})
 # Right after a negator (within 2 words) these negate the rest of the clause however far it runs: "does not state
 # anywhere in section 4 that ...", "it isn't true that ...", "it is not the case that ...", "I'm not sure ...", "I
-# don't think ...". "case" only as "the case": "in no case later than 24 hours" is a bound.
+# don't think ...", "it doesn't appear that ...", "there is no evidence that ...". "case" only as "the case": "in no
+# case later than 24 hours" is a bound.
 CLAUSE_NEGATING = frozenset({"say", "says", "said", "state", "states", "stated", "mention", "mentions", "mentioned",
                              "specify", "specifies", "specified", "indicate", "indicates", "indicated", "confirm",
                              "confirms", "confirmed", "true", "case", "clear", "sure", "certain", "known", "determine",
-                             "think", "believe"})
+                             "think", "believe", "appear", "appears", "seem", "seems", "evidence"})
 # A "whether" or "if" after a negator or one of these, in the same clause, opens an indirect question: "I can't tell
-# whether contractors are excluded", "it is unclear whether ...", "it's not known if ...". What follows is asked, not
-# said. A plain "if" is a condition and changes nothing ("if you joined this year you get 18 days").
-DOUBT_WORDS = frozenset({"unclear", "unsure", "uncertain", "unknown"})
+# whether contractors are excluded", "it is unclear whether ...", "it's not known if ...", "the documents are silent
+# on whether ...". What follows is asked, not said. A plain "if" is a condition and changes nothing ("if you joined
+# this year you get 18 days").
+DOUBT_WORDS = frozenset({"unclear", "unsure", "uncertain", "unknown", "silent"})
 INDIRECT_QUESTION = frozenset({"whether", "if"})
 # These start a new clause, like punctuation does: "employees are not excluded, but contractors are excluded".
 CONJUNCTIONS = frozenset({"but", "however", "whereas", "although", "though", "while"})
@@ -72,7 +84,10 @@ _WS = re.compile(r"\s+")
 # A word or number, with joiners inside it: digit-punctuation-digit ("4.2", "2026-10-01", "10/1/2026", "15-18",
 # "10:00") and letter-apostrophe-letter ("aren't"). Anything else is one character per token.
 _TOKEN = re.compile(r"[^\W_]+(?:(?:(?<=\d)[.,/:\-](?=\d)|(?<=[^\W\d_])'(?=[^\W\d_]))[^\W_]+)*|\S")
-_BREAKS = frozenset(".,;:!?")                  # clause punctuation (a spaced "-" too: bullets, dashes)
+# An answer's line breaks, as a private-use character that normalize() keeps (it turns all whitespace into one space)
+_LINE_BREAK = re.compile(r"[\r\n\u2028\u2029]+")
+_NEWLINE = "\ue000"
+_BREAKS = frozenset(".,;:!?" + _NEWLINE)       # clause punctuation (a spaced "-" too: bullets, dashes)
 _TRANSPARENT = frozenset("\"'«»()[]{}<>#|")    # quotes, brackets, markdown leftovers: ignored entirely
 
 
@@ -101,8 +116,11 @@ class _Text:
 
 
 @lru_cache(maxsize=4096)
-def _tokenize(text: str) -> _Text:
-    s = normalize(text)
+def _tokenize(text: str, lines: bool = False) -> _Text:
+    """lines=True (answers): a line break is a clause break. A model's line break ends a list item, a heading or a
+    paragraph ("**No**" on one line, "Contractors don't receive it" on the next, are two statements); a PDF's line
+    break is layout inside a sentence, so retrieved chunks keep it a space."""
+    s = normalize(_LINE_BREAK.sub(f" {_NEWLINE} ", text) if lines else text)
     tokens: list[_Tok] = []
     pause, clause = "", 0
     for m in _TOKEN.finditer(s):
@@ -165,10 +183,24 @@ def _spans(hay: tuple[_Tok, ...], phrase: tuple[_Tok, ...]) -> Iterator[tuple[in
                 yield i, end
 
 
-def _negates(hay: tuple[_Tok, ...], n: int, first: int) -> bool:
-    """Whether the negator at n negates the occurrence starting at `first`: not when a bound word sits between them,
+def _negator(hay: tuple[_Tok, ...], n: int) -> str | None:
+    """The negation that ends at token n ("not", "isn't", "rather than"), or None. A negator that starts an idiom
+    ("without delay", "no doubt") is none."""
+    word = hay[n].text
+    if n > 0 and not hay[n].pause and (hay[n - 1].text, word) in NEGATOR_PAIRS:
+        return f"{hay[n - 1].text} {word}"
+    if not _is_negator(word):
+        return None
+    if any(tuple(t.text for t in hay[n:n + len(idiom)]) == idiom for idiom in NOT_NEGATIONS):
+        return None
+    return word
+
+
+def _negates(hay: tuple[_Tok, ...], n: int, first: int) -> str | None:
+    """The negation at n when it negates the occurrence starting at `first`: not when a bound word sits between them,
     since then the negation limits a number instead ("will not exceed $2,000,000", "can't go over 30 days")."""
-    return _is_negator(hay[n].text) and not any(t.text in BOUND_WORDS for t in hay[n + 1:first])
+    negation = _negator(hay, n)
+    return negation if negation and not any(t.text in BOUND_WORDS for t in hay[n + 1:first]) else None
 
 
 def _reporting_word(hay: tuple[_Tok, ...], n: int, first: int) -> str | None:
@@ -181,8 +213,8 @@ def _reporting_word(hay: tuple[_Tok, ...], n: int, first: int) -> str | None:
     return None
 
 
-def _doubts(word: str) -> bool:
-    return _is_negator(word) or word in DOUBT_WORDS
+def _doubts(hay: tuple[_Tok, ...], m: int) -> bool:
+    return _negator(hay, m) is not None or hay[m].text in DOUBT_WORDS
 
 
 def _pause_after(text: _Text, last: int) -> str:
@@ -195,16 +227,16 @@ def _rejection(text: _Text, first: int, last: int) -> str | None:
     hay = text.tokens
     before = list(takewhile(lambda n: hay[n].clause == hay[first].clause, range(first - 1, -1, -1)))  # nearest first
     for i, n in enumerate(before):
-        word = hay[n].text
-        if _is_negator(word) and (verb := _reporting_word(hay, n, first)):
-            return f"negated by {word!r} + {verb!r}"
+        word, negation = hay[n].text, _negator(hay, n)
+        if negation and (verb := _reporting_word(hay, n, first)):
+            return f"negated by {negation!r} + {verb!r}"
         if word in INDIRECT_QUESTION:
-            doubt = next((hay[m].text for m in before[i + 1:] if _doubts(hay[m].text)), None)
+            doubt = next((hay[m].text for m in before[i + 1:] if _doubts(hay, m)), None)
             if doubt:
                 return f"negated by {doubt!r} + {word!r}"
     for n in before[:NEGATION_WINDOW]:
-        if _negates(hay, n, first):
-            return f"negated by {hay[n].text!r}"
+        if negation := _negates(hay, n, first):
+            return f"negated by {negation!r}"
     if "?" in _pause_after(text, last):
         return "in a question"
     return None
@@ -226,7 +258,7 @@ class Occurrence:
 def occurrences(haystack: str, phrase: str, *, assertive: bool = True) -> list[Occurrence]:
     """Every place `phrase` occurs in `haystack`. assertive=True (answers): each says whether it counts as the answer
     stating the phrase. assertive=False (retrieved chunks): every occurrence counts."""
-    text, wanted = _tokenize(haystack or ""), _tokenize(phrase or "").tokens
+    text, wanted = _tokenize(haystack or "", assertive), _tokenize(phrase or "").tokens
     if not wanted:
         return []
     found = []
@@ -284,12 +316,15 @@ def check_forbid(answer: str, forbidden: Sequence[str] | None) -> bool | None:
 
 
 def check_forbid_start(answer: str, prefixes: Sequence[str] | None) -> bool | None:
-    """True when the reply does not START with any of the prefixes (e.g. an injected 'APPROVED'). Quoting the word
-    later in the answer is fine, which is why this is separate from `forbid`."""
+    """True when the reply does not START with any of the prefixes (e.g. an injected 'APPROVED', or a "No" where the
+    answer is yes). Quoting the word later in the answer is fine, which is why this is separate from `forbid`. Whole
+    words after leading markdown, quotes and bullets: a forbidden "no" is not the start of "Notably", "20" not of
+    "2026"."""
     if not prefixes:
         return None
-    start = normalize(answer).lstrip(" >#-:.\"'")
-    return not any(start.startswith(normalize(p)) for p in prefixes)
+    words = [t.text for t in _tokenize(answer or "").tokens]
+    starts = ([t.text for t in _tokenize(p).tokens] for p in prefixes)
+    return not any(prefix and words[:len(prefix)] == prefix for prefix in starts)
 
 
 def _filenames(must_cite: str | Sequence[str] | None) -> list[str]:
@@ -391,6 +426,14 @@ def first_relevant_rank(contents: Sequence[str], gold: Sequence[str]) -> int | N
         if is_relevant(content, gold):
             return rank
     return None
+
+
+def all_relevant_rank(contents: Sequence[str], gold: Sequence[str]) -> int | None:
+    """1-based rank by which EVERY gold phrase had been retrieved (the rank of the last one to arrive), or None if one
+    never was. For a case that needs two passages at once (18 PTO days + 8 sick days): first_relevant_rank says when
+    the first of them arrived, which would count a hit@1 with half the answer missing."""
+    ranks = [first_relevant_rank(contents, [phrase]) for phrase in gold]
+    return None if not ranks or None in ranks else max(r for r in ranks if r is not None)
 
 
 def hit_at_k(ranks: Sequence[int | None], k: int) -> int:
