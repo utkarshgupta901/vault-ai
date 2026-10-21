@@ -1,7 +1,9 @@
 """Write an eval report to disk and render its readable Markdown summary.
 
 The JSON keeps everything (every answer, citation and retrieval rank) so numbers can be re-derived or judged later;
-the Markdown is what docs/EVAL.md and the README quote. Every rate is printed with its raw count ("7/8 (88%)")."""
+the Markdown is what docs/EVAL.md and the README quote. Every rate is printed with its raw count ("7/8 (88%)").
+The hard set (cases tagged `hard`) and the --judge agreement get their own sections; reports written before they
+existed simply don't have those keys."""
 
 import json
 from datetime import UTC, datetime
@@ -70,15 +72,19 @@ def _counts(counter: dict[str, int]) -> str:
     return ", ".join(f"`{k}` x{v}" for k, v in counter.items()) or "n/a"
 
 
+def _retrieval_table(summary: dict[str, Any], ks: list[int]) -> list[str]:
+    header = ["mode", "cases"] + [f"hit@{k}" for k in ks] + ["MRR"]
+    rows = [[mode, str(s["overall"]["n"])] + [_hit(s["overall"], k) for k in ks] + [_mrr(s["overall"])]
+            for mode, s in summary.items()]
+    return _table(header, rows)
+
+
 def render_retrieval(retrieval: dict[str, Any]) -> list[str]:
     lines = ["## Retrieval (GET /search, no LLM)", ""]
     if "skipped" in retrieval:
         return lines + [f"Skipped: {retrieval['skipped']}.", ""]
     ks = retrieval["ks"]
-    header = ["mode", "cases"] + [f"hit@{k}" for k in ks] + ["MRR"]
-    rows = [[mode, str(s["overall"]["n"])] + [_hit(s["overall"], k) for k in ks] + [_mrr(s["overall"])]
-            for mode, s in retrieval["summary"].items()]
-    lines += _table(header, rows) + ["", "Per tag (hit@8 / MRR):", ""]
+    lines += _retrieval_table(retrieval["summary"], ks) + ["", "Per tag (hit@8 / MRR):", ""]
     modes = list(retrieval["summary"])
     tags = sorted({t for s in retrieval["summary"].values() for t in s["by_tag"]})
     tag_rows = []
@@ -88,7 +94,10 @@ def render_retrieval(retrieval: dict[str, Any]) -> list[str]:
             m = retrieval["summary"][mode]["by_tag"].get(tag)
             cells.append("n/a" if not m else f"{_hit(m, 8)} / {_mrr(m)}")
         tag_rows.append([tag] + cells)
-    return lines + _table(["tag"] + modes, tag_rows) + [""]
+    lines += _table(["tag"] + modes, tag_rows) + [""]
+    if retrieval.get("hard"):
+        lines += ["Hard set (tag `hard`; not in the tables above):", "", *_retrieval_table(retrieval["hard"], ks), ""]
+    return lines
 
 
 def render_answers(answers: dict[str, Any], retrieval_ran: bool = True) -> list[str]:
@@ -111,6 +120,49 @@ def render_answers(answers: dict[str, Any], retrieval_ran: bool = True) -> list[
     lines += ["", *_table(["tag", "passed"], [[t, frac(s)] for t, s in answers["by_tag"].items()]), ""]
     return lines + render_refusals(answers["refusals"]) + render_demo(answers["demo"]) + \
         render_reliability(answers["reliability"]) + render_latency_cost(answers, retrieval_ran)
+
+
+def render_hard(hard: dict[str, Any] | None) -> list[str]:
+    """The hard set's own summary: pass rate, checks and per tag. Short on purpose: its latency and cost are in the
+    JSON, and its failures are in the Failures table with the others."""
+    if not hard:
+        return []
+    n = hard["cases"]
+    checks, refusals = hard["checks"], hard["refusals"]
+    rows = [[t, frac(s)] for t, s in hard["by_tag"].items() if t != "hard"]
+    return [f"## Hard set ({n} case{'' if n == 1 else 's'}, tag `hard`, not in the headline above)", "",
+            f"- First-run pass rate (hard set): **{frac(hard['passed'])}**",
+            f"- not_found correct: {frac(checks['not_found'])} | citations valid: {frac(checks['citations_valid'])} | "
+            f"gold citation: {frac(checks['gold_citation'])} | grounded: {frac(checks['grounded'])}",
+            f"- Refusals: {refusals['should_refuse']} should be refused, {refusals['fn']} answered instead, "
+            f"{refusals['fp']} false refusals", "", *_table(["tag", "passed"], rows), ""]
+
+
+def render_judge(judge: dict[str, Any] | None) -> list[str]:
+    """Agreement of the LLM judge with the code's content checks, and every disagreement with the judge's reason."""
+    if not judge:
+        return []
+    s = judge["summary"]
+    sets = s["by_set"]
+    by_set = " | ".join(f"{'original cases' if name == 'core' else 'hard set'} {v['agree']}/{v['judged']}"
+                        for name, v in sets.items())
+    stat = {"ok": s["agree"], "n": s["judged"], "rate": s["rate"]}
+    lines = ["## LLM judge agreement (--judge, never gates)", "",
+             "The judge grades each model-generated answer against the case's golden facts; it is compared with the "
+             "code's content checks (any_of, all_of, forbid, forbid_start, not_found), not with citations or "
+             "grounding, which it does not see.", "",
+             f"- Agree: {frac(stat)}" + (f" | {by_set}" if by_set else ""),
+             f"- Code pass, judge fail (candidate false passes): {', '.join(s['code_pass_judge_fail']) or 'none'}",
+             f"- Code fail, judge pass (candidate false fails): {', '.join(s['code_fail_judge_pass']) or 'none'}",
+             f"- Judge models: {_counts(s['models'])}"]
+    if s["errors"]:
+        lines.append(f"- Judge errors (not counted): {', '.join(s['errors'])}")
+    rows = [[r["id"], r["set"], "pass" if r["code"] else "fail", "pass" if r["judge"] else "fail",
+             ", ".join(r["failed"]) or "-", (r["rationale"] or "").replace("|", "/")[:200]]
+            for r in judge["rows"] if r["judge"] is not None and r["judge"] != r["code"]]
+    if rows:
+        lines += ["", *_table(["case", "set", "code", "judge", "code's failed checks", "judge's reason"], rows)]
+    return lines + [""]
 
 
 def render_refusals(r: dict[str, Any]) -> list[str]:
@@ -170,6 +222,13 @@ def render_latency_cost(answers: dict[str, Any], retrieval_ran: bool = True) -> 
             f"Answer-call cost: ${cost['total']:.4f} over {cost['answers']} answers ({per} per answer).", ""]
 
 
+def rejected_phrases(run: dict[str, Any]) -> list[str]:
+    """Phrases the answer contains but that didn't count, with the reason ("'are excluded' negated by 'not'"): the
+    first thing to look at when a correct-looking answer failed. Reports before 2026-10-21 have no evidence."""
+    return [f"'{e['phrase']}' {e['rejected']}" for items in (run.get("evidence") or {}).values() for e in items
+            if e.get("rejected")]
+
+
 def render_failures(report: dict[str, Any]) -> list[str]:
     rows = []
     for case in report["cases"]:
@@ -178,7 +237,9 @@ def render_failures(report: dict[str, Any]) -> list[str]:
                 continue
             answer = (run.get("answer") or {}).get("content") or run.get("error") or ""
             excerpt = " ".join(answer.split())[:140].replace("|", "/")
-            rows.append([f"{case['id']} #{i}", ", ".join(run["failed"]), excerpt])
+            why = rejected_phrases(run)
+            failed = ", ".join(run["failed"]) + (f" ({'; '.join(why)})" if why else "")
+            rows.append([f"{case['id']} #{i}", failed.replace("|", "/"), excerpt])
     if not rows:
         return []
     return ["## Failures", "", *_table(["case", "failed checks", "answer (start)"], rows), ""]
@@ -187,5 +248,6 @@ def render_failures(report: dict[str, Any]) -> list[str]:
 def render_markdown(report: dict[str, Any]) -> str:
     retrieval_ran = "skipped" not in report["retrieval"]
     lines = render_meta(report) + render_retrieval(report["retrieval"]) + \
-        render_answers(report["answers"], retrieval_ran) + render_failures(report)
+        render_answers(report["answers"], retrieval_ran) + render_hard(report["answers"].get("hard")) + \
+        render_judge(report.get("judge")) + render_failures(report)
     return "\n".join(lines).rstrip() + "\n"

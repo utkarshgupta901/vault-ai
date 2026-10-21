@@ -18,7 +18,7 @@ STARTERS_PATH = EVALS_DIR / "golden_starters.yaml"
 CATEGORY_TAGS = {"factoid", "multi_doc", "unanswerable_offtopic", "unanswerable_indomain", "multiturn", "injection",
                  "docx", "starter", "public_doc"}
 # ... plus optional modifiers.
-MODIFIER_TAGS = {"demo", "table"}
+MODIFIER_TAGS = {"demo", "table", "hard"}
 ALLOWED_TAGS = CATEGORY_TAGS | MODIFIER_TAGS
 UNANSWERABLE_TAGS = {"unanswerable_offtopic", "unanswerable_indomain"}
 # Which refusal layer we expect for each kind of unanswerable question (recorded, never failed on).
@@ -26,6 +26,10 @@ EXPECTED_REFUSAL_PATH = {"unanswerable_offtopic": "gate", "unanswerable_indomain
 # Cases over a real, public document the user drops into demo_docs/user/ (gitignored, never generated). Its file is
 # not in `corpus`, and the eval runner skips these cases when the file is absent instead of failing the whole run.
 PUBLIC_DOC_TAG = "public_doc"
+# The hard set: paraphrases, "no" answers, computed numbers, cross-document questions, in-domain traps and a pronoun
+# follow-up, all over the synthetic corpus. Scored and reported on their own line, so the headline over the original
+# cases stays comparable with every earlier report. Never `demo`: a demo case must pass every run, a hard case may not.
+HARD_TAG = "hard"
 
 CASE_KEYS = {"id", "question", "tags", "scope", "turns", "expect", "retrieval_query", "note"}
 REQUIRED_CASE_KEYS = {"id", "question", "tags", "scope", "expect"}
@@ -59,6 +63,10 @@ class Case:
     @property
     def is_public_doc(self) -> bool:
         return PUBLIC_DOC_TAG in self.tags
+
+    @property
+    def is_hard(self) -> bool:
+        return HARD_TAG in self.tags
 
     @property
     def scope_files(self) -> list[str]:
@@ -183,6 +191,8 @@ def _validate_case(c: Any, corpus: list[str], *, check_files: bool) -> list[str]
     categories = [t for t in tags if t in CATEGORY_TAGS]
     if len(categories) != 1:
         problems.append(f"{cid}: needs exactly one category tag from {sorted(CATEGORY_TAGS)}, got {categories}")
+    if "demo" in tags and HARD_TAG in tags:
+        problems.append(f"{cid}: a case cannot be both demo and hard")
     scope = c["scope"]
     scope_files: list[str] | None = None
     if scope == "all":

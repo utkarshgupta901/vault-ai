@@ -2,6 +2,7 @@
 
     uv run python evals/run_eval.py --api http://localhost:8000 --key vault-eval-key
         [--tag demo] [--repeat 3] [--retrieval-only] [--modes hybrid,vector,keyword] [--k 40] [--out evals/reports]
+        [--judge]
 
 What it does, in order:
   1. Preflight: /health/ready (records server model names) and which routes exist (/openapi.json).
@@ -13,10 +14,15 @@ What it does, in order:
      the JSON endpoint. Each answer is scored by evals/scoring.score_answer. Cases tagged `demo` run --repeat times
      and must pass every run (pass^N); quality metrics use each case's first run so every case weighs the same,
      while latency and cost count every run.
-  5. Report: evals/reports/<UTC timestamp>.json (everything, including answers) and .md (the readable summary the
+     Cases tagged `hard` are summarized apart (retrieval and answers), so the headline over the original cases
+     stays comparable with every earlier report.
+  5. With --judge: an LLM judge (evals/judge.py) grades each model-generated answer against the case's golden facts,
+     and the report gives its agreement with the code's content checks plus every disagreement. Never gates.
+  6. Report: evals/reports/<UTC timestamp>.json (everything, including answers) and .md (the readable summary the
      README quotes), and the markdown is printed.
 
-Exit code 1 when the corpus could not be prepared, a needed endpoint is missing, or a demo case failed any run.
+Exit code 1 when the corpus could not be prepared, a needed endpoint is missing, --judge was asked for and the judge
+cannot run, or a demo case failed any run.
 The eval user (vault-eval-key) is separate from the demo user so eval spend never eats the demo user's quota."""
 
 import argparse
@@ -24,6 +30,7 @@ import subprocess
 import sys
 import time
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -52,6 +59,10 @@ class SetupError(Exception):
     """The eval cannot run meaningfully (missing corpus file, document failed to ingest, endpoint absent)."""
 
 
+# (case: {"id", "question", "turns", "expect"}, first run as stored in the report) -> {"correct", "rationale", "model"}
+JudgeFn = Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]]
+
+
 @dataclass
 class Options:
     tags: list[str]
@@ -62,6 +73,7 @@ class Options:
     k: int
     docs_dir: Path
     ingest_timeout_s: float
+    judge: JudgeFn | None = None
 
 
 def log(msg: str) -> None:
@@ -183,6 +195,10 @@ def run_retrieval(client: VaultClient, cases: list[Case], doc_ids: dict[str, str
     return records, k
 
 
+def is_hard(record: dict[str, Any]) -> bool:
+    return golden_mod.HARD_TAG in record["tags"]
+
+
 def summarize_retrieval(records: list[dict[str, Any]], ks: tuple[int, ...]) -> dict[str, Any]:
     """{mode: {"overall": metrics, "by_tag": {tag: metrics}}} where metrics = hit@k counts + MRR."""
     out: dict[str, Any] = {}
@@ -269,6 +285,8 @@ def _rate(values: list[bool]) -> dict[str, Any]:
 
 
 def summarize_answers(cases: list[Case], results: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
+    """Every number over `cases` only, runs included: the headline and the hard set are summarized separately."""
+    results = {c.id: results[c.id] for c in cases if c.id in results}
     first = {c.id: results[c.id][0] for c in cases if results.get(c.id)}
     by_id = {c.id: c for c in cases}
     answered = {cid: r for cid, r in first.items() if r["answer"] is not None}
@@ -313,6 +331,29 @@ def summarize_answers(cases: list[Case], results: dict[str, list[dict[str, Any]]
     }
 
 
+def run_judge(cases: list[Case], results: dict[str, list[dict[str, Any]]], judge: JudgeFn) -> dict[str, Any]:
+    """The judge's verdict on each case's first model-generated answer (refusals and failed calls have nothing to
+    grade), next to the code's content verdict. A judge failure is recorded on its row and never stops the run: the
+    judge is a second opinion on the scorer, not part of it."""
+    rows = []
+    for case in cases:
+        run = (results.get(case.id) or [None])[0]
+        if not run or not run["answer"] or run["answer"]["answer_type"] != "answered":
+            continue
+        row = {"id": case.id, "set": "hard" if case.is_hard else "core", "code": scoring.content_verdict(run["checks"]),
+               "judge": None, "failed": run["failed"], "rationale": None, "model": None, "error": None}
+        try:
+            verdict = judge({"id": case.id, "question": case.question, "turns": case.turns, "expect": case.expect},
+                            run)
+            row.update(judge=bool(verdict["correct"]), rationale=verdict.get("rationale"), model=verdict.get("model"))
+        except Exception as exc:        # any judge failure (provider, parsing, ledger): recorded, never fatal
+            row["error"] = f"{type(exc).__name__}: {exc}"
+        rows.append(row)
+        log(f"  judge {case.id}: {row['error'] or ('pass' if row['judge'] else 'fail')}"
+            f" (code {'pass' if row['code'] else 'fail'})")
+    return {"summary": scoring.judge_agreement(rows), "rows": rows}
+
+
 # ---------------------------------------------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------------------------------------------
@@ -342,7 +383,10 @@ def evaluate(client: VaultClient, golden: Golden, opts: Options) -> dict[str, An
         log(f"retrieval: {len(cases)} cases x modes {opts.modes}")
         records, k_used = run_retrieval(client, cases, doc_ids, opts.modes, opts.k)
         ks = tuple(k for k in ks if k <= k_used)
-        retrieval = {"k": k_used, "ks": list(ks), "summary": summarize_retrieval(records, ks), "records": records}
+        retrieval = {"k": k_used, "ks": list(ks),
+                     "summary": summarize_retrieval([r for r in records if not is_hard(r)], ks), "records": records}
+        if any(is_hard(r) for r in records):
+            retrieval["hard"] = summarize_retrieval([r for r in records if is_hard(r)], ks)
     else:
         retrieval = {"skipped": f"{SEARCH_ROUTE} is not deployed"}
 
@@ -353,10 +397,16 @@ def evaluate(client: VaultClient, golden: Golden, opts: Options) -> dict[str, An
     else:
         log(f"answers: {len(cases)} cases (demo cases x{opts.repeat})")
         results = run_answers(client, cases, doc_ids, opts.repeat)
-        answers = summarize_answers(cases, results)
+        answers = summarize_answers([c for c in cases if not c.is_hard], results)
+        if any(c.is_hard for c in cases):
+            answers["hard"] = summarize_answers([c for c in cases if c.is_hard], results)
+    judged = None
+    if opts.judge and results:
+        log(f"judge: grading the first model-generated answer of each of {len(cases)} cases")
+        judged = run_judge(cases, results, opts.judge)
     spend_after = today_spend(client)
 
-    return {
+    report = {
         "meta": {
             "started_at": started.isoformat(timespec="seconds"),
             "finished_at": datetime.now(UTC).isoformat(timespec="seconds"),
@@ -373,6 +423,9 @@ def evaluate(client: VaultClient, golden: Golden, opts: Options) -> dict[str, An
         "cases": [{"id": c.id, "category": c.category, "tags": c.tags, "question": c.question, "turns": c.turns,
                    "scope": c.scope, "expect": c.expect, "runs": results.get(c.id, [])} for c in cases],
     }
+    if judged is not None:
+        report["judge"] = judged
+    return report
 
 
 def demo_failures(report: dict[str, Any]) -> list[str]:
@@ -394,6 +447,9 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument("--no-starters", action="store_true", help="ignore evals/golden_starters.yaml")
     p.add_argument("--docs-dir", type=Path, default=DEMO_DOCS)
     p.add_argument("--ingest-timeout", type=float, default=600, help="seconds to wait for the corpus to be ready")
+    p.add_argument("--judge", action="store_true",
+                   help="also grade each answer with the LLM judge and report its agreement with the code (never "
+                        "gates; needs a model key and the database the API writes its ai_usage ledger to)")
     return p.parse_args(argv)
 
 
@@ -401,12 +457,26 @@ def _csv(value: str) -> list[str]:
     return [v.strip() for v in value.split(",") if v.strip()]
 
 
-def main(argv: list[str] | None = None, *, transport: Any = None) -> int:
+def live_judge() -> JudgeFn:
+    """The real judge, checked before the eval spends anything. Imported here, not at the top: a plain run is an HTTP
+    client and must not need the app's settings, database or model key."""
+    from evals import judge
+
+    return judge.correctness_judge()
+
+
+def main(argv: list[str] | None = None, *, transport: Any = None, judge_fn: JudgeFn | None = None) -> int:
     args = parse_args(argv)
     golden = golden_mod.load(args.golden, starters=None if args.no_starters else golden_mod.STARTERS_PATH)
+    if args.judge and judge_fn is None:
+        try:
+            judge_fn = live_judge()
+        except Exception as exc:        # no key, no ledger database, no eval user: say so before any spend
+            log(f"--judge cannot run: {type(exc).__name__}: {exc}")
+            return 1
     opts = Options(tags=_csv(args.tag), case_ids=_csv(args.case), repeat=max(1, args.repeat),
                    retrieval_only=args.retrieval_only, modes=_csv(args.modes), k=args.k, docs_dir=args.docs_dir,
-                   ingest_timeout_s=args.ingest_timeout)
+                   ingest_timeout_s=args.ingest_timeout, judge=judge_fn if args.judge else None)
     with VaultClient(args.api, args.key, timeout=120, transport=transport) as client:
         try:
             report = evaluate(client, golden, opts)
