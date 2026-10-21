@@ -65,13 +65,16 @@ def render_meta(report: dict[str, Any]) -> list[str]:
     if meta.get("skipped_cases"):
         lines.append(f"- Skipped (document not present): {', '.join(meta['skipped_cases'])}")
     if spend.get("delta") is not None:
-        lines.append(f"- AI spend during the whole run (eval user, /metrics/ai-usage; every call, hard set included): "
-                     f"${spend['delta']:.4f}")
+        # the stack's bill for everything the run did (answers, condense, follow-ups, query embeddings), unlike the
+        # answer-cost lines below, which cover one set of cases each
+        covers = "every call, hard set included" if (report.get("answers") or {}).get("hard") else "every call"
+        lines.append(f"- AI spend during the whole run (eval user, /metrics/ai-usage; {covers}): ${spend['delta']:.4f}")
     return lines + [""]
 
 
 def _server_code(meta: dict[str, Any]) -> list[str]:
-    """The API's code, as stated with --server-ref. Reports before 2026-10-22 have no such key (and no line)."""
+    """The API's code, as stated with --server-ref. Reports written before that flag (2026-10-21) have no such key
+    and get no line."""
     if "server_ref" not in meta:
         return []
     if meta["server_ref"]:

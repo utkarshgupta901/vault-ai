@@ -162,6 +162,8 @@ def test_the_hard_set_is_reported_apart_from_the_headline(setup: dict[str, Path]
     assert "| h-vacation #1 | hard | any_of |" in md                      # failures say which set they are in
     # the spend line is the stack's whole bill for the run, unlike the cost lines (answers of one set each)
     assert "AI spend during the whole run (eval user, /metrics/ai-usage; every call, hard set included)" in md
+    demo_only = run(setup, FakeVaultApi(answer_fn=answer, search_fn=search), "--tag", "demo")[1]
+    assert "AI spend during the whole run (eval user, /metrics/ai-usage; every call):" in render_markdown(demo_only)
 
 
 def fake_judge(case: dict[str, Any], run: dict[str, Any]) -> dict[str, Any]:

@@ -136,6 +136,9 @@ MATCH_TABLE = [
      ["18 days"], True, True),
     ("limitation: a hedging adverb is a filler ('does not explicitly apply')", "The stipend section does not "
      "explicitly apply to contractors.", ["does not apply"], False, True),
+    ("limitation: doubt AFTER the phrase is not read (live answer, 20261021T185603Z)", "The sources provide no "
+     "monthly figures, so whether Larkspur reached 99.5% in every month cannot be determined.", ["reached"], True,
+     True),
 ]
 
 

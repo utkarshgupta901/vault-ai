@@ -490,8 +490,8 @@ cases:
   # the generated text, the computed answers, the cross-document inputs and the traps are checked by
   # tests/evals/test_golden.py, and HARD_ANSWERS there shows how the labels read right, wrong and hedged answers.
   # Hard to answer more than hard to retrieve: on 2026-10-21 hybrid search ranked 9 of 11 gold passages first.
-  #   paraphrase (3): the question avoids the passage's key terms ("vacation", "stolen", "overseas"); keyword search
-  #                   still ranked all three first, so they test the answer, not retrieval
+  #   paraphrase (3): the question avoids the passage's key words ("vacation", "stolen", "overseas"); keyword search
+  #                   still ranked the passage 1st, 3rd and 1st, so they test the answer more than retrieval
   #   "no" answers (3): the correct answer is a negation, so the negation-aware matcher matters
   #   computed (3): a total or a difference of stated numbers, never stated itself
   #   cross-document (1, + 1 computed): each input is stated in only one of the two documents
@@ -605,7 +605,7 @@ cases:
       grounded: true
 
   # 99.62% is only in the board update, 99.5% only in the BrightPath proposal, so neither document answers it alone.
-  # (It replaced a CoreLink comparison on 2026-10-22: the board update restates CoreLink's 99.9% as its own target,
+  # (It replaced a CoreLink comparison on 2026-10-21: the board update restates CoreLink's 99.9% as its own target,
   # so that one could be answered from one sentence.) The board update's "below our internal target of 99.9%" is a
   # distractor: the answer is "yes".
   - id: h-availability-vs-brightpath
