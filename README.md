@@ -239,12 +239,13 @@ and the scaling path.
 
 ## AI-assisted development
 
-Built in one day with Claude Code (plus a pre-demo pass the next day): a 9-agent design panel with adversarial
-"interviewer" reviewers, parallel implementation by agents in isolated git worktrees against frozen contracts, an
-evaluation harness whose reports exposed three real bugs (the third found by an audit reading them), a 4-lens
-adversarial code review, and a pre-demo sweep (confidentiality, clean clone, docs accuracy). What the AI did, what I
-decided and verified, and what went wrong: [AI_USAGE.md](AI_USAGE.md). A second adversarial review of the whole repo
-(2026-10-18), its fixes and what was deferred: [docs/REVIEW.md](docs/REVIEW.md).
+Built in one day with Claude Code (2026-10-13, plus a pre-demo pass the next day; the later commits are a self-review
+on 2026-10-18 and eval-quality work on 2026-10-21, merged after the evals passed): a 9-agent design panel with
+adversarial "interviewer" reviewers, parallel implementation by agents in isolated git worktrees against frozen
+contracts, an evaluation harness whose reports exposed three real bugs (the third found by an audit reading them), a
+4-lens adversarial code review, and a pre-demo sweep (confidentiality, clean clone, docs accuracy). What the AI did,
+what I decided and verified, and what went wrong: [AI_USAGE.md](AI_USAGE.md). A second adversarial review of the whole
+repo (2026-10-18), its fixes and what was deferred: [docs/REVIEW.md](docs/REVIEW.md).
 
 ## Repository layout
 

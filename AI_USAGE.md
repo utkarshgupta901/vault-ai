@@ -1,7 +1,8 @@
 # How AI coding tools were used to build Vault AI
 
 **Tool:** Claude Code (Opus 5.5) in the terminal: plan mode, multi-agent workflows, subagents working in isolated
-git worktrees, and the evaluation harness as the arbiter. **Time:** one day, plus a pre-demo pass the next day.
+git worktrees, and the evaluation harness as the arbiter. **Time:** the product was built in one day (2026-10-13), plus a pre-demo pass the next day; a
+self-review (2026-10-18) and eval-quality work (2026-10-21) followed, each logged below.
 **Result:** ~9.3k lines of Python in app/ (plus ~8.3k in tests), ~5.5k lines of TypeScript, ~615 tests (~1,090 after
 the 2026-10-18 review and the eval work), a 43-case evaluation plus a 13-case hard set, deployment config.
 
@@ -82,8 +83,9 @@ areas, each adding regression tests.
 A second review on 2026-10-18 went over the whole repo again with four reviewers, static analysis and dependency
 audits. It found no critical issue and no cross-tenant path, but found operational gaps (readiness that said "ok"
 under a revoked key, a download holding a DB connection for the whole stream, billed calls missing from the ledger).
-The fixes are on the `review-fixes` branch, which merges only after the evals pass again with a working key:
-[docs/REVIEW.md](docs/REVIEW.md).
+The fixes were made on a branch and merged into `main` on 2026-10-22, after the full eval (43/43) and the demo
+questions (30/30 runs) passed on them with a working key. That check caught one more bug, a grounding false positive
+on a correct two-calculation answer: [docs/REVIEW.md](docs/REVIEW.md).
 
 ## 6. Guardrails that made AI-written code trustworthy
 

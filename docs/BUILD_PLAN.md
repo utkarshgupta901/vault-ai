@@ -37,7 +37,7 @@
 | Storage | S3 API everywhere: RustFS locally (MinIO's free images were withdrawn), Cloudflare R2 (or S3) in the cloud | The API and worker never share a disk, locally or in the cloud, so the same code path works in both |
 | Auth | `X-API-Key` per user (sha256-hashed), every query owner-scoped, 404 on another owner's resources. Seeded users `demo`, `other`, `eval` | Real multi-tenancy story, cheap to build |
 | Cloud | Render Blueprint (`render.yaml`): web service (API+SPA), worker, Postgres 17, Key Value (`noeviction`), R2. About $20/month; a free fallback is documented | User choice; facts verified |
-| Repo | `/Users/puru/personal-repos/vault-ai`, GitHub repo `utkarshgupta901/vault-ai` (private during the build, public for review), push at each milestone. Work packages merge locally from worktree branches, **no GitHub PRs** | User choice |
+| Repo | GitHub repo `utkarshgupta901/vault-ai` (private during the build, public for review), push at each milestone. Work packages merge locally from worktree branches, **no GitHub PRs** | User choice |
 | Demo docs | Synthetic "Larkspur Analytics" corpus with planted facts, plus **1 real document from the user**, plus a golden Q&A set | Answers are known in advance, so the demo is predictable and measurable |
 | Teaching | Checkpoint per module, plus a study page that grows, plus a deep session and the full study page at the end | User choice |
 

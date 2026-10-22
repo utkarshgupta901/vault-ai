@@ -1,15 +1,22 @@
 # Code review (2026-10-18): `main` at 71be0fa, and what branch `review-fixes` changed
 
-Five days after the one-day build (2026-10-13), I reviewed the whole repository adversarially and fixed what was
-worth fixing, on a branch. `main`, which the demo runs, is unchanged. The fixes stay on `review-fixes` until the evals
-pass again with a working OpenAI key (see the [merge checklist](#merge-checklist)).
+> **Status (2026-10-22): merged.** The fixes below were made on a branch, `review-fixes`, while the OpenAI key was
+> revoked. Once a working key was back, the [merge checklist](#merge-checklist) passed on 2026-10-21 and the branch was
+> merged into `main`, which is what this repository, the demo video and the final eval run. Today `main` has 1,088
+> Python tests and 33 frontend tests, CI is green on GitHub, and the final eval on the merged code is 43/43 (demo
+> questions 30/30 runs, hard set 12/13; see [EVAL.md](EVAL.md)). The rest of this document is the review as written
+> on 2026-10-18, with the last sections updated.
 
-| | `main` 71be0fa | `review-fixes` |
-|---|---|---|
-| Python tests | 618 | 849 collected: 848 pass, 1 skip (the existing one: golden starters not frozen) |
-| Frontend tests | 21 | 33 |
-| CI | none | `.github/workflows/ci.yml` (lint, pytest against service containers, frontend), and `make ci` locally |
-| Commits | | 8 fix-group commits, 7 follow-up commits and this docs commit. Before the docs commit: 85 files, +4,622 / −409 |
+Five days after the one-day build (2026-10-13), I reviewed the whole repository adversarially and fixed what was
+worth fixing, on a branch. `main`, which the demo ran at the time, stayed unchanged until the evals could pass again
+with a working OpenAI key (see the [merge checklist](#merge-checklist)).
+
+| | `main` 71be0fa (before) | `review-fixes` (2026-10-18) | `main` today (merged) |
+|---|---|---|---|
+| Python tests | 618 | 849 collected: 848 pass, 1 skip (the existing one: golden starters not frozen) | 1,088 collected (with the later eval work) |
+| Frontend tests | 21 | 33 | 33 |
+| CI | none | `.github/workflows/ci.yml` (lint, pytest against service containers, frontend), and `make ci` locally | green on GitHub on every push |
+| Commits | | 8 fix-group commits, 7 follow-up commits and this docs commit. Before the docs commit: 85 files, +4,622 / −409 | |
 
 ## Verdict
 
@@ -247,33 +254,41 @@ stopped one step short.
 | Timed-out condense, follow-up and query-embedding calls record 0 tokens | This existed before the branch: a call that hits its own timeout was usually billed (rule 7) | Record `estimated_usage(...)` (`estimated=true`) on a timeout, as the cancellation path already does |
 | Unicode parity of the citation grammars | Python's `\d`, `\s` and `IGNORECASE` are Unicode-aware, and the JS regex is not, so `[S１]` (fullwidth digit) counts on one side only. A 60,000-case fuzz over realistic input found no mismatch | Use explicit `[0-9]` and a fixed whitespace class on both sides |
 | A shield does not stop a native `task.cancel()` (N01) | Request-path cancellations come from anyio, so the shields hold. A hard shutdown can still cut a ledger write | If shutdown durability matters, run ledger writes in an `asyncio.shield`ed task |
-| CI has not run on GitHub | The workflow was checked locally (actionlint, `make ci`). Service containers cannot take compose's tuning flags | Push the branch and watch the first run |
+| ~~CI has not run on GitHub~~ Done | Green on GitHub since 2026-10-18 (runs 39141265270 and 39645144891 on the branch, and on every push to `main` since the merge) | — |
 
-## What cannot be verified without a working OpenAI key
+## Verified once the key worked (2026-10-21)
 
-The OpenAI key has been dead since 2026-10-17, and no fix on this branch was tested against the real API. Every test
-uses the FakeProvider, and the OpenAI SDK paths run through the real SDK against a mock transport. Still unverified:
+When this review was written the OpenAI key had been revoked since 2026-10-17, so nothing above had run against the
+real API; every test used the FakeProvider and a mock transport. With a working key, everything that list named was
+checked on 2026-10-21 against a second compose stack (API on port 8001) built from the branch:
 
-- **`make eval-demo`** (3/3 per demo case) and **the full `make eval`** (43 cases). Every answerable case now fails
-  on an ungrounded number. Re-scoring the stored 2026-10-14 answers passes 43/43 and 30/30 runs, but those are old
-  answers, not a new run.
-- **`make smoke-llm`**: every configured model and effort pair, embeddings with `dimensions=`, and TTFT.
-- **The effect of escaped history** on multi-turn answers: does the model ever echo `&amp;` or `&lt;`?
-- **Streamed refusals and empty streams from the real Responses API**, and the fallback they now trigger.
-- **`make doctor` passing.** While the key is dead it FAILs on `auth_failed` and on the embedding probe, which is the
-  point of the change.
-- **Not key-related, also unverified:** the loopback port binding applies only after `make demo` recreates the
-  containers, and the CI workflow has not run on GitHub yet.
+- **`make eval-demo`** found one more bug: the first run on 330610e was 29/30, because the grounding checker derived
+  only the result after the last `=` in a sentence and flagged a correct two-calculation answer. The fix (`1e534b3`,
+  with tests) made it 30/30 runs, and **the full `make eval`** passed 43/43.
+- **`make doctor`**: 19 PASS, 0 FAIL, including the real embeddings call it now makes.
+- **Escaped history** in multi-turn answers: the 6 multi-turn cases pass in every run, and no answer in the final
+  reports contains an escaped entity such as `&amp;` or `&lt;`.
+- **Loopback ports**: after `make demo` recreated the demo stack from the merged code, Postgres, Valkey and S3 are
+  published on `127.0.0.1` only.
+- **CI**: green on GitHub.
+- **Not exercised by a live run:** a streamed refusal or an empty stream from the real Responses API (none happened);
+  the fallback they trigger is covered by tests against the mock transport. `make smoke-llm` was not re-run
+  separately; the evals called every configured model.
+
+After the merge, the final eval on the merged code (`ea90635`) passed 43/43 with every answer grounded, the demo
+questions passed 30/30 runs, and a harder 13-case set passed 12/13 (reports `20261021T205542Z`, `20261021T205852Z`).
+The demo stack rebuilt from `main` passed 30/30 runs again (`20261021T210636Z`).
 
 ## Merge checklist
 
-`main` stays the demo until all of this is green:
+All green on 2026-10-21; `review-fixes` was merged into `main` on 2026-10-22.
 
-1. **Baseline.** With a working key, on `main` as it runs now, run `make eval-demo` (expect 3/3 per case, as in
-   `20261014T110107Z`).
-2. **On `review-fixes`.** Start from a clean tree, then switch the main checkout to `review-fixes` and run:
-   - `make demo`: rebuild, and recreate the containers with loopback-only ports;
-   - `make doctor`: it now makes a real embeddings call and must show no FAIL;
-   - `make eval-demo`: 3/3 for every demo case;
-   - the full `make eval`: compare with `20261014T105823Z`, and read the multi-turn answers for entity text.
-3. **Merge only if every step is green**, CI included. If anything fails, switch back to `main` and run `make demo`.
+1. **Baseline.** With a working key, on `main` as it ran then (71be0fa), `make eval-demo`: 10/10 cases, 30/30 runs
+   (`20261021T164121Z`). The full eval on that `main` was 42/43: one correct answer worded outside the expected
+   phrases (`20261021T163824Z`), which the later phrase matcher accepts.
+2. **On `review-fixes`**, on a second stack built from the branch:
+   - `make demo`: rebuilt from the branch (loopback-only ports confirmed on the demo stack after the merge);
+   - `make doctor`: 19 PASS, 0 FAIL, with a real embeddings call;
+   - `make eval-demo`: 30/30 runs after the grounding fix in `1e534b3`;
+   - the full `make eval`: 43/43; the multi-turn answers show no escaped entities.
+3. **Merged** only after every step was green, CI included.
